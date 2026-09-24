@@ -1,0 +1,100 @@
+{
+  "name": "dsh-cache-badge",
+  "version": "1.7.1",
+  "description": "DSH web plugin: cache hit rate as falling Tetris-style bricks in the blank gutter beside the conversation — one brick per real model request attempt, one column per task, red below 10%.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/invariant.js",
+    "lib/types/**/*.d.ts",
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "tests/clickfix.fixture.js"
+  ],
+  "scripts": {
+    "build": "rimraf lib && tsc -p tsconfig.build.json && tsdown",
+    "build:fast": "tsdown",
+    "build:hotfix": "node scripts/build-client-hotfix.mjs",
+    "check:contracts": "node scripts/check-contract-drift.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:clickfix": "node scripts/test-clickfix.mjs",
+    "verify:host": "node scripts/verify-host-artifact.mjs",
+    "verify:live": "node scripts/live-verify.mjs",
+    "verify:ui": "node scripts/ui-verify.mjs",
+    "pack:latest": "pnpm pack && node scripts/pack-latest.mjs",
+    "bench": "node -e \"process.env.DSH_BENCH='1'\" && vitest run tests/collector-cost.spec.ts"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-ui-chat": ">=0.1.6-alpha.1 <0.1.8-0",
+    "@deepseek-ai/dsh-client-ui-conversation": ">=0.1.6-alpha.1 <0.1.8-0",
+    "@deepseek-ai/dsh-client-ui-renderer": ">=0.1.6-alpha.1 <0.1.8-0",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.6-alpha.1 <0.1.8-0",
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/dsh-client-ui-chat": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.7-rc.2",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "rimraf": "^5.0.5",
+    "tsdown": "^0.22.2",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "prompt-cache"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/3289192-bot/dsh-cache-bricks.git"
+  },
+  "homepage": "https://github.com/3289192-bot/dsh-cache-bricks#readme",
+  "bugs": {
+    "url": "https://github.com/3289192-bot/dsh-cache-bricks/issues"
+  }
+}
