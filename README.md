@@ -6,13 +6,15 @@ A local DSH web plugin that turns model request attempts into a falling-brick bo
 
 ## Screenshots / 截图
 
-**Conversation view** — private transcript and inspector text are pixelated and marked `REDACTED`.
+**Conversation view** — private on-screen text is masked in this screenshot.
 
-![Cache Bricks in DeepSeek Harness, with conversation text redacted](docs/assets/conversation-redacted.png)
+![Conversation view with private text masked](docs/assets/conversation-redacted.png)
 
-**Cache rate / Activity type**
+**Cache hit rate** — each brick represents a real request attempt; the board makes cache health and outliers visible at a glance.
 
 ![Cache hit-rate board](docs/assets/cache-hit-board.png)
+
+**Activity type**
 
 ![Activity-type board](docs/assets/activity-board.png)
 
@@ -45,8 +47,9 @@ The repository includes the built `lib/` files, so GitHub installation does not 
 
 ## Compatibility / 兼容性
 
-- Runtime notes cover DSH `0.1.7-rc.2`; the plugin targets the web profile.
-- The package manifest declares DSH client package compatibility from `0.1.6-alpha.1` up to, but not including, `0.1.8`.
+- The plugin targets the DSH web profile. Its manifest declares compatibility with DSH client packages `>=0.1.6-alpha.1 <0.1.8-0`; it is not limited to `0.1.7-rc.2`.
+- Full live and browser verification was completed on DSH `0.1.7-rc.2`. DSH `0.1.6-alpha.1` received cross-version API/contract checks, but not the same full live UI run. Other versions inside the declared range have not all been individually verified.
+- The development dependencies are pinned to `0.1.7-rc.2` for the verified build; that pin is not the plugin's declared runtime minimum.
 
 ## Data and permissions / 数据与权限
 
