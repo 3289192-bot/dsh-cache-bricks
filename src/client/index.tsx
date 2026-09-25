@@ -272,9 +272,14 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
       outcome.expanded ? 'opened a collapsed group' : undefined,
       row === undefined ? undefined : row,
     ].filter((part): part is string => part !== undefined).join(', ')
+    const located = locateResultOf(outcome)
     setNotice({
-      state: outcome.accuracy === 'exact' ? 'success' : 'error',
-      text: outcome.accuracy === 'exact'
+      state: located.status === 'exact' ? 'success' : 'error',
+      text: located.status === 'exact-not-visible'
+        // Found, and the reader cannot see it: a capped process group is clipping the row. Say that
+        // rather than "located" — the whole point of the check is that this case stops lying.
+        ? '找到了这一行，但它被这一轮的过程组裁掉了，屏幕上看不见；没有高亮，也不当作定位成功。'
+        : outcome.accuracy === 'exact'
         // A folded brick lands on its **step**: say so, so a step-level landing is never read
         // as "this is the request you clicked" (the board's dashes say it too, but the notice
         // is what a reader actually reads).
@@ -295,10 +300,10 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
       accuracy: outcome.accuracy,
       row: outcome.row,
       load: outcome.load,
-      locate: locateResultOf(outcome),
+      locate: located,
     })
     console.info(
-      `[dsh-cache-bricks] ${where}: ${outcome.accuracy} landing · locate=${locateResultOf(outcome).status}`
+      `[dsh-cache-bricks] ${where}: ${outcome.accuracy} landing · locate=${located.status}`
       + `${detail === '' ? '' : ` (${detail})`}`,
     )
   }

@@ -58,6 +58,12 @@ function locateRows(locate: BrickLocateResult): { readonly label: string; readon
         { label: 'Chat projection', value: `✓ ${locate.row}` },
         { label: 'Reason', value: 'the request has its own row on screen' },
       ]
+    case 'exact-not-visible':
+      return [
+        { label: 'Transcript loaded', value: '✓' },
+        { label: 'Chat projection', value: `✕ ${locate.row}: found, not visible` },
+        { label: 'Reason', value: 'the row is there, but a capped process group is clipping it — nothing was highlighted' },
+      ]
     case 'step-other-half':
       return [
         { label: 'Transcript loaded', value: '✓' },

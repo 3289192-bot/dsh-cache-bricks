@@ -64,7 +64,7 @@ import {
   type RailGeometry,
 } from './tetris'
 import type { LoadReport, LoadRequest } from './navigation'
-import { revealBrick, type RevealElement, type RevealOutcome } from './reveal'
+import { revealBrick, rowVisible, type RevealElement, type RevealOutcome } from './reveal'
 import type { BrickTarget, HistoricalStepTarget } from './target'
 
 /** Both sides of the card, in the order that keeps cache-first everywhere. */
@@ -645,18 +645,33 @@ export class CacheTetrisBoard {
           isCurrent,
         })
       if (isCurrent() && outcome.accuracy === 'exact' && outcome.element !== undefined && scroller !== undefined) {
-        // A long smooth scroll used to outlive the entire 1.1 s highlight. Wait for motion
-        // to stop, then emphasise the destination for six seconds, never an adjacent row.
-        let previous = scroller.scrollTop
+        // Wait for the *row* to stop moving, not for the conversation's scrollTop.
+        //
+        // The conversation settling says nothing about a row inside a capped process group: its
+        // position changes when the group's own port scrolls, and when the host corrects the
+        // layout afterwards. Watching the row covers every one of those, which is why the wait is
+        // expressed in the destination's own coordinates.
+        let previousRow = outcome.element.getBoundingClientRect().top
+        let previousScroll = scroller.scrollTop
         let stable = 0
-        for (let elapsed = 0; elapsed < 1800 && isCurrent(); elapsed += 50) {
+        for (let elapsed = 0; elapsed < 2200 && isCurrent(); elapsed += 50) {
           await new Promise<void>((resolve) => setTimeout(resolve, 50))
-          const current = scroller.scrollTop
-          stable = Math.abs(current - previous) < 0.5 ? stable + 1 : 0
-          previous = current
+          const rowTop = outcome.element.getBoundingClientRect().top
+          const scrollTop = scroller.scrollTop
+          const moved = Math.abs(rowTop - previousRow) >= 0.5 || Math.abs(scrollTop - previousScroll) >= 0.5
+          stable = moved ? 0 : stable + 1
+          previousRow = rowTop
+          previousScroll = scrollTop
           if (stable >= 3) break
         }
-        if (isCurrent() && outcome.element.isConnected !== false) this.flash(outcome.element, outcome.row)
+        // **Visible or it did not happen.** The row's identity is not the claim a reader acts on:
+        // a row clipped by a process group is exactly the case that made a jump report `exact`
+        // while the screen showed nothing. So the verdict is checked against the boxes the reader
+        // has, and a clip is reported as such instead of being highlighted.
+        if (isCurrent() && outcome.element.isConnected !== false) {
+          if (rowVisible(outcome.element, scroller)) this.flash(outcome.element, outcome.row)
+          else outcome = { ...outcome, hidden: true }
+        }
       }
     } catch (error) {
       console.warn('[dsh-cache-bricks] transcript navigation failed', error)

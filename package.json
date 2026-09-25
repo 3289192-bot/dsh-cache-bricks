@@ -1,6 +1,6 @@
 {
   "name": "dsh-cache-bricks",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DSH web plugin: cache hit rate as falling Tetris-style bricks in the blank gutter beside the conversation \u2014 one brick per real model request attempt, one column per task, amber below 90% and red below 70%.",
   "type": "module",
   "main": "lib/index.js",

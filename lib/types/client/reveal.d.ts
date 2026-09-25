@@ -37,6 +37,21 @@ export interface RevealElement {
     /** Fire an event at the element; used for the Chat view's `beforematch` reveal. */
     dispatchEvent?(event: Event): boolean;
     readonly parentElement?: RevealElement | null;
+    /**
+     * Present when this element scrolls its own content.
+     *
+     * A long Turn's process group is one: DSH caps it (`max-height`) and lets it scroll inside, so a
+     * row can be in the DOM, laid out, and still invisible — clipped by the group rather than by the
+     * conversation. The reveal has to move that port too, or it "reaches" a row nobody can see.
+     */
+    readonly scrollHeight?: number;
+    readonly clientHeight?: number;
+    /** Writable: the reveal moves nested ports, not only the conversation. */
+    scrollTop?: number;
+    scrollTo?(options: {
+        top: number;
+        behavior?: 'smooth' | 'auto';
+    }): void;
     readonly isConnected?: boolean;
     readonly disabled?: boolean;
     readonly textContent?: string | null;
@@ -95,6 +110,13 @@ export interface RevealOutcome {
      * that is not the brick's own, and the notice says which half was missing.
      */
     readonly fellBack?: true;
+    /**
+     * True when the declared row was reached and is **not visible**: something between it and the
+     * conversation — in practice a capped process group whose own port would not bring it into view —
+     * is clipping it. The identity matched; the reader still cannot see it, so it is not reported as
+     * a successful landing and it is never highlighted.
+     */
+    readonly hidden?: true;
     /** The row that was reached, when one was. */
     readonly element?: RevealElement;
 }
@@ -167,6 +189,36 @@ export declare function findStepNodes(root: RevealScroller, turn: number, step: 
  * @returns the button, or undefined when that Turn has no process group on screen.
  */
 export declare function findProcessToggle(root: RevealScroller, turn: number): RevealElement | undefined;
+/**
+ * The capped process group a row sits inside, when it has one.
+ *
+ * DSH gives a long Turn's process group its own scrollport — `[data-step-process-body]`, capped by
+ * `max-height` — so scrolling the *conversation* moves the group onto the screen and leaves the row
+ * exactly where it was inside the group. That is how a jump came to report `exact` while the reader
+ * saw nothing: the row was reached, highlighted, and clipped.
+ *
+ * The anchor is the official attribute. A rename degrades to the structural fallback — the
+ * innermost scrollable ancestor that is not the conversation itself — so the chain keeps working
+ * without depending on a name that may move.
+ *
+ * @param row - the row that was found.
+ * @param root - the conversation's own scrollport.
+ * @returns the port to scroll first, or undefined when the row is not inside one.
+ */
+export declare function processScrollport(row: RevealElement, root: RevealScroller): RevealElement | undefined;
+/**
+ * Whether a reader can actually see this row: inside the conversation's viewport **and** inside
+ * every scrollport between the two.
+ *
+ * `exact` used to mean "the declared row was found in the DOM", which is not the same claim. On a
+ * capped process group the two came apart, so the verdict is now checked against the boxes the
+ * reader actually has.
+ *
+ * @param row - the row that was reached.
+ * @param root - the conversation's own scrollport.
+ * @returns true when nothing between the row and the conversation clips it.
+ */
+export declare function rowVisible(row: RevealElement, root: RevealScroller): boolean;
 /**
  * Every tool-call node for one call id.
  *
@@ -258,6 +310,17 @@ export declare function stepsInTurn(root: RevealScroller, turn: number): {
  */
 export type BrickLocateResult = {
     readonly status: 'exact';
+    readonly row: RevealRow;
+    readonly element: RevealElement;
+}
+/**
+ * The declared row was found, and the reader cannot see it.
+ *
+ * Kept apart from `exact` on purpose: reporting a landing the reader cannot see is the one lie
+ * this whole module exists to prevent, and it is what a capped process group produced.
+ */
+ | {
+    readonly status: 'exact-not-visible';
     readonly row: RevealRow;
     readonly element: RevealElement;
 } | {

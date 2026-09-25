@@ -74,6 +74,30 @@ function render(overrides: Partial<BrickPanelProps> = {}): string {
   return renderToStaticMarkup(createElement(BrickPanel, props))
 }
 
+describe('BrickPanel: a row that was found and cannot be seen', () => {
+  it('refuses to call it located when a process group is clipping it', () => {
+    const element = { getBoundingClientRect: () => ({ top: 10, height: 20 }) }
+    const hidden = render({
+      jump: {
+        turn: 4, step: 10, accuracy: 'exact', row: 'assistant-step', expanded: false,
+        load: { status: 'not-needed' },
+        locate: { status: 'exact-not-visible', row: 'assistant-step', element },
+      },
+    })
+    expect(hidden).toContain('found, not visible')
+    expect(hidden).toContain('nothing was highlighted')
+    // The same jump, visible, still reads as a landing — the check is not a blanket downgrade.
+    const visible = render({
+      jump: {
+        turn: 4, step: 10, accuracy: 'exact', row: 'assistant-step', expanded: false,
+        load: { status: 'not-needed' },
+        locate: { status: 'exact', row: 'assistant-step', element },
+      },
+    })
+    expect(visible).toContain('the request has its own row on screen')
+  })
+})
+
 describe('BrickPanel', () => {
   it('shows every tab, and the identity of the attempt in the header', () => {
     const markup = render()

@@ -11,6 +11,51 @@
 > (1.7.2-a, `historical-step`), and history had no type because the log was read by a poorer reader
 > than the live path (1.7.2-c, `src/core/replay.ts`).
 
+## 0.1.3 — a landing you can see
+
+One fix on top of 0.1.2, developed against the local instance and ported here. The brick contract,
+the data model, the rendering rules and the colour thresholds are untouched; the colour work
+continues on the local line.
+
+Reported from the running board: double-clicking a brick from a long Turn located nothing and
+highlighted nothing, because the row lives inside the Turn's **capped process group**
+(`[data-step-process-body]`, `max-height` plus `overflow-y: auto`) and only the conversation's own
+scrollport was moved. The group came on screen; the row stayed where it was inside it. The second
+half was worse: the flash *was* applied — to the correct DOM row — where the group clipped it, and
+the panel still said `exact / 已定位`.
+
+- **inside out**: `scrollToRow` moves the group's port first (`behavior: 'auto'`, because two
+  animations at once make the row a moving target), re-measures the row, and only then scrolls the
+  conversation. `scrollIntoView()` is deliberately not used: sticky chrome, follow-scroll and
+  prepend anchoring all live on this surface, and one call that scrolls every ancestor at once
+  would fight them. The anchor is the official attribute, with a structural fallback to the
+  innermost scrollable ancestor, so a rename degrades instead of regressing;
+- **visible, or it did not happen**: the board waits for the *row's* rect to settle rather than the
+  conversation's `scrollTop` — the latter says nothing about a row inside a port — and then checks
+  `rowVisible()`: inside the conversation's box **and** inside every port between them. If it is not
+  visible there is no flash, and the verdict is `exact-not-visible`, printed by the panel as "found,
+  not visible" and explained by the notice.
+
+Verification on this release:
+
+- `pnpm run typecheck` clean; **371 unit tests passing, 2 skipped** (0.1.2's 367 plus the reveal and
+  panel cases this fix adds);
+- `pnpm run test:scroll` — **47/47** in a real browser (unchanged from 0.1.2: this fix adds no
+  browser fixture, because the level it needs lives in the unit fixture below);
+- `tests/reveal.spec.ts` — the fixture grew the scroll level it was missing, which is why the
+  existing browser checks could not see this bug: every row used to be one `scrollTop` away from
+  the conversation. It now models a capped group with its own `scrollTop`, rows nested under it, and
+  **live** geometry. Three cases: the port is scrolled first to a value that brings the row inside
+  it and the conversation is asked afterwards; a group that cannot scroll yields
+  `exact-not-visible` instead of a landing; and an element that merely has the metrics is not
+  treated as a port when it has nothing to scroll;
+- `tests/panel.spec.ts` — the detail prints "found, not visible" and "nothing was highlighted" for
+  that verdict, and still prints the ordinary landing for a row that is visible;
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- measured on the running instance: `[data-step-process-body]` exists with `max-height: 400px` and
+  holds `assistant-step*` / `tool-call*` rows — the mechanism, in the real DOM. The end-to-end
+  gesture on a long Turn is the confirmation a reader performs on their own screen.
+
 ## 0.1.2 — public GitHub distribution
 
 The 0.1.2 release starts from the local `v0.1.1` stable commit; the public GitHub line starts at `v0.1.2`. No `src/` runtime implementation changed. The changes are distribution and documentation: the package version, exact `0.1.7-rc.2` DSH client peer range, prebuilt `lib/` files, portable verification-script defaults, synthetic release screenshots, and a GitHub-only release workflow.

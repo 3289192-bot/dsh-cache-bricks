@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   findProcessToggle,
+  rowVisible,
   findStepNodes,
   locateResultOf,
   nodeSeqOf,
@@ -51,10 +52,29 @@ function scroller(options: {
   compactions?: { compactionId: string; height: number }[]
   anchors?: { seq: number; kind: string; id: string; height: number; turn?: number }[]
   process?: { turn: number; expanded: boolean; reveals: boolean }
-}): RevealScroller & { scrolls: number[]; pages: number } {
+  /**
+   * A capped process group — DSH's `[data-step-process-body]`.
+   *
+   * The level the fixture used to be missing, which is why a real bug lived through 29 browser
+   * checks: a Turn whose steps sit inside their own scrollport. `offsetOf` places a step inside it,
+   * in the port's own coordinates; the rows of `turn` are nested under the port and their on-screen
+   * position follows the port's `scrollTop`, exactly as a browser would report it.
+   */
+  port?: {
+    readonly turn: number
+    readonly top: number
+    readonly clientHeight: number
+    readonly scrollHeight: number
+    /** Where each step sits inside the port's content, by step number. */
+    readonly offsetOf: (step: number) => number
+  }
+}): RevealScroller & { scrolls: number[]; pages: number; portScrolls: number[]; port: { scrollTop: number } } {
   const mounted = new Set(options.turns ?? [])
+  const portState = { scrollTop: 0 }
   const state = {
     scrolls: [] as number[],
+    portScrolls: [] as number[],
+    port: portState,
     pages: 0,
     scrollTop: 0,
     scrollHeight: 10_000,
@@ -88,8 +108,31 @@ function scroller(options: {
             entry,
           })),
         ]
-        return rows.map((row) => ({
-          getBoundingClientRect: () => ({ top: row.top, height: row.entry.height }),
+        const port = options.port
+        const portElement: RevealElement | undefined = port === undefined ? undefined : {
+          getBoundingClientRect: () => ({ top: port.top }),
+          getAttribute: (name: string) => (name === 'data-step-process-body' ? '' : null),
+          scrollHeight: port.scrollHeight,
+          clientHeight: port.clientHeight,
+          get scrollTop() { return portState.scrollTop },
+          set scrollTop(value: number) { portState.scrollTop = value },
+          scrollTo: (value: { top: number }) => { state.portScrolls.push(value.top); portState.scrollTop = value.top },
+        }
+        return rows.map((row) => {
+          const inPort = port !== undefined && row.key.includes(`assistant-step${String(port.turn)}:`)
+          const step = Number(/assistant-step\d+:(\d+)/u.exec(row.key)?.[1] ?? 0)
+          return {
+          // A row inside the port is *laid out* — height and all — and can still be clipped by it.
+          // That is the whole bug: `isLaidOut` says yes, the reader says nothing.
+          //
+          // The position is read **live**, the way a browser reports it: scrolling the port moves
+          // the row. A snapshot here would hide the very thing the fix depends on — re-measuring
+          // after the inner scroll — which is how the fixture earned its second scroll level.
+          getBoundingClientRect: () => ({
+            top: inPort && port !== undefined ? port.top + port.offsetOf(step) - portState.scrollTop : row.top,
+            height: row.entry.height,
+          }),
+          ...(inPort && portElement !== undefined ? { parentElement: portElement } : {}),
           getAttribute: (name: string) => (name === 'data-chat-node-key' ? row.key
             : name === 'data-chat-group-part' ? row.group
               : name === 'hidden' ? (row.entry.untilFound === true ? 'until-found' : null)
@@ -105,7 +148,8 @@ function scroller(options: {
             row.entry.height = 24
             return true
           },
-        }))
+        }
+        })
       }
       if (selector === 'button[data-turn-process]') {
         const process = options.process
@@ -384,6 +428,59 @@ describe('revealBrick: exact or nothing', () => {
     const outcome = await revealBrick(root, { kind: 'none', reason: 'session-title' }, { wait: instant })
     expect(outcome).toMatchObject({ accuracy: 'none', row: 'none', load: { status: 'nothing-to-load' } })
     expect((root as unknown as { scrolls: number[] }).scrolls).toEqual([])
+  })
+})
+
+describe('a row inside a capped process group', () => {
+  /** A Turn of twelve steps, capped at 200px, with step 10 sitting 900px down its content. */
+  const capped = () => scroller({
+    turns: [4],
+    steps: Array.from({ length: 12 }, (_, index) => ({ turn: 4, step: index + 1, height: 24 })),
+    port: { turn: 4, top: 200, clientHeight: 200, scrollHeight: 1_200, offsetOf: (step) => step * 100 },
+  })
+
+  it('scrolls the process group first, then measures again and scrolls the conversation', async () => {
+    // The bug this exists for: only the conversation was scrolled, so the group came on screen and
+    // the row stayed where it was inside it — reached, highlighted, and clipped.
+    const root = capped()
+    const outcome = await revealBrick(root, { kind: 'assistant-step', turn: 4, step: 10, part: 'response' }, { wait: instant })
+    expect(outcome.accuracy).toBe('exact')
+    // The inner port moved, and it moved to a value that actually brings the row into its box.
+    expect(root.portScrolls.length).toBeGreaterThan(0)
+    expect(root.port.scrollTop).toBeGreaterThan(800)
+    expect(root.port.scrollTop).toBeLessThanOrEqual(1_000)
+    // And the conversation was asked for a position *after* that, measured from the new geometry.
+    expect((root as unknown as { scrolls: number[] }).scrolls.length).toBeGreaterThan(0)
+    // The row a reader would see is inside the port's box now.
+    expect(rowVisible(outcome.element!, root)).toBe(true)
+  })
+
+  it('never calls it a landing when the group will not show the row', async () => {
+    // A port with nothing to scroll and a row outside its box: the identity matches, the reader
+    // sees nothing, and the honest answer is exactly that.
+    const root = scroller({
+      turns: [4],
+      steps: [{ turn: 4, step: 10, height: 24 }],
+      port: { turn: 4, top: 200, clientHeight: 200, scrollHeight: 200, offsetOf: (step) => step * 100 },
+    })
+    const outcome = await revealBrick(root, { kind: 'assistant-step', turn: 4, step: 10, part: 'response' }, { wait: instant })
+    expect(outcome.accuracy).toBe('exact')
+    expect(rowVisible(outcome.element!, root)).toBe(false)
+    // The board's own verdict for that state, and the one the panel prints.
+    expect(locateResultOf({ ...outcome, hidden: true })).toMatchObject({ status: 'exact-not-visible', row: 'assistant-step' })
+  })
+
+  it('is not fooled by a scrollport that merely exists', async () => {
+    // `scrollHeight === clientHeight` is not a port: nothing to scroll, nothing to clip.
+    const root = scroller({
+      turns: [4],
+      steps: [{ turn: 4, step: 1, height: 24 }],
+      port: { turn: 4, top: 0, clientHeight: 200, scrollHeight: 200, offsetOf: () => 10 },
+    })
+    const outcome = await revealBrick(root, { kind: 'assistant-step', turn: 4, step: 1, part: 'response' }, { wait: instant })
+    expect(outcome.accuracy).toBe('exact')
+    expect(rowVisible(outcome.element!, root)).toBe(true)
+    expect(root.portScrolls).toEqual([])
   })
 })
 

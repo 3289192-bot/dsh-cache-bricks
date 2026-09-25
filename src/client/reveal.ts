@@ -41,6 +41,18 @@ export interface RevealElement {
   /** Fire an event at the element; used for the Chat view's `beforematch` reveal. */
   dispatchEvent?(event: Event): boolean
   readonly parentElement?: RevealElement | null
+  /**
+   * Present when this element scrolls its own content.
+   *
+   * A long Turn's process group is one: DSH caps it (`max-height`) and lets it scroll inside, so a
+   * row can be in the DOM, laid out, and still invisible — clipped by the group rather than by the
+   * conversation. The reveal has to move that port too, or it "reaches" a row nobody can see.
+   */
+  readonly scrollHeight?: number
+  readonly clientHeight?: number
+  /** Writable: the reveal moves nested ports, not only the conversation. */
+  scrollTop?: number
+  scrollTo?(options: { top: number; behavior?: 'smooth' | 'auto' }): void
   readonly isConnected?: boolean
   readonly disabled?: boolean
   readonly textContent?: string | null
@@ -95,6 +107,13 @@ export interface RevealOutcome {
    * that is not the brick's own, and the notice says which half was missing.
    */
   readonly fellBack?: true
+  /**
+   * True when the declared row was reached and is **not visible**: something between it and the
+   * conversation — in practice a capped process group whose own port would not bring it into view —
+   * is clipping it. The identity matched; the reader still cannot see it, so it is not reported as
+   * a successful landing and it is never highlighted.
+   */
+  readonly hidden?: true
   /** The row that was reached, when one was. */
   readonly element?: RevealElement
 }
@@ -227,7 +246,92 @@ export function findProcessToggle(root: RevealScroller, turn: number): RevealEle
 }
 
 /** Scroll so the row sits about a quarter down the viewport. */
+/** Whether an element is a scrollport with something to scroll. */
+function scrollsItself(node: RevealElement): boolean {
+  return typeof node.scrollTo === 'function'
+    && typeof node.clientHeight === 'number'
+    && typeof node.scrollHeight === 'number'
+    && node.scrollHeight > node.clientHeight + 1
+}
+
+/**
+ * The capped process group a row sits inside, when it has one.
+ *
+ * DSH gives a long Turn's process group its own scrollport — `[data-step-process-body]`, capped by
+ * `max-height` — so scrolling the *conversation* moves the group onto the screen and leaves the row
+ * exactly where it was inside the group. That is how a jump came to report `exact` while the reader
+ * saw nothing: the row was reached, highlighted, and clipped.
+ *
+ * The anchor is the official attribute. A rename degrades to the structural fallback — the
+ * innermost scrollable ancestor that is not the conversation itself — so the chain keeps working
+ * without depending on a name that may move.
+ *
+ * @param row - the row that was found.
+ * @param root - the conversation's own scrollport.
+ * @returns the port to scroll first, or undefined when the row is not inside one.
+ */
+export function processScrollport(row: RevealElement, root: RevealScroller): RevealElement | undefined {
+  let innermost: RevealElement | undefined
+  for (let node = row.parentElement; node !== null && node !== undefined; node = node.parentElement) {
+    if ((node as unknown) === (root as unknown)) break
+    if (!scrollsItself(node)) continue
+    if (node.getAttribute?.('data-step-process-body') != null) return node
+    innermost ??= node
+  }
+  return innermost
+}
+
+/** Whether a row's box sits inside a port's box, allowing a pixel of rounding. */
+function insidePort(row: RevealElement, port: RevealElement): boolean {
+  const rect = row.getBoundingClientRect()
+  if (rect.height !== undefined && rect.height <= 0) return false
+  const top = port.getBoundingClientRect().top
+  const height = port.clientHeight ?? 0
+  const bottom = rect.top + (rect.height ?? 0)
+  return rect.top >= top - 1 && bottom <= top + height + 1
+}
+
+/**
+ * Whether a reader can actually see this row: inside the conversation's viewport **and** inside
+ * every scrollport between the two.
+ *
+ * `exact` used to mean "the declared row was found in the DOM", which is not the same claim. On a
+ * capped process group the two came apart, so the verdict is now checked against the boxes the
+ * reader actually has.
+ *
+ * @param row - the row that was reached.
+ * @param root - the conversation's own scrollport.
+ * @returns true when nothing between the row and the conversation clips it.
+ */
+export function rowVisible(row: RevealElement, root: RevealScroller): boolean {
+  if (!insidePort(row, root as unknown as RevealElement)) return false
+  for (let node = row.parentElement; node !== null && node !== undefined; node = node.parentElement) {
+    if ((node as unknown) === (root as unknown)) break
+    if (scrollsItself(node) && !insidePort(row, node)) return false
+  }
+  return true
+}
+
+/**
+ * Bring one row into view, **inside out**.
+ *
+ * The order is the whole fix, and it is DSH's own model: scroll the capped process group first —
+ * instantly, because two animations at once make the row a moving target — then re-measure, then
+ * scroll the conversation. Scrolling only the conversation is what left the row clipped.
+ *
+ * @param root - the conversation's scrollport.
+ * @param row - the row to reach.
+ */
 function scrollToRow(root: RevealScroller, row: RevealElement): void {
+  const inner = processScrollport(row, root)
+  if (inner !== undefined) {
+    const innerTop = row.getBoundingClientRect().top - inner.getBoundingClientRect().top + (inner.scrollTop ?? 0)
+    inner.scrollTo?.({
+      top: revealTarget(innerTop, inner.scrollHeight ?? 0, inner.clientHeight ?? 0),
+      behavior: 'auto',
+    })
+  }
+  // Re-measure: the inner scroll just changed where the row is on the screen.
   const rowTop = row.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop
   root.scrollTo({
     top: revealTarget(rowTop, root.scrollHeight, root.clientHeight),
@@ -458,6 +562,13 @@ function findOtherHalf(root: RevealScroller, target: BrickTarget): { row: Reveal
  */
 export type BrickLocateResult =
   | { readonly status: 'exact'; readonly row: RevealRow; readonly element: RevealElement }
+  /**
+   * The declared row was found, and the reader cannot see it.
+   *
+   * Kept apart from `exact` on purpose: reporting a landing the reader cannot see is the one lie
+   * this whole module exists to prevent, and it is what a capped process group produced.
+   */
+  | { readonly status: 'exact-not-visible'; readonly row: RevealRow; readonly element: RevealElement }
   | { readonly status: 'step-other-half'; readonly row: RevealRow; readonly element: RevealElement }
   | { readonly status: 'host-projection-blocked'; readonly seq: number }
   | { readonly status: 'loaded-awaiting-render' }
@@ -474,7 +585,9 @@ export function locateResultOf(outcome: RevealOutcome): BrickLocateResult {
     return { status: 'step-other-half', row: outcome.row, element: outcome.element }
   }
   if (outcome.accuracy === 'exact' && outcome.element !== undefined) {
-    return { status: 'exact', row: outcome.row, element: outcome.element }
+    return outcome.hidden === true
+      ? { status: 'exact-not-visible', row: outcome.row, element: outcome.element }
+      : { status: 'exact', row: outcome.row, element: outcome.element }
   }
   const { status, seq } = outcome.load
   // Coverage without an exact row is not proof of an assembler failure. A delayed mount,

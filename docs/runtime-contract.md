@@ -254,3 +254,20 @@ instances. It is also why `toolHistory` is read as an **optional** field: 0.1.6-
 same code produces the same hash on all three lines (asserted in `tests/observe.spec.ts`).
 The host half imports no DSH package at runtime — it speaks structural
 types only — which is what makes that claim testable rather than hopeful.
+
+## The process group has its own scrollport (0.1.3)
+
+A long Turn's process group is capped and scrolls inside itself:
+
+- the anchor is `[data-step-process-body]`, and the cap is a `max-height` (measured on the running
+  instance: `max-height: 400px`, `overflow-y: auto`, holding `assistant-step*` and `tool-call*`
+  node rows);
+- the official viewport handling is **inner first, then outer**: the group's own scrollport is
+  moved, then the conversation's. `use-chat-viewport.ts` is the reference;
+- therefore a row can be **in the DOM, laid out, and clipped** by the group. `isLaidOut` (height
+  > 0, no `hidden` ancestor) is not a visibility test, and treating it as one is what made a jump
+  report `exact` while the reader saw nothing;
+- the plugin reads the attribute by name and falls back to the innermost scrollable ancestor when
+  it is absent, so a rename degrades to "still works" rather than to the bug;
+- the plugin never calls `scrollIntoView()`: this surface also has sticky chrome, follow-scroll and
+  prepend anchoring, and one call that scrolls every ancestor at once would fight them.
