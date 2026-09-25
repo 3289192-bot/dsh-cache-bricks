@@ -19,7 +19,14 @@ import type { BrickTarget } from './target';
 import { type ActivityKind, type BoardColumn, type Brick, type BrickAbnormal, type BrickContent } from './tetris';
 /** Tone for a record's reading, with the same honesty rule the badges use. */
 export declare function toneOfRatio(ratio: number | undefined, promptTokens: number | undefined): CacheTone;
-/** Compact brick face: whole percent from 10% up, one decimal below it. */
+/**
+ * Compact brick face: one decimal, `n/a` when the provider reported no cache fields.
+ *
+ * The same rule the client's own fold uses (`percentLabel`), so a brick reads the same
+ * whichever half produced it.
+ * @param ratio - share in [0, 1], or undefined when nothing was reported.
+ * @returns e.g. `99.9%`, `100%`, `n/a`.
+ */
 export declare function labelOfRatio(ratio: number | undefined): string;
 /** What the board needs from one source. */
 export interface BoardData {
@@ -199,7 +206,10 @@ export declare function recordFromReading(reading: StepReading): BrickRecord;
  *
  * This is the one place the board shows a different granularity from the rest of it, and
  * it is a degradation, not a mode: with no host half there is no attempt identity to be
- * had, so these bricks carry `target: none` and cannot navigate.
+ * had. That costs the brick its *attempt* precision — it cannot say which of a step's
+ * requests it is — but not its place in the conversation: it carries a `historical-step`
+ * target, which the jump resolves against the durable log, so a folded brick still opens
+ * the row its step became (`resolveHistoricalStep`).
  *
  * The records are reduced (`observedBy: 'client'`), which is enough for the
  * overview tab and the diff's cache rows, and visibly not enough for the rest.
@@ -207,3 +217,39 @@ export declare function recordFromReading(reading: StepReading): BrickRecord;
  * @returns board data, with a reduced record per brick.
  */
 export declare function boardFromReadings(turns: readonly StepReading[]): BoardData;
+/**
+ * Everything the board can be built from, weakest first.
+ *
+ * The three sources answer three different questions, and none of them contains the others:
+ *
+ * - the **collector** knows this process's attempts — one brick per request, retry included,
+ *   with the request, the timed stream and the dispatch-time context kept by reference — and
+ *   nothing that happened before it started or after its LRU dropped a session;
+ * - a **replay** of the session's own log knows every settled attempt of the turns the client
+ *   is holding, at attempt granularity, with the log's own usage, activity, retries and
+ *   settlement positions — but no request capture (`../core/replay`);
+ * - the **fold** is the browser's per-step reading, for a core with no session face at all.
+ */
+export interface BoardSources {
+    /** The collector's feed, when a host half is answering this session. */
+    readonly live?: BrickFeed;
+    /** The session's log, replayed into bricks. */
+    readonly replay?: BrickFeed;
+    /** The client's own per-step readings. */
+    readonly readings?: readonly StepReading[];
+}
+/**
+ * Build one board out of everything available.
+ *
+ * Merging is **per attempt**, not per step: a step whose first attempt happened before the
+ * collector started and whose second it watched must still come out as two bricks, because that
+ * pair is the case this plugin exists for. So the live feed wins on the attempts it has, a
+ * replay fills the attempts it does not, and the fold supplies steps neither covers — one
+ * step-level brick per step, dropped as soon as any attempt-level brick covers that step, since
+ * keeping both would count the same request twice.
+ *
+ * @param sources - live feed, replayed feed and folded readings, any of them optional.
+ * @returns the merged board. The board-level `estimated` flag is set only for a board that is
+ *   *entirely* folded, where the claim is true of every brick.
+ */
+export declare function boardFromSources(sources: BoardSources): BoardData;

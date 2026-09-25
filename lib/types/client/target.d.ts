@@ -17,6 +17,12 @@
  * attempt *is* in the transcript; whether that row is currently rendered is a separate
  * question, answered by the reveal's accuracy.
  *
+ * Targets come in two granularities, and the difference is the brick's, not the row's:
+ * a **collected** brick names one attempt (`assistant-step` / `tool-call` / `retry-chain` /
+ * `compaction`), while a **folded** brick names one step (`historical-step`) and is resolved
+ * against the durable log when the jump runs. Both are exact landings at their own
+ * granularity; only the board's own marking (`estimated`) tells the reader which one they got.
+ *
  * Every reachable target also carries **`loadSeq`** — the durable log position the session
  * window has to cover before that row can exist at all. It is the one input the official
  * loader needs (`ISession.loadThrough(seq)`), and it is taken from the record's own settling
@@ -69,11 +75,42 @@ export type BrickTarget =
     readonly compactionId: string;
     readonly loadSeq?: number;
 }
+/**
+ * A step the client folded itself — no attempt identity, but a real place in the conversation.
+ *
+ * The fold sees usage per step, so it cannot say *which request* a brick is, and it must not
+ * pretend to. It can say *which step of which Turn* it is, because the durable log is the
+ * session's own record of exactly that — and a step is a row. Treating "no attempt identity"
+ * as "nothing to navigate to" threw that away: after a restart (or an eviction, or a resumed
+ * old session) every brick older than the collector became a brick that could not be opened
+ * in the conversation, even though the brick, the log and the loader all knew where it was.
+ *
+ * So this target is resolved **at navigation time**, against the log: load through
+ * `loadSeq`, read the step, and land on the row it actually became — a message half, a tool
+ * call, a retry chain. What it never does is claim more than the fold measured: the landing
+ * is **step**-exact, and the board marks these bricks as folded (`estimated`, dashed, `≈`),
+ * so a step-level landing is never read as "this is the attempt you clicked".
+ */
+ | {
+    readonly kind: 'historical-step';
+    readonly turn: number;
+    readonly step: number;
+    readonly loadSeq?: number;
+}
 /** Nothing in the transcript can represent this attempt; the reason says why. */
  | {
     readonly kind: 'none';
-    readonly reason: 'session-title' | 'no-compaction-id' | 'client-fold';
+    readonly reason: 'session-title' | 'no-compaction-id';
 };
+/**
+ * A folded brick's target: the step, and how far back the log has to be loaded to read it.
+ *
+ * Named because three modules pass it around (the board, the reveal, the log reader) and the
+ * `Extract` spelling at every one of those seams would hide what they are agreeing on.
+ */
+export type HistoricalStepTarget = Extract<BrickTarget, {
+    kind: 'historical-step';
+}>;
 /**
  * How exactly a brick reached its row.
  *

@@ -56,7 +56,7 @@ function loadBundle(): LoadedBundle {
 
   expect(registrations).toHaveLength(1)
   const registration = registrations[0]!
-  expect(registration.id).toBe('dsh-cache-badge')
+  expect(registration.id).toBe('dsh-cache-bricks')
 
   const exports = registration.factory((spec: string) => {
     requested.push(spec)
@@ -136,7 +136,7 @@ function turnNode(bundle: LoadedBundle, steps: { usage: unknown; provider?: stri
     matches.push({ event, location: { kind: 'turn', turn: { turn } } })
   }
   return definition.buildViewNode({
-    key: 'k', id: `turn:${turn}`, kind: 'cache-badge', target: 'chat', state, matches,
+    key: 'k', id: `turn:${turn}`, kind: 'cache-bricks', target: 'chat', state, matches,
     start: { event: first, role: 'start', location: { kind: 'turn', turn: { turn } } },
   } as any)
 }
@@ -149,7 +149,7 @@ describe('built client bundle', () => {
   })
 
   it('registers itself under the served id and asks only for baseline modules', () => {
-    expect(bundle.id).toBe('dsh-cache-badge')
+    expect(bundle.id).toBe('dsh-cache-bricks')
     expect(bundle.exports.inject).toEqual(['slots'])
     // `react` and the JSX runtime, both from the shell's module table, and
     // nothing else: a cross-plugin value import would show up here.
@@ -165,7 +165,7 @@ describe('built client bundle', () => {
   it('takes one session seat for the board controller and nothing else', () => {
     expect(bundle.injected).toContain('conversation.chat.node')
     expect(bundle.slots).toEqual([
-      { name: 'conversation.composer.dock', id: 'cache-badge', order: 1 },
+      { name: 'conversation.composer.dock', id: 'cache-bricks', order: 1 },
     ])
   })
 

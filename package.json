@@ -1,7 +1,7 @@
 {
-  "name": "dsh-cache-badge",
-  "version": "1.7.1",
-  "description": "DSH web plugin: cache hit rate as falling Tetris-style bricks in the blank gutter beside the conversation — one brick per real model request attempt, one column per task, red below 10%.",
+  "name": "dsh-cache-bricks",
+  "version": "0.1.2",
+  "description": "DSH web plugin: cache hit rate as falling Tetris-style bricks in the blank gutter beside the conversation \u2014 one brick per real model request attempt, one column per task, amber below 90% and red below 70%.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -38,6 +38,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:clickfix": "node scripts/test-clickfix.mjs",
+    "test:scroll": "node scripts/test-scroll.mjs",
     "verify:host": "node scripts/verify-host-artifact.mjs",
     "verify:live": "node scripts/live-verify.mjs",
     "verify:ui": "node scripts/ui-verify.mjs",
@@ -58,10 +59,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-chat": ">=0.1.6-alpha.1 <0.1.8-0",
-    "@deepseek-ai/dsh-client-ui-conversation": ">=0.1.6-alpha.1 <0.1.8-0",
-    "@deepseek-ai/dsh-client-ui-renderer": ">=0.1.6-alpha.1 <0.1.8-0",
-    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.6-alpha.1 <0.1.8-0",
+    "@deepseek-ai/dsh-client-ui-chat": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.7-rc.2",
     "react": "^18.0.0"
   },
   "devDependencies": {
@@ -83,12 +84,6 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "license": "MIT",
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "deepseek-harness",
-    "prompt-cache"
-  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/3289192-bot/dsh-cache-bricks.git"
@@ -96,5 +91,11 @@
   "homepage": "https://github.com/3289192-bot/dsh-cache-bricks#readme",
   "bugs": {
     "url": "https://github.com/3289192-bot/dsh-cache-bricks/issues"
-  }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "prompt-cache"
+  ]
 }

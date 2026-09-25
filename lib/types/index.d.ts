@@ -15,7 +15,7 @@
  * the installed runtime.
  */
 import { type CollectorOptions } from './host/collect';
-export declare const name = "dsh-cache-badge";
+export declare const name = "dsh-cache-bricks";
 /**
  * Install the collector.
  *

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { installCollector, type HostContextLike } from '../src/host/collect'
-import { createCacheBadgeRouter, type RouteRequestLike, type RouteResponseLike } from '../src/host/routes'
+import { createCacheBricksRouter, type RouteRequestLike, type RouteResponseLike } from '../src/host/routes'
 
 /** A response fake that records what the router did. */
 function fakeResponse(): RouteResponseLike & { body: string; headers: Record<string, string>; status?: number; events: string[] } {
@@ -48,47 +48,47 @@ describe('the route namespace', () => {
   }
 
   it('serves the sessions and the feed of one session', () => {
-    const { handler, path } = createCacheBadgeRouter(deps)
-    expect(path).toBe('/cache-badge')
+    const { handler, path } = createCacheBricksRouter(deps)
+    expect(path).toBe('/cache-bricks')
     const sessions = fakeResponse()
-    handler(fakeRequest('/cache-badge/sessions'), sessions)
+    handler(fakeRequest('/cache-bricks/sessions'), sessions)
     expect(JSON.parse(sessions.body)).toEqual({ sessions: ['s1'] })
 
     const feed = fakeResponse()
-    handler(fakeRequest('/cache-badge/attempts?sessionId=s1'), feed)
+    handler(fakeRequest('/cache-bricks/attempts?sessionId=s1'), feed)
     expect(feed.statusCode).toBe(200)
     expect(JSON.parse(feed.body).sessionId).toBe('s1')
   })
 
   it('says 404 rather than inventing a feed for an unobserved session', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const response = fakeResponse()
-    handler(fakeRequest('/cache-badge/attempts?sessionId=nope'), response)
+    handler(fakeRequest('/cache-bricks/attempts?sessionId=nope'), response)
     expect(response.statusCode).toBe(404)
   })
 
   it('requires a session id and refuses an unknown route', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const missing = fakeResponse()
-    handler(fakeRequest('/cache-badge/attempts'), missing)
+    handler(fakeRequest('/cache-bricks/attempts'), missing)
     expect(missing.statusCode).toBe(400)
     const unknown = fakeResponse()
-    handler(fakeRequest('/cache-badge/nope'), unknown)
+    handler(fakeRequest('/cache-bricks/nope'), unknown)
     expect(unknown.statusCode).toBe(404)
   })
 
   it('resolves a blob by ref and reports an evicted one', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const ok = fakeResponse()
-    handler(fakeRequest('/cache-badge/blob?ref=abc'), ok)
+    handler(fakeRequest('/cache-bricks/blob?ref=abc'), ok)
     expect(JSON.parse(ok.body)).toEqual({ ref: 'abc', value: { value: 1 } })
     const gone = fakeResponse()
-    handler(fakeRequest('/cache-badge/blob?ref=zzz'), gone)
+    handler(fakeRequest('/cache-bricks/blob?ref=zzz'), gone)
     expect(gone.statusCode).toBe(404)
   })
 
   it('honours a configured base path instead of slicing a hardcoded one', () => {
-    const { handler, path } = createCacheBadgeRouter(deps, { basePath: '/badge/v2' })
+    const { handler, path } = createCacheBricksRouter(deps, { basePath: '/badge/v2' })
     expect(path).toBe('/badge/v2')
     const response = fakeResponse()
     handler(fakeRequest('/badge/v2/sessions'), response)
@@ -98,49 +98,49 @@ describe('the route namespace', () => {
 
   it('defers to the harness request policy when one is available', () => {
     const seen: unknown[] = []
-    const { handler } = createCacheBadgeRouter(deps, {
+    const { handler } = createCacheBricksRouter(deps, {
       guard: (request) => {
         seen.push(request)
         return 401
       },
     })
     const response = fakeResponse()
-    handler(fakeRequest('/cache-badge/sessions'), response)
+    handler(fakeRequest('/cache-bricks/sessions'), response)
     expect(seen).toHaveLength(1)
     expect(response.statusCode).toBe(401)
   })
 
   it('treats an unidentifiable peer as remote, not as local', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const response = fakeResponse()
-    handler({ method: 'GET', url: '/cache-badge/sessions', headers: { host: '127.0.0.1:18090' } }, response)
+    handler({ method: 'GET', url: '/cache-bricks/sessions', headers: { host: '127.0.0.1:18090' } }, response)
     expect(response.statusCode).toBe(403)
   })
 
   it('refuses anything that is not a local, same-origin GET', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const remote = fakeResponse()
-    handler({ ...fakeRequest('/cache-badge/sessions'), socket: { remoteAddress: '10.0.0.9' } }, remote)
+    handler({ ...fakeRequest('/cache-bricks/sessions'), socket: { remoteAddress: '10.0.0.9' } }, remote)
     expect(remote.statusCode).toBe(403)
 
     const crossOrigin = fakeResponse()
-    handler(fakeRequest('/cache-badge/sessions', 'GET', { origin: 'https://evil.example' }), crossOrigin)
+    handler(fakeRequest('/cache-bricks/sessions', 'GET', { origin: 'https://evil.example' }), crossOrigin)
     expect(crossOrigin.statusCode).toBe(403)
 
     const posted = fakeResponse()
-    handler(fakeRequest('/cache-badge/sessions', 'POST'), posted)
+    handler(fakeRequest('/cache-bricks/sessions', 'POST'), posted)
     expect(posted.statusCode).toBe(405)
 
     // A same-origin Origin header (what the page itself sends) is allowed.
     const sameOrigin = fakeResponse()
-    handler(fakeRequest('/cache-badge/sessions', 'GET', { origin: 'http://127.0.0.1:18090' }), sameOrigin)
+    handler(fakeRequest('/cache-bricks/sessions', 'GET', { origin: 'http://127.0.0.1:18090' }), sameOrigin)
     expect(sameOrigin.statusCode).toBe(200)
   })
 
   it('opens an SSE stream with the right headers and pushes the current feed', () => {
-    const { handler } = createCacheBadgeRouter(deps)
+    const { handler } = createCacheBricksRouter(deps)
     const response = fakeResponse()
-    handler(fakeRequest('/cache-badge/stream?sessionId=s1'), response)
+    handler(fakeRequest('/cache-bricks/stream?sessionId=s1'), response)
     expect(response.headers['content-type']).toContain('text/event-stream')
     expect(response.headers['cache-control']).toContain('no-transform')
     expect(response.events.join('')).toContain('event: feed')
@@ -333,7 +333,7 @@ describe('the collector tap on the model-call path', () => {
     const withServer = fakeContext(services as Record<string, unknown>)
     installCollector(withServer.ctx)
     expect(registered).toHaveLength(1)
-    expect(registered[0]!.path).toBe('/cache-badge')
+    expect(registered[0]!.path).toBe('/cache-bricks')
     expect(registered[0]!.kind).toBe('prefix')
 
     let injected = 0

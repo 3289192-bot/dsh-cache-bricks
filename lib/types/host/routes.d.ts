@@ -59,7 +59,7 @@ export interface RouterDeps {
  * @param deps - ledger access.
  * @returns a handler suitable for `webServer.register`, plus the path it serves.
  */
-export declare function createCacheBadgeRouter(deps: RouterDeps, options?: RouterOptions): {
+export declare function createCacheBricksRouter(deps: RouterDeps, options?: RouterOptions): {
     readonly path: string;
     readonly handler: (request: RouteRequestLike, response: RouteResponseLike) => void;
 };

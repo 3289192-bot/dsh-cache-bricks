@@ -4,7 +4,7 @@
  * has no host-side behavior — all state lives in the browser conversation
  * projection.
  */
-export const name = 'dsh-cache-badge/invariant'
+export const name = 'dsh-cache-bricks/invariant'
 
 export function apply(): void {
   // Intentionally empty: no host runtime invariant for a browser-only node.

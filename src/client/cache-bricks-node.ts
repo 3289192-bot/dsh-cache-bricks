@@ -7,7 +7,7 @@ import type { CacheUsage } from './logic'
 declare module '@deepseek-ai/dsh-client-ui-chat/client' {
   interface ChatNodeDataMap {
     /** One Turn's per-step prompt-cache row, anchored outside the Turn's fold. */
-    'cache-badge': CacheBadgeNodeData
+    'cache-bricks': CacheBricksNodeData
   }
 }
 
@@ -53,7 +53,7 @@ export interface StepSample {
 }
 
 /** State accumulated for one Turn: one sample per assistant step. */
-export interface CacheBadgeState {
+export interface CacheBricksState {
   readonly turn: number
   readonly steps: ReadonlyMap<number, StepSample>
   /** True once the Turn's `turn/end` has been seen. */
@@ -61,7 +61,7 @@ export interface CacheBadgeState {
 }
 
 /** Published view data: the Turn's steps in step order. */
-export interface CacheBadgeNodeData {
+export interface CacheBricksNodeData {
   readonly turn: number
   readonly steps: readonly StepSample[]
   readonly ended: boolean
@@ -115,7 +115,7 @@ function emptySample(step: number): StepSample {
 }
 
 /** Copy the Turn state with one step's sample patched. */
-function patchStep(state: CacheBadgeState, step: number, patch: Partial<StepSample>): CacheBadgeState {
+function patchStep(state: CacheBricksState, step: number, patch: Partial<StepSample>): CacheBricksState {
   const steps = new Map(state.steps)
   steps.set(step, { ...(steps.get(step) ?? emptySample(step)), ...patch })
   return { ...state, steps }
@@ -146,7 +146,7 @@ function seqOf(event: TurnEvent): { seq?: number } {
   return typeof event.seq === 'number' && Number.isSafeInteger(event.seq) ? { seq: event.seq } : {}
 }
 
-function applyEvent(state: CacheBadgeState, event: TurnEvent): CacheBadgeState {
+function applyEvent(state: CacheBricksState, event: TurnEvent): CacheBricksState {
   switch (event.type) {
     case 'turn/start':
       return { ...state, turn: event.data.turn }
@@ -216,8 +216,8 @@ function applyEvent(state: CacheBadgeState, event: TurnEvent): CacheBadgeState {
  *
  * A Turn whose provider never reports usage publishes nothing.
  */
-export const cacheBadgeDefinition: ConversationNodeDefinition<CacheBadgeState> = {
-  kind: 'cache-badge',
+export const cacheBricksDefinition: ConversationNodeDefinition<CacheBricksState> = {
+  kind: 'cache-bricks',
   target: 'chat',
   match: (event) => {
     const type = event.type
@@ -228,7 +228,7 @@ export const cacheBadgeDefinition: ConversationNodeDefinition<CacheBadgeState> =
   },
   start: (_context, match) => {
     const event = match.event as TurnEvent
-    const base: CacheBadgeState = { turn: event.data.turn, steps: new Map(), ended: false }
+    const base: CacheBricksState = { turn: event.data.turn, steps: new Map(), ended: false }
     return applyEvent(base, event)
   },
   update: (context, match) => applyEvent(context.state, match.event as TurnEvent),
@@ -267,7 +267,7 @@ export const cacheBadgeDefinition: ConversationNodeDefinition<CacheBadgeState> =
     if (turn === undefined) return null
     return {
       key: context.key,
-      kind: 'cache-badge',
+      kind: 'cache-bricks',
       id: context.id,
       target: 'chat',
       anchorSeq: context.matches.at(-1)?.event.seq ?? context.start?.event.seq ?? 0,
@@ -279,7 +279,7 @@ export const cacheBadgeDefinition: ConversationNodeDefinition<CacheBadgeState> =
         turn,
         steps,
         ended: state?.ended === true,
-      } satisfies CacheBadgeNodeData,
+      } satisfies CacheBricksNodeData,
     }
   },
 }

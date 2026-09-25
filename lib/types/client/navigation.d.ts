@@ -31,7 +31,7 @@
  * Everything is structural and injectable — the plugin imports none of these packages at
  * runtime — so the whole strategy is testable without a browser.
  */
-import type { BrickTarget } from './target';
+import type { BrickTarget, HistoricalStepTarget } from './target';
 /** One entry of the session's contiguous event window. */
 export interface WindowEntry {
     /** `event` is durable, `transient` is a client-only live chunk. */
@@ -225,6 +225,28 @@ export interface TranscriptView {
     /** True when the beginning of the turn is present in the window. */
     readonly loaded: boolean;
 }
+/**
+ * What a folded step actually became, read from the durable log.
+ *
+ * A folded brick knows its `(turn, step)` and the log position it was measured from — and the
+ * session's own log is the authority on what happened there. So the question "where does this
+ * brick go?" is answerable without any collector state: load that position, read the step, and
+ * land on the row it produced. The decision mirrors `targetOf` for collected records, on
+ * purpose — the two paths must not disagree about which row a step with a message, a call and a
+ * retry belongs to:
+ *
+ * 1. a retry chain wins, because that is the only row that shows the attempts together;
+ * 2. otherwise the message's own half: reasoning if the step thought, response if it only spoke;
+ * 3. otherwise the first tool call — a step that only called tools has no assistant row at all;
+ * 4. otherwise `undefined`, and the reveal falls back to the Turn itself, reported as `context`.
+ *    Never a neighbouring step: "near enough" is what this whole module exists to refuse.
+ *
+ * @param face - the session face, or undefined when this core has none.
+ * @param target - the folded brick's target.
+ * @returns the concrete row, or undefined when the log offers none (not loaded far enough yet,
+ *   or a step that produced neither a message nor a call).
+ */
+export declare function resolveHistoricalStep(face: SessionFace | undefined, target: HistoricalStepTarget): BrickTarget | undefined;
 /**
  * Read the conversation around a brick out of the session's own event window.
  *

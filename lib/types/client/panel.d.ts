@@ -34,7 +34,6 @@ export interface JumpReport {
     /** Which location answer this jump produced. */
     readonly locate?: BrickLocateResult;
 }
-/** The tabs, in order. */
 export declare const PANEL_TABS: readonly [{
     readonly id: "transcript";
     readonly label: "对话";

@@ -1,9 +1,9 @@
 # Runtime contract this plugin is built on
 
-Every fact below was read out of the installed runtime source (paths relative to
-the `@deepseek-ai/` root of `<DSH_HOME>/runtime/node_modules`, DSH
-0.1.7-rc.2) before the code that depends on it was written. The 0.1.6-alpha.1 line
-was checked for the same surfaces, since the plugin runs on both.
+Every fact below was read out of the installed DSH 0.1.7-rc.2 runtime source (paths
+relative to the `@deepseek-ai/` root under `$DSH_HOME/runtime/node_modules`) before
+the code that depends on it was written. The 0.1.6-alpha.1 line was also checked
+historically; 0.1.2 supports only 0.1.7-rc.2.
 
 **0.1.7-rc.2 re-check.** The instance moved from rc.1 to rc.2 on 2026-09-24. Every surface
 below was re-read against rc.2 (byte-diff of the rc.1 tarballs out of the npm cache against
@@ -228,8 +228,8 @@ byte-identical anchor, so the same minimal patch applies.
 | A Definition that turns a materialized target into `null` makes the assembler **throw**, and the throw loses the whole flush — the page of history that triggered the rebuild | `dsh-client-ui-conversation/lib/client.js:2490-2496` (`buildTargetUpserts`: `if (node === null && previous !== null) throw new Error('conversation Definition "…" withdrew materialized target "…"')`) |
 | `systemMessageDefinition().buildViewNode` returns `null` whenever the prompt stops being *visible*, which a prepend rebuild re-derives differently | `dsh-client-ui-chat/lib/client.js:9223-9237` |
 | The sibling Definition in the same file already carries the fix — same key, `visibility: "hidden"` instead of `null` | `dsh-client-ui-chat/lib/client.js:9255-9285` (`requestPromptDefinition.buildViewNode`), helper at `:9206-9209` (`stableRequestPromptAnchor`) |
-| Reproduction (unpatched): the harness's **own** Turn navigator jumping to a turn that has to be paged in logs the throw and draws no rows; the same run with this plugin's Definition unregistered behaves identically, so the plugin is not the cause | live, this instance, 0.1.7-rc.1 — see `host-patches/system-message-never-withdraw/README.md` |
-| The fix lives in `host-patches/system-message-never-withdraw/`: an idempotent patch (three invariants, mirroring the sibling Definition), 5 regression tests that drive the **installed artifact**, and a live test whose `--revert` run fails | `patch.mjs`, `system-message.spec.mjs`, `live-turn19.mjs` |
+| Reproduction (unpatched): the harness's **own** Turn navigator jumping to a turn that has to be paged in logs the throw and draws no rows; the same run with this plugin's Definition unregistered behaves identically, so the plugin is not the cause | live, 0.1.7-rc.1; the local experiment's patch files are not part of this public repository |
+| The locally verified fix used an idempotent host patch (three invariants, mirroring the sibling Definition), 5 regression tests driving the installed artifact, and a live test whose `--revert` run failed | local `patch.mjs`, `system-message.spec.mjs`, `live-turn19.mjs` (not published here) |
 
 The plugin does **not** patch the host: a third-party Definition may not replace a built-in
 one, so the honest plugin-side behaviour is to load through the official API and then report

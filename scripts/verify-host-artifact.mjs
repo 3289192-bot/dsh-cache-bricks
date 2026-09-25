@@ -67,7 +67,7 @@ check('subscribes to llm/stream', listeners.has('llm/stream'))
 check('subscribes to agent/assistant-stream', listeners.has('agent/assistant-stream'))
 check('subscribes to session/event', listeners.has('session/event'))
 check('registers exactly one route', routes.length === 1, `got ${String(routes.length)}`)
-check('serves its own namespace', routes[0]?.path === '/cache-badge', routes[0]?.path)
+check('serves its own namespace', routes[0]?.path === '/cache-bricks', routes[0]?.path)
 
 // --- replay one session with a retried step ------------------------------
 console.log('\nreplay')
@@ -206,7 +206,7 @@ const response = {
 }
 const request_ = {
   method: 'GET',
-  url: '/cache-badge/attempts?sessionId=verify-session',
+  url: '/cache-bricks/attempts?sessionId=verify-session',
   headers: { host: '127.0.0.1:18090' },
   socket: { remoteAddress: '127.0.0.1' },
 }
@@ -243,20 +243,20 @@ check('the tool history is kept by reference', retried?.request?.toolHistoryRef 
 check('the store deduplicated payloads', (feed.store?.blobs ?? 0) > 0 && (feed.store?.bytes ?? 0) > 0)
 
 const blobResponse = { ...response, body: '', statusCode: 0 }
-routes[0].handler({ ...request_, url: `/cache-badge/blob?ref=${String(retried?.raw?.streamRef)}` }, blobResponse)
+routes[0].handler({ ...request_, url: `/cache-bricks/blob?ref=${String(retried?.raw?.streamRef)}` }, blobResponse)
 const blob = JSON.parse(blobResponse.body)
 check('a stored payload can be fetched back by ref', Array.isArray(blob.value) && blob.value.length === 3)
 
 // The declaration list the hash covers has to be readable back, additions included: that is
 // what makes "the tools hash moved" explainable rather than merely alarming.
 const envelopeResponse = { ...response, body: '', statusCode: 0 }
-routes[0].handler({ ...request_, url: `/cache-badge/blob?ref=${String(retried?.request?.requestRef)}` }, envelopeResponse)
+routes[0].handler({ ...request_, url: `/cache-bricks/blob?ref=${String(retried?.request?.requestRef)}` }, envelopeResponse)
 const envelope = JSON.parse(envelopeResponse.body)
 check('the request envelope records the split it hashed',
   envelope.value?.toolSchemaCount === 2 && envelope.value?.toolSchemaActivated === 1 && envelope.value?.deferredToolCount === 1,
   JSON.stringify(envelope.value))
 const toolsResponse = { ...response, body: '', statusCode: 0 }
-routes[0].handler({ ...request_, url: `/cache-badge/blob?ref=${String(envelope.value?.toolsRef)}` }, toolsResponse)
+routes[0].handler({ ...request_, url: `/cache-bricks/blob?ref=${String(envelope.value?.toolsRef)}` }, toolsResponse)
 const toolsBlob = JSON.parse(toolsResponse.body)
 check('the stored declaration list holds each tool once, without the dispatch-only flag',
   Array.isArray(toolsBlob.value?.tools) && toolsBlob.value.tools.length === 2

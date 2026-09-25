@@ -1,4 +1,4 @@
-import { BlobStore } from './blob-store';
+import { BlobStore } from '../core/blob-store';
 import type { BrickFeed } from '../shared/brick';
 /** Structural view of the Cordis context this plugin uses. */
 export interface HostContextLike {

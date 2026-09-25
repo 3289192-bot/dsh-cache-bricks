@@ -24,7 +24,7 @@ export interface CacheUsage {
 export type CacheTone = 'good' | 'warn' | 'critical' | 'minor' | 'unknown'
 
 /** Everything the renderer needs for one step's badge and its tooltip. */
-export interface CacheBadgeStatus {
+export interface CacheBricksStatus {
   readonly tone: CacheTone
   /** Badge text, e.g. `Cache 99.2%` or `Cache n/a`. */
   readonly label: string
@@ -40,11 +40,19 @@ export interface CacheBadgeStatus {
   readonly promptTokens: number
 }
 
-/** Below this share the step is red: the cache did not survive into this call. */
-export const CRITICAL_BELOW = 0.1
+/**
+ * Below this share the step is red: **most of the prefix was paid for again**.
+ *
+ * 0.1.0.a moved this from 10% to 70%, and it changes what red is *for*. At 10% only a rebuilt
+ * cache could reach it, so red meant "the prefix was thrown away"; at 70% red means "this call
+ * re-billed most of its prompt", which is the reading a board whose subject is the *tail* of a
+ * long conversation wants to see — a 30% loss on a 400k prompt is 120k tokens of full price, and
+ * it used to be painted amber and scrolled past.
+ */
+export const CRITICAL_BELOW = 0.7
 
-/** Below this share the step is amber, but not alarming. */
-export const WARN_BELOW = 0.8
+/** Below this share the step is amber: a tenth of the prefix was re-billed. */
+export const WARN_BELOW = 0.9
 
 /** Steps smaller than this prompt are not a meaningful cache signal; they stay
  * grey so a tiny step cannot dilute the red ones the badge exists to surface. */
@@ -82,14 +90,33 @@ export function hitRatioOf(usage: CacheUsage | undefined): number | null {
 }
 
 /**
- * Percentage text with one decimal. A partial hit is never rounded up to a flat
- * `100.0%`: honesty about the last fraction is the point of a cache badge, so
- * the rounded-up case is pinned to `99.9%`.
+ * Percentage text with one decimal, **always rounded downward**.
+ *
+ * Honesty about the last fraction is the point of a cache badge, so the printed number never
+ * overstates the hit: `0.9999` is `99.9`, not `100.0`, and `0.0875` is `8.7`, not `8.8`. The
+ * floor is what makes the `100.0` clamp unnecessary — no ratio below one can reach it.
+ *
  * @param ratio - share in [0, 1].
+ * @returns the number, without the percent sign.
  */
 export function formatPercent(ratio: number): string {
-  const text = (ratio * 100).toFixed(1)
-  return ratio < 1 && text === '100.0' ? '99.9' : text
+  const capped = Math.max(0, Math.min(1, ratio))
+  return (Math.floor(capped * 1000) / 10).toFixed(1)
+}
+
+/**
+ * The reading printed on a brick: one decimal, never overstated.
+ *
+ * A brick has room for five characters and no more (see the typography note on `BRICK_W`), so
+ * the one case that would need a sixth — an exact full hit — drops the decimal instead:
+ * `100%` is exact, not a rounded-up `99.9`, and nothing is lost by writing it shorter. Every
+ * partial hit keeps its tenth, which is the whole point of the change.
+ *
+ * @param ratio - share in [0, 1].
+ * @returns e.g. `99.9%`, `100%`, `0.0%`.
+ */
+export function percentLabel(ratio: number): string {
+  return ratio >= 1 ? '100%' : `${formatPercent(ratio)}%`
 }
 
 /**
@@ -112,21 +139,23 @@ export function formatTokens(value: number): string {
  * chip stays short enough for a multi-step Turn.
  * @param status - the decided badge for that step.
  */
-export function chipLabel(status: CacheBadgeStatus): string {
+export function chipLabel(status: CacheBricksStatus): string {
   return status.hitRatio === null ? 'n/a' : `${formatPercent(status.hitRatio)}%`
 }
 
 /**
- * Brick-face reading: whole percent from 10% up, one decimal below it, `n/a`
- * when the provider reports nothing. Rounding is always downward so a partial
- * hit can never print `100%`; the decimal is kept exactly where a fraction of a
- * percent is the difference between "healthy" and "worth a look".
+ * Brick-face reading: one decimal, `n/a` when the provider reports nothing.
+ *
+ * It used to drop the decimal from 10% up (`99%`), which threw away the difference between
+ * 99.1 and 99.9 exactly where a long healthy session lives. The digit grew with it: nine
+ * pixels was what a four-character label needed, and a five-character one at 12px is still
+ * inside the brick.
+ *
  * @param status - the decided badge for that step.
  */
-export function brickLabel(status: CacheBadgeStatus): string {
+export function brickLabel(status: CacheBricksStatus): string {
   if (status.hitRatio === null) return 'n/a'
-  const percent = status.hitRatio * 100
-  return percent >= 10 ? `${String(Math.floor(percent))}%` : `${formatPercent(status.hitRatio)}%`
+  return percentLabel(status.hitRatio)
 }
 
 function trimZero(text: string): string {
@@ -172,7 +201,7 @@ export const UNKNOWN_LABEL = 'Cache n/a'
  *   badge appears once the provider has reported accounting, because a request
  *   still in flight has nothing to show and must not flash a wrong number.
  */
-export function badgeStatus(input: BadgeInput): CacheBadgeStatus | null {
+export function badgeStatus(input: BadgeInput): CacheBricksStatus | null {
   const usage = input.usage
   if (usage === undefined) return null
   if (!hasCacheFields(usage) && !input.hasCacheEvidence) {
@@ -207,7 +236,7 @@ export function badgeStatus(input: BadgeInput): CacheBadgeStatus | null {
     return {
       ...base,
       tone: 'critical',
-      reason: `under ${String(CRITICAL_BELOW * 100)}% of this prompt was cached — the cache was rebuilt`,
+      reason: `under ${String(CRITICAL_BELOW * 100)}% of this prompt was cached — most of the prefix was re-billed`,
     }
   }
   if (hitRatio < WARN_BELOW) {
@@ -222,7 +251,7 @@ export function badgeStatus(input: BadgeInput): CacheBadgeStatus | null {
  * @param context - step identity, provider and the accounting instant.
  */
 export function badgeLogLine(
-  status: CacheBadgeStatus,
+  status: CacheBricksStatus,
   context: {
     readonly turn: number
     readonly step: number
@@ -230,7 +259,7 @@ export function badgeLogLine(
     readonly at: number
   },
 ): string {
-  const head = `[dsh-cache-badge] ${formatLocalTime(context.at)} turn ${context.turn} step ${context.step}: ${status.label}`
+  const head = `[dsh-cache-bricks] ${formatLocalTime(context.at)} turn ${context.turn} step ${context.step}: ${status.label}`
   const tail = status.hitRatio === null
     ? `uncached input ${formatTokens(status.rebilledTokens)} tokens`
     : `cached ${formatTokens(status.cachedTokens)} / prompt ${formatTokens(status.promptTokens)}, `

@@ -15,7 +15,7 @@
  */
 import type { BrickFeed, BrickRecord, BrickUsage } from '../shared/brick'
 import { EMPTY_COUNTERS, deriveMetrics } from '../shared/metrics'
-import { badgeStatus, type CacheTone } from './logic'
+import { badgeStatus, percentLabel, type CacheTone } from './logic'
 import type { BrickTarget } from './target'
 import {
   brickKey,
@@ -43,11 +43,16 @@ export function toneOfRatio(ratio: number | undefined, promptTokens: number | un
   return status.tone
 }
 
-/** Compact brick face: whole percent from 10% up, one decimal below it. */
+/**
+ * Compact brick face: one decimal, `n/a` when the provider reported no cache fields.
+ *
+ * The same rule the client's own fold uses (`percentLabel`), so a brick reads the same
+ * whichever half produced it.
+ * @param ratio - share in [0, 1], or undefined when nothing was reported.
+ * @returns e.g. `99.9%`, `100%`, `n/a`.
+ */
 export function labelOfRatio(ratio: number | undefined): string {
-  if (ratio === undefined) return 'n/a'
-  const percent = ratio * 100
-  return percent >= 10 ? `${String(Math.floor(percent))}%` : `${percent.toFixed(1)}%`
+  return ratio === undefined ? 'n/a' : percentLabel(ratio)
 }
 
 /** What the board needs from one source. */
@@ -99,6 +104,10 @@ export function boardFromFeed(feed: BrickFeed): BoardData {
       turn: record.identity.turn,
       step: record.identity.step,
       attempt: record.identity.attemptOrdinal,
+      // A feed is either the live collector's or a replay of the session's own log, and the
+      // record says which. The board paints them differently for exactly one reason: a
+      // replayed brick has no request capture behind it, and the reader is owed that.
+      origin: record.observedBy === 'replay' ? 'replay' : 'live',
       tone: toneOfRatio(ratio, record.metrics.promptTokens),
       label: labelOfRatio(ratio),
       kind,
@@ -507,7 +516,10 @@ export function recordFromReading(reading: StepReading): BrickRecord {
  *
  * This is the one place the board shows a different granularity from the rest of it, and
  * it is a degradation, not a mode: with no host half there is no attempt identity to be
- * had, so these bricks carry `target: none` and cannot navigate.
+ * had. That costs the brick its *attempt* precision — it cannot say which of a step's
+ * requests it is — but not its place in the conversation: it carries a `historical-step`
+ * target, which the jump resolves against the durable log, so a folded brick still opens
+ * the row its step became (`resolveHistoricalStep`).
  *
  * The records are reduced (`observedBy: 'client'`), which is enough for the
  * overview tab and the diff's cache rows, and visibly not enough for the rest.
@@ -532,12 +544,20 @@ export function boardFromReadings(turns: readonly StepReading[]): BoardData {
       // channels ran — so every brick it produces is the quiet default type.
       // Claiming 思考 or 工具 here would be a guess dressed as a measurement.
       kind: 'output',
-      // And it has no attempt identity at all: these bricks are one per *step*, folded
-      // from the session event feed, so there is nothing in the transcript they could
-      // claim to be. They open a record; they do not navigate — and they are drawn dashed,
-      // so a board of them can never be read as a board of real requests.
+      // No attempt identity at all: these bricks are one per *step*, folded from the session
+      // event feed. That is a claim about precision, not about reachability — the step is a
+      // real place in the conversation, and the durable log says which row it became. So the
+      // target is a `historical-step`, resolved against the log when the jump runs (see
+      // `resolveHistoricalStep`), and the brick is drawn dashed so a board of them is never
+      // read as a board of real requests.
       estimated: true,
-      target: { kind: 'none', reason: 'client-fold' },
+      origin: 'fold',
+      target: {
+        kind: 'historical-step',
+        turn: reading.turn,
+        step: reading.step,
+        ...(reading.seq === undefined || reading.seq <= 0 ? {} : { loadSeq: reading.seq }),
+      },
     }
     const column = columns.get(reading.turn) ?? { turn: reading.turn, ended: reading.ended, bricks: [] }
     column.bricks.push(brick)
@@ -561,4 +581,139 @@ export function boardFromReadings(turns: readonly StepReading[]): BoardData {
     // request. A lane entry here would be inventing one.
     aux: [],
   }
+}
+
+/**
+ * Everything the board can be built from, weakest first.
+ *
+ * The three sources answer three different questions, and none of them contains the others:
+ *
+ * - the **collector** knows this process's attempts — one brick per request, retry included,
+ *   with the request, the timed stream and the dispatch-time context kept by reference — and
+ *   nothing that happened before it started or after its LRU dropped a session;
+ * - a **replay** of the session's own log knows every settled attempt of the turns the client
+ *   is holding, at attempt granularity, with the log's own usage, activity, retries and
+ *   settlement positions — but no request capture (`../core/replay`);
+ * - the **fold** is the browser's per-step reading, for a core with no session face at all.
+ */
+export interface BoardSources {
+  /** The collector's feed, when a host half is answering this session. */
+  readonly live?: BrickFeed
+  /** The session's log, replayed into bricks. */
+  readonly replay?: BrickFeed
+  /** The client's own per-step readings. */
+  readonly readings?: readonly StepReading[]
+}
+
+/** `${turn}:${step}:${attempt}`, the identity a fine-grained brick is merged by. */
+function attemptKey(turn: number, step: number, attempt: number): string {
+  return `${String(turn)}:${String(step)}:${String(attempt)}`
+}
+
+/**
+ * Build one board out of everything available.
+ *
+ * Merging is **per attempt**, not per step: a step whose first attempt happened before the
+ * collector started and whose second it watched must still come out as two bricks, because that
+ * pair is the case this plugin exists for. So the live feed wins on the attempts it has, a
+ * replay fills the attempts it does not, and the fold supplies steps neither covers — one
+ * step-level brick per step, dropped as soon as any attempt-level brick covers that step, since
+ * keeping both would count the same request twice.
+ *
+ * @param sources - live feed, replayed feed and folded readings, any of them optional.
+ * @returns the merged board. The board-level `estimated` flag is set only for a board that is
+ *   *entirely* folded, where the claim is true of every brick.
+ */
+export function boardFromSources(sources: BoardSources): BoardData {
+  const live = sources.live?.bricks ?? []
+  const replay = sources.replay?.bricks ?? []
+  const readings = sources.readings ?? []
+  if (live.length === 0 && replay.length === 0) return boardFromReadings(readings)
+
+  const liveBoard = live.length === 0 ? undefined : boardFromFeed(sources.live!)
+  const replayBoard = replay.length === 0 ? undefined : boardFromFeed(sources.replay!)
+
+  // Attempt-level bricks, live last so it overwrites a replay of the same attempt.
+  const bricks = new Map<string, { brick: Brick; record: BrickRecord; title: string; turn: number; step: number; attempt: number }>()
+  const coveredSteps = new Set<string>()
+  const columns = new Map<number, { turn: number; ended: boolean; bricks: Brick[] }>()
+  const titles = new Map<string, string>()
+  const records = new Map<string, BrickRecord>()
+  const aux: Brick[] = []
+  const endedTurns = new Set<number>()
+
+  const addBoard = (board: BoardData, feed: BrickFeed | undefined): void => {
+    for (const turn of feed?.endedTurns ?? []) endedTurns.add(turn)
+    for (const column of board.columns) {
+      const entry = columns.get(column.turn) ?? { turn: column.turn, ended: false, bricks: [] }
+      // Either source reporting a Turn ended is enough: the log knows the past, the collector
+      // the present, and one that died mid-Turn never saw the end its log recorded.
+      entry.ended = entry.ended || column.ended
+      columns.set(column.turn, entry)
+      for (const brick of column.bricks) {
+        const record = board.records.get(brick.key)
+        if (record === undefined) continue
+        bricks.set(attemptKey(brick.turn, brick.step, brick.attempt), {
+          brick,
+          record,
+          title: board.titles.get(brick.key) ?? brick.label,
+          turn: brick.turn,
+          step: brick.step,
+          attempt: brick.attempt,
+        })
+        coveredSteps.add(brickKey(brick.turn, brick.step))
+      }
+    }
+    for (const brick of board.aux) {
+      const record = board.records.get(brick.key)
+      if (record === undefined) continue
+      aux.push(brick)
+      records.set(brick.key, record)
+      titles.set(brick.key, board.titles.get(brick.key) ?? brick.label)
+    }
+  }
+
+  // Weakest first, so a stronger source overwrites it: replay, then live.
+  if (replayBoard !== undefined) addBoard(replayBoard, sources.replay)
+  if (liveBoard !== undefined) addBoard(liveBoard, sources.live)
+
+  for (const entry of bricks.values()) {
+    const column = columns.get(entry.turn)!
+    column.bricks.push(entry.brick)
+    records.set(entry.brick.key, entry.record)
+    titles.set(entry.brick.key, entry.title)
+  }
+
+  // The fold fills what no attempt-level brick covers, and only that.
+  const restored = readings.filter((reading) => !coveredSteps.has(brickKey(reading.turn, reading.step)))
+  if (restored.length > 0) {
+    const folded = boardFromReadings(restored)
+    for (const column of folded.columns) {
+      const entry = columns.get(column.turn) ?? { turn: column.turn, ended: false, bricks: [] }
+      entry.ended = entry.ended || column.ended
+      columns.set(column.turn, entry)
+      for (const brick of column.bricks) {
+        const record = folded.records.get(brick.key)
+        if (record === undefined) continue
+        entry.bricks.push(brick)
+        records.set(brick.key, record)
+        titles.set(brick.key, folded.titles.get(brick.key) ?? brick.label)
+      }
+    }
+  }
+
+  const ordered = [...columns.values()].sort((left, right) => left.turn - right.turn)
+  for (const column of ordered) column.bricks.sort(byStepThenAttempt)
+  return {
+    columns: ordered,
+    titles,
+    records,
+    order: [...ordered.flatMap((column) => column.bricks.map((brick) => brick.key)), ...aux.map((brick) => brick.key)],
+    aux,
+  }
+}
+
+/** Board order inside a column: by step, then by attempt so a retry sits after the attempt it replaced. */
+function byStepThenAttempt(left: Brick, right: Brick): number {
+  return left.step - right.step || left.attempt - right.attempt
 }

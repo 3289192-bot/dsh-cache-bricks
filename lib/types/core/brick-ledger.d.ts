@@ -262,12 +262,21 @@ export interface LedgerOptions {
     readonly maxBricks?: number;
     /** Blob store used for raw payloads. */
     readonly store?: BlobStore;
+    /**
+     * What the bricks from this ledger should claim about where they came from.
+     *
+     * `host` (the default) is the live tap. `replay` is the same fold run over a session's
+     * own log, where the request capture and the dispatch-time context do not exist — the
+     * record says so instead of leaving fields that look measured.
+     */
+    readonly observedBy?: 'host' | 'replay';
 }
 /** The per-session ledger. */
 export declare class BrickLedger {
     private readonly sessionId;
     private readonly maxBricks;
     private readonly store;
+    private readonly observedBy;
     private readonly drafts;
     private readonly pendingDispatches;
     private attemptCounts;

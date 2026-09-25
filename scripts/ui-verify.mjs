@@ -17,11 +17,13 @@
  *
  * Usage:
  *   node scripts/ui-verify.mjs                     # port 18090, newest log's token
- *   node scripts/ui-verify.mjs --port 18083 --home <DSH_HOME_DAILY>
+ *   node scripts/ui-verify.mjs --port 18083 --home /path/to/dsh-home
  *   node scripts/ui-verify.mjs --shot C:\tmp\shots # also write before/after PNGs
+ *   node scripts/ui-verify.mjs --rails            # the board's own checks only; the chat is never navigated
  */
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const args = process.argv.slice(2)
@@ -30,11 +32,16 @@ const option = (name, fallback) => {
   return index === -1 ? fallback : args[index + 1]
 }
 
-const home = option('home', join(process.env.USERPROFILE ?? process.env.HOME ?? process.cwd(), '.dsh-017'))
+const home = option('home', join(homedir(), '.dsh-017'))
 const port = Number(option('port', '18090'))
 const base = `http://127.0.0.1:${String(port)}`
 const shotDir = option('shot', undefined)
 const requestedSession = option('session', undefined)
+/** `--rails`: run the board's own checks and stop before the phases that move the chat. */
+const railsOnly = args.includes('--rails')
+
+/** Thrown to end a `--rails` run after the board's own checks; never a failure. */
+class StopAfterRails extends Error {}
 
 const failures = []
 const check = (label, condition, detail = '') => {
@@ -119,7 +126,7 @@ if (auth.cookie === undefined) {
 }
 
 // --- pick the richest observed session --------------------------------------
-const listed = await fetch(`${base}/cache-badge/sessions`, { headers: { cookie: auth.cookie } })
+const listed = await fetch(`${base}/cache-bricks/sessions`, { headers: { cookie: auth.cookie } })
 if (!listed.ok) {
   console.log(`the collector route answered ${String(listed.status)}; nothing to verify (is the host half loaded?)`)
   process.exit(0)
@@ -128,7 +135,7 @@ const { sessions } = await listed.json()
 let richest = { id: requestedSession, bricks: -1, feed: undefined }
 for (const id of sessions) {
   if (requestedSession !== undefined && id !== requestedSession) continue
-  const feed = await fetch(`${base}/cache-badge/attempts?sessionId=${encodeURIComponent(id)}`, {
+  const feed = await fetch(`${base}/cache-bricks/attempts?sessionId=${encodeURIComponent(id)}`, {
     headers: { cookie: auth.cookie },
   })
   const body = await feed.json()
@@ -179,16 +186,19 @@ try {
   await page.mouse.move(1200, 700)
   await page.waitForTimeout(400)
 
-  const board = page.locator('[data-cache-badge-board]')
+  const board = page.locator('[data-cache-bricks-board]')
   await board.first().waitFor({ timeout: 10_000 }).catch(() => {})
   check('the board is mounted in the gutter', await board.count() === 1)
   const box = await board.first().boundingBox().catch(() => null)
   check('the board has a usable size', box !== null && box.width >= 70 && box.height >= 45, JSON.stringify(box))
 
-  const cacheSlabs = page.locator('[data-cache-badge-layer="cache"] > div')
+  const cacheSlabs = page.locator('[data-cache-bricks-layer="cache"] > div')
   const cacheCount = await cacheSlabs.count()
   check('the cache side carries one slab per visible brick', cacheCount > 0, String(cacheCount))
 
+  // A brick prints nothing: the fill is the reading, and the number travels as the element's
+  // own facts (`data-cache-bricks-reading`), which is exactly what the tooltip, the accessible
+  // name and the panel carry too. Read from there, and prove the face is bare.
   // The reading is the slab's own text node; a lifecycle mark is a child span, so
   // reading `firstChild` keeps a marked brick from looking like a malformed reading.
   const labels = await cacheSlabs.evaluateAll((els) => els.map((el) => (el.firstChild?.textContent ?? '').trim()))
@@ -196,22 +206,22 @@ try {
     labels.length > 0 && labels.every((text) => /^(\d+(\.\d+)?%|n\/a)$/u.test(text)), JSON.stringify(labels.slice(0, 4)))
 
   const marks = await cacheSlabs.evaluateAll((els) => els
-    .flatMap((el) => [...el.querySelectorAll('[data-cache-badge-mark]')])
+    .flatMap((el) => [...el.querySelectorAll('[data-cache-bricks-mark]')])
     .map((el) => el.textContent))
   // The four glyphs `LIFECYCLE` defines: retry ↻, failure !, interrupted ⏹, output limit ⌁.
   check('lifecycle is drawn as glyphs, never as a colour of its own',
     marks.every((glyph) => ['↻', '!', '⏹', '⌁'].includes(String(glyph))), JSON.stringify([...new Set(marks)]))
 
-  const kinds = await cacheSlabs.evaluateAll((els) => els.map((el) => el.dataset.cacheBadgeKind))
+  const kinds = await cacheSlabs.evaluateAll((els) => els.map((el) => el.dataset.cacheBricksKind))
   check('every brick already knows its activity type',
     kinds.every((kind) => ['output', 'reasoning', 'tool', 'mixed', 'auxiliary'].includes(String(kind))))
 
   // The type side is built on demand: it must not exist until the card is flipped.
-  check('the type side is not built while it faces away', await page.locator('[data-cache-badge-layer="type"] > div').count() === 0)
+  check('the type side is not built while it faces away', await page.locator('[data-cache-bricks-layer="type"] > div').count() === 0)
 
-  const chip = page.locator('[data-cache-badge-flip]')
+  const chip = page.locator('[data-cache-bricks-flip]')
   check('the flip control is on the board', await chip.count() === 1, await chip.first().textContent().catch(() => ''))
-  const rotator = page.locator('[data-cache-badge-layer="cache"]').first()
+  const rotator = page.locator('[data-cache-bricks-layer="cache"]').first()
   check('the card starts on its cache side',
     (await rotator.evaluate((el) => el.parentElement.style.transform)) === 'rotateY(0deg)')
   await shot(page, 'board-cache.png')
@@ -221,19 +231,19 @@ try {
   check('the flip turns the whole card over',
     (await rotator.evaluate((el) => el.parentElement.style.transform)) === 'rotateY(180deg)')
   check('the control now offers the way back', (await chip.first().textContent()) === '缓存')
-  const typeSlabs = page.locator('[data-cache-badge-layer="type"] > div')
+  const typeSlabs = page.locator('[data-cache-bricks-layer="type"] > div')
   const typeCount = await typeSlabs.count()
   check('the activity side mirrors the bricks', typeCount === cacheCount, `${String(typeCount)} vs ${String(cacheCount)}`)
   const faces = await typeSlabs.evaluateAll((els) => els.map((el) => ({
-    kind: el.dataset.cacheBadgeKind,
+    kind: el.dataset.cacheBricksKind,
     text: (el.textContent ?? '').trim(),
-    segments: el.querySelectorAll('[data-cache-badge-segment]').length,
+    segments: el.querySelectorAll('[data-cache-bricks-segment]').length,
   })))
   check('a split face is exactly the model/tool pair (the official thinking + acting lanes)',
     await typeSlabs.evaluateAll((els) => els
-      .filter((el) => el.querySelectorAll('[data-cache-badge-segment]').length > 0)
-      .every((el) => [...el.querySelectorAll('[data-cache-badge-segment]')]
-        .map((part) => part.dataset.cacheBadgeSegment).join('+') === 'model+tool')))
+      .filter((el) => el.querySelectorAll('[data-cache-bricks-segment]').length > 0)
+      .every((el) => [...el.querySelectorAll('[data-cache-bricks-segment]')]
+        .map((part) => part.dataset.cacheBricksSegment).join('+') === 'model+tool')))
   // The type face is drawn the way the official timeline draws a span: flat, one-pixel
   // corners, no rim and no shadow, opacity .78 for a background lane and 1 for the lanes that
   // matter. The only gradient the official view has is the model lane's TTFT one — so any
@@ -242,14 +252,14 @@ try {
     const style = getComputedStyle(el)
     const fill = style.backgroundImage === 'none' ? style.backgroundColor : style.backgroundImage
     return {
-      kind: el.dataset.cacheBadgeKind,
+      kind: el.dataset.cacheBricksKind,
       radius: style.borderTopLeftRadius,
       shadow: style.boxShadow,
       opacity: style.opacity,
       fill,
       bevel: /linear-gradient\((?![^)]*to right)/u.test(fill),
-      parts: [...el.querySelectorAll('[data-cache-badge-segment]')].map((part) => ({
-        tone: part.dataset.cacheBadgeSegment,
+      parts: [...el.querySelectorAll('[data-cache-bricks-segment]')].map((part) => ({
+        tone: part.dataset.cacheBricksSegment,
         fill: getComputedStyle(part).backgroundImage === 'none'
           ? getComputedStyle(part).backgroundColor
           : getComputedStyle(part).backgroundImage,
@@ -269,12 +279,12 @@ try {
   // tools half on the right — so a vertical split is a defect, not a variation. This is also
   // the guard for the transition a streaming brick makes (reasoning only, then a tool call).
   const seams = await typeSlabs.evaluateAll((els) => els
-    .filter((el) => el.querySelectorAll('[data-cache-badge-segment]').length === 2)
+    .filter((el) => el.querySelectorAll('[data-cache-bricks-segment]').length === 2)
     .map((el) => {
-      const parts = [...el.querySelectorAll('[data-cache-badge-segment]')]
+      const parts = [...el.querySelectorAll('[data-cache-bricks-segment]')]
       const rects = parts.map((part) => part.getBoundingClientRect())
       return {
-        tones: parts.map((part) => part.dataset.cacheBadgeSegment).join('+'),
+        tones: parts.map((part) => part.dataset.cacheBricksSegment).join('+'),
         direction: getComputedStyle(el).flexDirection,
         sideBySide: Math.abs(rects[0].top - rects[1].top) < 1.5,
         stacked: Math.abs(rects[0].left - rects[1].left) < 1.5,
@@ -300,9 +310,9 @@ try {
   // interrupted or output-limited brick lands on the board.
   const spoken = await typeSlabs.evaluateAll((els) => els.slice(0, 24).map((el) => {
     const clone = el.cloneNode(true)
-    for (const mark of clone.querySelectorAll('[data-cache-badge-mark]')) mark.remove()
+    for (const mark of clone.querySelectorAll('[data-cache-bricks-mark]')) mark.remove()
     return {
-      kind: el.dataset.cacheBadgeKind,
+      kind: el.dataset.cacheBricksKind,
       text: (clone.textContent ?? '').trim(),
       spoken: `${el.getAttribute('title') ?? ''} ${el.getAttribute('aria-label') ?? ''}`,
     }
@@ -330,7 +340,7 @@ try {
     return style.backgroundImage === 'none' ? style.backgroundColor : style.backgroundImage
   })
 
-  const litIndex = await typeSlabs.evaluateAll((els) => els.findIndex((el) => ['reasoning', 'tool'].includes(el.dataset.cacheBadgeKind)))
+  const litIndex = await typeSlabs.evaluateAll((els) => els.findIndex((el) => ['reasoning', 'tool'].includes(el.dataset.cacheBricksKind)))
   if (litIndex >= 0) {
     const slab = typeSlabs.nth(litIndex)
     const quiet = await fillOf(slab)
@@ -352,7 +362,7 @@ try {
       probe.remove()
       return resolved
     }, 'var(--dsw-alias-state-warn-label)')
-    const isTool = await slab.evaluate((el) => el.dataset.cacheBadgeKind === 'tool')
+    const isTool = await slab.evaluate((el) => el.dataset.cacheBricksKind === 'tool')
     if (isTool) {
       // The zone is a material, so its gradient holds three stops — the tone itself is the
       // middle one, next to the lit top and the shadowed bottom. Comparing painted pixels,
@@ -377,10 +387,10 @@ try {
   // The same must hold for the other lanes — an answer, and an auxiliary call — so the rule
   // is "the brick under the pointer lights up", not "purple and orange do".
   const otherIndex = await typeSlabs.evaluateAll((els) => els
-    .findIndex((el) => ['output', 'auxiliary'].includes(el.dataset.cacheBadgeKind) && el.querySelectorAll('[data-cache-badge-segment]').length === 0))
+    .findIndex((el) => ['output', 'auxiliary'].includes(el.dataset.cacheBricksKind) && el.querySelectorAll('[data-cache-bricks-segment]').length === 0))
   if (otherIndex >= 0) {
     const slab = typeSlabs.nth(otherIndex)
-    const kind = await slab.evaluate((el) => el.dataset.cacheBadgeKind)
+    const kind = await slab.evaluate((el) => el.dataset.cacheBricksKind)
     const before = await fillOf(slab)
     await slab.hover()
     await page.waitForTimeout(250)
@@ -397,6 +407,164 @@ try {
   check('the card turns back to the readings',
     (await rotator.evaluate((el) => el.parentElement.style.transform)) === 'rotateY(0deg)')
 
+  // --- the two rails: the board's window on a real session -------------------------
+  // The frame is fixed and the content pans inside it: the vertical rail down the board's
+  // **left** edge (its outer side, away from the transcript), the horizontal one under the
+  // grid. This is live evidence for the arithmetic `tests/board-scroll.spec.ts` pins and
+  // for the gestures `scripts/test-scroll.mjs` drives against fixtures. Nothing here moves
+  // the conversation: the rails are the board's own control surface.
+  const railState = async (axis) => page.locator(`[data-cache-bricks-rail="${axis}"]`).evaluate((el) => {
+    const thumb = el.firstElementChild
+    const box = el.getBoundingClientRect()
+    const handle = thumb.getBoundingClientRect()
+    return {
+      x: box.x, y: box.y, right: box.x + box.width, bottom: box.y + box.height,
+      width: box.width, height: box.height,
+      track: el.dataset.cacheBricksRail === 'x' ? box.width : box.height,
+      thumb: el.dataset.cacheBricksRail === 'x' ? handle.width : handle.height,
+      offset: el.dataset.cacheBricksRail === 'x' ? handle.x - box.x : handle.y - box.y,
+      now: Number(el.getAttribute('aria-valuenow')), max: Number(el.getAttribute('aria-valuemax')),
+      text: el.getAttribute('aria-valuetext'), disabled: el.getAttribute('aria-disabled'),
+      tabIndex: el.tabIndex, interactive: getComputedStyle(el).pointerEvents === 'auto',
+    }
+  })
+  // Brick keys are `session:turn:step:attempt` from the collector and `turn:step` from the
+  // client's own fold, so the position is read from the end of the key, not from index 1.
+  // Turn 0 is the auxiliary lane, which is not a Turn: the filter runs on the array, not on
+  // the Set (`[...new Set(x)].filter(...)`, which is also what keeps this line honest).
+  const visibleTurns = () => page.locator('[data-cache-bricks-layer="cache"] > div')
+    .evaluateAll((els) => [...new Set(els.map((el) => {
+      const parts = el.dataset.cacheBricksBrick.split(':')
+      return Number(parts.length >= 4 ? parts[parts.length - 3] : parts[0])
+    }).filter((turn) => turn > 0))].sort((left, right) => left - right))
+  /** The column with the most bricks on screen: the one a vertical pan is about. */
+  const tallestShown = () => page.locator('[data-cache-bricks-layer="cache"] > div')
+    .evaluateAll((els) => {
+      const byTurn = new Map()
+      for (const el of els) {
+        const parts = el.dataset.cacheBricksBrick.split(':')
+        const turn = Number(parts.length >= 4 ? parts[parts.length - 3] : parts[0])
+        const step = Number(parts.length >= 4 ? parts[parts.length - 2] : parts[1])
+        byTurn.set(turn, [...(byTurn.get(turn) ?? []), step])
+      }
+      let best
+      for (const [turn, steps] of byTurn) {
+        if (best === undefined || steps.length > best.steps.length) best = { turn, steps }
+      }
+      return best === undefined
+        ? undefined
+        : { turn: best.turn, count: best.steps.length, low: Math.min(...best.steps), high: Math.max(...best.steps) }
+    })
+
+  const box2 = await board.first().boundingBox()
+  const hRail = await railState('x')
+  const vRail = await railState('y')
+  check('the board carries both rails: one down the left edge, one under the grid',
+    Math.abs(vRail.x - (box2.x + 1)) <= 1.5 && vRail.height > 40
+    && Math.abs(hRail.bottom - (box2.y + box2.height - 1)) <= 1.5,
+    JSON.stringify({ v: [vRail.x, box2.x + 1], h: [hRail.bottom, box2.y + box2.height - 1] }))
+  if (shotDir !== undefined) {
+    mkdirSync(shotDir, { recursive: true })
+    await board.first().screenshot({ path: join(shotDir, 'board-window.png') }).catch(() => {})
+  }
+  const underRail = await page.evaluate(() => {
+    const rails = [...document.querySelectorAll('[data-cache-bricks-rail]')].map((el) => el.getBoundingClientRect())
+    return [...document.querySelectorAll('[data-cache-bricks-layer="cache"] > div')]
+      .filter((slab) => {
+        const box = slab.getBoundingClientRect()
+        return rails.some((rail) => box.right > rail.left && box.left < rail.right && box.bottom > rail.top && box.top < rail.bottom)
+      })
+      .map((slab) => slab.dataset.cacheBricksBrick)
+  })
+  check('no brick is ever under a rail: the rails are carved out of the band', underRail.length === 0, underRail.slice(0, 4).join(' '))
+  // The thumb's fraction of its travel has to equal the pan the rail reports, or the bar is
+  // decoration: `aria-valuenow / aria-valuemax` and the pixels must agree.
+  check('each rail places its thumb by the fraction it reports',
+    [hRail, vRail].every((rail) => (rail.max === 0
+      ? Math.abs(rail.thumb - rail.track) <= 1
+      : Math.abs(rail.offset - (rail.track - rail.thumb) * (rail.now / rail.max)) <= 1.5)
+      && rail.offset >= 0 && rail.offset + rail.thumb <= rail.track + 1),
+    JSON.stringify([{ axis: 'x', now: hRail.now, max: hRail.max, offset: hRail.offset, thumb: hRail.thumb, track: hRail.track },
+      { axis: 'y', now: vRail.now, max: vRail.max, offset: vRail.offset, thumb: vRail.thumb, track: vRail.track }]))
+  check('a rail with travel is reachable and names what is hidden; an inert one is not a tab stop',
+    [hRail, vRail].every((rail) => rail.max > 0
+      ? rail.interactive && rail.tabIndex === 0 && (rail.text ?? '').length > 0 && rail.disabled === 'false'
+      : !rail.interactive && rail.tabIndex === -1 && rail.disabled === 'true'))
+
+  if (hRail.max > 0) {
+    const before = await visibleTurns()
+    // The whole travel, not half of it: with one cell of overflow a half-travel drag rounds
+    // to zero and the check would "fail" while the rail behaved perfectly.
+    const travel = hRail.width - hRail.thumb
+    const thumbBox = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+    await page.mouse.move(thumbBox.x + thumbBox.width / 2, thumbBox.y + thumbBox.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(thumbBox.x + thumbBox.width / 2 - travel, thumbBox.y + thumbBox.height / 2, { steps: 10 })
+    await page.mouse.up()
+    await page.waitForTimeout(250)
+    const after = await visibleTurns()
+    const live = page.locator('[data-cache-bricks-live]')
+    check(`dragging the horizontal thumb pages the window back (${String(before[0])} → ${String(after[0])})`,
+      after.length > 0 && after[0] < before[0])
+    check('a panned board says so, and offers one control back to the newest',
+      await live.isVisible() && (await live.getAttribute('title') ?? '').includes('回看'))
+    await shot(page, 'board-panned.png')
+    if (await live.isVisible()) await live.click()
+    await page.waitForTimeout(250)
+    const returned = await visibleTurns()
+    check('the way back restores the newest Turn at the right edge',
+      returned.includes(before[before.length - 1]) && (await page.locator('[data-cache-bricks-live]').isVisible()) === false)
+  } else {
+    check('a board whose Turns all fit shows an inert horizontal rail',
+      Math.abs(hRail.thumb - hRail.track) <= 1 && !hRail.interactive && hRail.tabIndex === -1)
+  }
+  // How many bricks each Turn has, from the collector's feed: the vertical range is measured
+  // against the tallest of these, wherever it sits on the time axis.
+  const bricksPerTurn = new Map()
+  for (const brick of richest.feed?.bricks ?? []) {
+    const turn = brick.identity.turn
+    if (turn > 0) bricksPerTurn.set(turn, (bricksPerTurn.get(turn) ?? 0) + 1)
+  }
+  let tallestTurn
+  for (const [turn, count] of bricksPerTurn) {
+    if (tallestTurn === undefined || count > tallestTurn.count) tallestTurn = { turn, count }
+  }
+  const tallestOnBoard = tallestTurn === undefined ? false : (await visibleTurns()).includes(tallestTurn.turn)
+  if (vRail.max > 0 && !tallestOnBoard) {
+    // 1.7.1.a measures the vertical range against the tallest column of the **whole board**,
+    // so when that column is outside the horizontal window the frame can be raised onto rows
+    // no visible column reaches — an empty frame. That is the released behaviour, named here
+    // instead of papered over: the raise is only checked when its promise is meaningful.
+    console.log(`  · vertical raise not checked: the tallest Turn (${String(tallestTurn?.turn)}, `
+      + `${String(tallestTurn?.count)} bricks) is not in the horizontal window this run shows`)
+  } else if (vRail.max > 0) {
+    const before = await tallestShown()
+    const travel = vRail.height - vRail.thumb
+    const vThumb = await page.locator('[data-cache-bricks-rail="y"] > div').first().boundingBox()
+    await page.mouse.move(vThumb.x + vThumb.width / 2, vThumb.y + vThumb.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(vThumb.x + vThumb.width / 2, vThumb.y + vThumb.height / 2 - travel, { steps: 12 })
+    await page.mouse.up()
+    await page.waitForTimeout(250)
+    const raised = await tallestShown()
+    // The window rises: the column keeps its frame, so the rows it shows are **higher**
+    // steps — the floor bricks leave and the ones the live window cut off arrive.
+    check(`raising the vertical thumb reaches rows the live window had hidden (${JSON.stringify(before)} → ${JSON.stringify(raised)})`,
+      before !== undefined && raised !== undefined && raised.turn === before.turn
+      && raised.low > before.low && raised.high > before.high)
+    await shot(page, 'board-raised.png')
+    const live = page.locator('[data-cache-bricks-live]')
+    if (await live.isVisible()) await live.click()
+    await page.waitForTimeout(250)
+  } else {
+    check('a board whose columns all fit shows an inert vertical rail',
+      Math.abs(vRail.thumb - vRail.track) <= 1 && !vRail.interactive && vRail.tabIndex === -1)
+  }
+  if (railsOnly) {
+    console.log('\n--rails: stopping before the phases that navigate the chat')
+    throw new StopAfterRails()
+  }
+
   // --- click bricks: each must land on its OWN row, or say it did not -------------
   // The bar is exact, deliberately. Accepting a nearby row as a pass is what let this
   // feature look fixed for several rounds while it was not: a brick whose row cannot be
@@ -410,7 +578,7 @@ try {
   const settled = (richest.feed?.bricks ?? []).filter((brick) => brick.settlement !== 'running')
   const rows = await page.evaluate(() => [...document.querySelectorAll('[data-chat-node-key]')]
     .map((el) => ({ key: el.dataset.chatNodeKey ?? '', laidOut: el.getBoundingClientRect().height > 0 })))
-  const boardKeys = await page.locator('[data-cache-badge-layer="cache"] > div').evaluateAll((els) => els.map((el) => el.dataset.cacheBadgeBrick))
+  const boardKeys = await page.locator('[data-cache-bricks-layer="cache"] > div').evaluateAll((els) => els.map((el) => el.dataset.cacheBricksBrick))
   const onBoard = settled.filter((brick) => boardKeys.includes(brick.identity.id))
 
   // The anchors a brick's **declared target** maps to: its retry chain, its step's row,
@@ -521,12 +689,12 @@ try {
   // row, a call it made, or its retry chain — which is the same set the census checked for
   // existence.
   const landingOf = (anchors) => page.evaluate((suffixes) => {
-    const marked = [...document.querySelectorAll('[data-chat-node-key][data-cache-badge-landed]')]
+    const marked = [...document.querySelectorAll('[data-chat-node-key][data-cache-bricks-landed]')]
     const own = marked.find((el) => suffixes.some((suffix) => (el.dataset.chatNodeKey ?? '').endsWith(suffix)))
     return { key: own?.dataset.chatNodeKey ?? null, marked: marked.length }
   }, anchors)
 
-  const onBoardKeysRecheck = await page.locator('[data-cache-badge-layer="cache"] > div').evaluateAll((els) => els.map((el) => el.dataset.cacheBadgeBrick))
+  const onBoardKeysRecheck = await page.locator('[data-cache-bricks-layer="cache"] > div').evaluateAll((els) => els.map((el) => el.dataset.cacheBricksBrick))
   /** Bricks whose page the core loaded and then failed to render — with the log as evidence. */
   const coreRenderFailures = []
   /** How long each load-then-land took, in seconds, for the report. */
@@ -572,7 +740,7 @@ try {
   }
 
   const clickBrick = async (key, kind = 'dblclick') => {
-    const slab = page.locator(`[data-cache-badge-brick="${key}"][data-cache-badge-face="cache"]`)
+    const slab = page.locator(`[data-cache-bricks-brick="${key}"][data-cache-bricks-face="cache"]`)
     await slab.waitFor({ state: 'visible', timeout: 20000 })
     await slab.evaluate((el) => { el.scrollIntoView({ block: 'center', behavior: 'instant' }) })
     await page.waitForTimeout(120)
@@ -587,10 +755,10 @@ try {
     await clickBrick(firstKey, 'click')
     await page.waitForTimeout(900)
     const afterOpen = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
-    const panel = await page.locator('[data-cache-badge-panel]').count()
+    const panel = await page.locator('[data-cache-bricks-panel]').count()
     check('one click opens the record and does not move the conversation', panel === 1 && afterOpen === before,
       `panel=${String(panel)} scrollTop ${String(before)} → ${String(afterOpen)}`)
-    await page.locator('[data-cache-badge-panel] button[aria-label="close"]').first().click()
+    await page.locator('[data-cache-bricks-panel] button[aria-label="close"]').first().click()
     await page.waitForTimeout(300)
   }
 
@@ -619,7 +787,7 @@ try {
     const startedAt = Date.now()
     for (let waited = 0; waited < budgetMs && accuracy === undefined; waited += 200) {
       await page.waitForTimeout(200)
-      const reported = await page.locator('[data-cache-badge-jump]').first().getAttribute('data-cache-badge-jump').catch(() => null)
+      const reported = await page.locator('[data-cache-bricks-jump]').first().getAttribute('data-cache-bricks-jump').catch(() => null)
       if (reported === 'exact' || reported === 'context' || reported === 'none') accuracy = reported
     }
     const landedAfterMs = Date.now() - startedAt
@@ -627,7 +795,7 @@ try {
       loadTimings.push(`${String(turn)}:${String(step)} ${String((landedAfterMs / 1000).toFixed(1))}s`)
     }
     if (accuracy === undefined) {
-      const tail = pageLog.filter((entry) => entry.includes('[dsh-cache-badge]')).slice(-2).join(' ‖ ')
+      const tail = pageLog.filter((entry) => entry.includes('[dsh-cache-bricks]')).slice(-2).join(' ‖ ')
       misses.push(`turn ${String(turn)} step ${String(step)} → no jump report in ${String(budgetMs / 1000)}s (${tail || 'no plugin output'})`)
       tally.none += 1
       continue
@@ -650,13 +818,13 @@ try {
       continue
     }
 
-    const locate = await page.locator('[data-cache-badge-locate]').first().getAttribute('data-cache-badge-locate')
+    const locate = await page.locator('[data-cache-bricks-locate]').first().getAttribute('data-cache-bricks-locate')
     if (locate !== 'exact') misses.push(`turn ${String(turn)} step ${String(step)} → locate=${String(locate)}`)
     const landed = await landingOf(brick.anchors)
     if (landed.key === null) misses.push(`turn ${String(turn)} step ${String(step)} → marked ${String(landed.marked)} row(s), none of them on its target`)
-    const panel = page.locator('[data-cache-badge-panel]')
+    const panel = page.locator('[data-cache-bricks-panel]')
     if (await panel.count() !== 1) misses.push(`turn ${String(turn)} step ${String(step)} → the record did not open`)
-    const reported = await page.locator('[data-cache-badge-jump]').first().getAttribute('data-cache-badge-jump')
+    const reported = await page.locator('[data-cache-bricks-jump]').first().getAttribute('data-cache-bricks-jump')
     if (reported !== 'exact') misses.push(`turn ${String(turn)} step ${String(step)} → the panel reported ${String(reported)}`)
   }
 
@@ -675,7 +843,7 @@ try {
     const position = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
     // Markers from the sampled exact landings above may still be fading; what matters is that
     // *this* click marks nothing new.
-    const markedBefore = await page.locator('[data-cache-badge-landed]').count()
+    const markedBefore = await page.locator('[data-cache-bricks-landed]').count()
     try {
       await clickBrick(brick.identity.id)
     } catch {
@@ -693,7 +861,7 @@ try {
       accuracy = /: (exact|context|none) landing/u.exec(line ?? '')?.[1]
     }
     const moved = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
-    const markedAfter = await page.locator('[data-cache-badge-landed]').count()
+    const markedAfter = await page.locator('[data-cache-bricks-landed]').count()
     check(`a brick the transcript cannot show reports none, marks nothing and does not move (${why}; ${brick.identity.id})`,
       accuracy === 'none' && markedAfter <= markedBefore && moved === position,
       `accuracy=${String(accuracy)} marked ${String(markedBefore)} → ${String(markedAfter)}, `
@@ -751,17 +919,17 @@ try {
     console.log('  · lane: no auxiliary brick in this session yet (compaction / session title)')
   } else {
     const lane = await page.evaluate((keys) => {
-      const label = document.querySelector('[data-cache-badge-lane="label"]')
-      const rule = document.querySelector('[data-cache-badge-lane="rule"]')
+      const label = document.querySelector('[data-cache-bricks-lane="label"]')
+      const rule = document.querySelector('[data-cache-bricks-lane="rule"]')
       const shown = (el) => el !== null && el !== undefined && getComputedStyle(el).display !== 'none'
       const rendered = keys.map((key) => {
-        const el = document.querySelector(`[data-cache-badge-brick="${key}"][data-cache-badge-face="cache"]`)
+        const el = document.querySelector(`[data-cache-bricks-brick="${key}"][data-cache-bricks-face="cache"]`)
         return el === null
           ? { key, present: false, bottom: null }
           : { key, present: true, bottom: Math.round(el.getBoundingClientRect().bottom), height: Math.round(el.getBoundingClientRect().height) }
       })
-      const others = [...document.querySelectorAll('[data-cache-badge-layer="cache"] > div')]
-        .filter((el) => !keys.includes(el.dataset.cacheBadgeBrick))
+      const others = [...document.querySelectorAll('[data-cache-bricks-layer="cache"] > div')]
+        .filter((el) => !keys.includes(el.dataset.cacheBricksBrick))
         .map((el) => Math.round(el.getBoundingClientRect().bottom))
       return {
         label: label?.textContent ?? null,
@@ -783,9 +951,9 @@ try {
   // and then reads the conversation from the log — without scrolling anything.
   // The panel's button is the double click, so it is proved on a brick the chat *has* drawn.
   if (firstKey !== undefined) {
-    await page.locator(`[data-cache-badge-brick="${firstKey}"][data-cache-badge-face="cache"]`).click()
+    await page.locator(`[data-cache-bricks-brick="${firstKey}"][data-cache-bricks-face="cache"]`).click()
     await page.waitForTimeout(400)
-    const panel = page.locator('[data-cache-badge-panel]')
+    const panel = page.locator('[data-cache-bricks-panel]')
     const locateButton = panel.getByRole('button', { name: '在主对话中定位' })
     check('the inspector offers the trip to the transcript', await locateButton.count() === 1)
     if (await locateButton.count() === 1) {
@@ -799,12 +967,12 @@ try {
         accuracy = /: (exact|context|none) landing/u.exec(line ?? '')?.[1]
       }
       const moved = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
-      const reported = await page.locator('[data-cache-badge-jump]').first().getAttribute('data-cache-badge-jump')
+      const reported = await page.locator('[data-cache-bricks-jump]').first().getAttribute('data-cache-bricks-jump')
       check(`the panel's button lands the same row the double click does (${String(accuracy)})`,
         accuracy === 'exact' && reported === 'exact',
         `accuracy=${String(accuracy)} reported=${String(reported)} moved=${String(moved !== position)}`)
     }
-    await page.locator('[data-cache-badge-panel] button[aria-label="close"]').first().click()
+    await page.locator('[data-cache-bricks-panel] button[aria-label="close"]').first().click()
     await page.waitForTimeout(300)
   }
 
@@ -822,9 +990,9 @@ try {
     // Read before selecting: the read is now triggered by the selection itself, so the
     // "did it move the chat" question has to be asked across the whole gesture.
     const scrollBeforeRead = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
-    const markedBeforeClick = await page.locator('[data-chat-node-key][data-cache-badge-landed]').count()
-    await page.locator(`[data-cache-badge-brick="${talkKey}"][data-cache-badge-face="cache"]`).click()
-    const panel = page.locator('[data-cache-badge-panel]')
+    const markedBeforeClick = await page.locator('[data-chat-node-key][data-cache-bricks-landed]').count()
+    await page.locator(`[data-cache-bricks-brick="${talkKey}"][data-cache-bricks-face="cache"]`).click()
+    const panel = page.locator('[data-cache-bricks-panel]')
 
     // The interaction contract changed with 1.7.1-clickfix.1: a single click **is** the request
     // to read — the panel opens on 对话 and loads this brick's log itself — so there is no
@@ -834,12 +1002,12 @@ try {
     let state = 'loading'
     for (let waited = 0; waited < 12000 && state === 'loading'; waited += 200) {
       await page.waitForTimeout(200)
-      state = await page.locator('[data-cache-badge-transcript-state]').first().getAttribute('data-cache-badge-transcript-state')
+      state = await page.locator('[data-cache-bricks-transcript-state]').first().getAttribute('data-cache-bricks-transcript-state')
     }
     // Past the 300 ms single/double-click discriminator: if the click had been read as a
     // locate, its highlight would be on the row by now.
     await page.waitForTimeout(600)
-    const markedAfterClick = await page.locator('[data-chat-node-key][data-cache-badge-landed]').count()
+    const markedAfterClick = await page.locator('[data-chat-node-key][data-cache-bricks-landed]').count()
     const scrollAfterRead = await page.locator('[data-conversation-scroll]').first().evaluate((el) => el.scrollTop)
     check(`selecting a brick reads its conversation without a second click (${state})`,
       state === 'ready' || state === 'unavailable', String(state))
@@ -848,8 +1016,8 @@ try {
     check('reading the conversation leaves the chat where it was', scrollAfterRead === scrollBeforeRead,
       `scrollTop ${String(scrollBeforeRead)} → ${String(scrollAfterRead)}`)
     if (state === 'ready') {
-      const blocks = await page.locator('[data-cache-badge-transcript]').evaluateAll((els) => els
-        .map((el) => [el.dataset.cacheBadgeTranscript ?? '', (el.textContent ?? '').trim()]))
+      const blocks = await page.locator('[data-cache-bricks-transcript]').evaluateAll((els) => els
+        .map((el) => [el.dataset.cacheBricksTranscript ?? '', (el.textContent ?? '').trim()]))
       const labels = blocks.map((block) => block[0])
       check(`the transcript tab reads the log, not the DOM: labelled verbatim blocks (${String(talkKey)})`,
         blocks.length > 0 && labels.some((label) => label.startsWith('input')) && labels.includes('assistant'),
@@ -862,6 +1030,8 @@ try {
   }
 
   await shot(page, 'brick-jump.png')
+} catch (error) {
+  if (!(error instanceof StopAfterRails)) throw error
 } finally {
   await browser.close()
 }

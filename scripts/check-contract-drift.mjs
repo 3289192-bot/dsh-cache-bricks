@@ -1,25 +1,20 @@
-// Contract-drift check for the two DSH cores this fork supports.
+// Contract-drift check across the historical 0.1.6 core and supported rc.2 core.
 //
-// The bundle is compiled once and served to both instances, so the client
-// contracts it depends on must stay compatible across the cores they run:
+// This historical comparison records whether the client's referenced members
+// remained compatible across the two cores:
 // a member the OLDER core has and the NEWER one dropped would break the fork
 // on that core. Additive differences (a newer core adding optional members)
 // are fine and reported as such.
 //
 //   node scripts/check-contract-drift.mjs [newerRuntimeDir] [olderRuntimeDir]
 //
-// Defaults follow the current user profile. Pass explicit paths for other
-// installations. Exit code 1 means a member was removed between the two cores
-// and the plugin must be adapted.
+// Defaults follow the current user's DSH home and global npm directories.
+// Exit code 1 means a member was removed between the two cores.
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const userProfile = process.env.USERPROFILE ?? process.env.HOME ?? process.cwd()
-const appData = process.env.APPDATA ?? join(userProfile, 'AppData', 'Roaming')
-const [
-  newerRoot = join(userProfile, '.dsh-017', 'runtime', 'node_modules'),
-  olderRoot = join(appData, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules'),
-] = process.argv.slice(2)
+const [newerRoot = join(process.env.DSH_HOME ?? join(homedir(), '.dsh-017'), 'runtime', 'node_modules'), olderRoot = join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules')] = process.argv.slice(2)
 
 /** Contract files this plugin's client half depends on, and the members it uses. */
 const TARGETS = [

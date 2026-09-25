@@ -4,7 +4,7 @@
  * Two rules come straight from the runtime contract (see `docs/runtime-contract.md`):
  *
  * - URLs are **document-relative**. The served page carries `<base href="./">` and
- *   may sit behind a prefix-stripping mount, so `location.origin + '/cache-badge'`
+ *   may sit behind a prefix-stripping mount, so `location.origin + '/cache-bricks'`
  *   would break outside the origin root.
  * - The feed is an optimisation, never a requirement. A composition without a host
  *   half (or an older line) answers 404, and the board must keep working from what
@@ -55,7 +55,7 @@ export class BrickFeedClient {
   /** The URL of one route, resolved for the current mount. */
   url(route: string): string {
     const base = this.environment.baseUri ?? (typeof document === 'undefined' ? '' : document.baseURI)
-    return documentRelative(`cache-badge/${route}`, base)
+    return documentRelative(`cache-bricks/${route}`, base)
   }
 
   /**
@@ -98,7 +98,7 @@ export class BrickFeedClient {
         this.state = 'unavailable'
         if (response.status === 404) {
           console.info(
-            `[dsh-cache-badge] the host collector has no observations for session ${sessionId} `
+            `[dsh-cache-bricks] the host collector has no observations for session ${sessionId} `
             + '(HTTP 404); the board falls back to the client-side fold.',
           )
         }

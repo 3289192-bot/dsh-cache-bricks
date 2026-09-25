@@ -231,15 +231,21 @@ export interface BrickRaw {
 /** One model request attempt. */
 export interface BrickRecord {
     /**
-     * Which half folded this brick.
+     * Where this brick came from — three provenances, and the panel reports which one it has.
      *
-     * `host` is the collector: the full record, with the request, the stream and the
-     * context snapshot kept by reference. `client` is the reduced record the browser
-     * can derive from the session event feed on its own, used when no host half is
-     * serving the session — fewer fields, and the panel says so rather than showing
-     * empty rows as if they had been measured.
+     * - `host`: the live collector. The full record: the request, the timed stream, the
+     *   dispatch-time context snapshot, all kept by reference.
+     * - `replay`: the session's own log, folded by the same observations the collector uses
+     *   (`./replay`). Usage, cache accounting, activity, tools, retries, settlement and the
+     *   navigation target are the log's own; what the log never carried — the outgoing
+     *   request, the context snapshot, the dispatch instant — is absent rather than guessed.
+     * - `client`: the browser's reduced per-step fold, used only when no session face is
+     *   reachable at all. One brick per step, no attempt identity, no type.
+     *
+     * Absent means the writer predates the distinction (an older host build); treat it as
+     * `host`, which is what it was.
      */
-    readonly observedBy?: 'host' | 'client';
+    readonly observedBy?: 'host' | 'replay' | 'client';
     readonly identity: BrickIdentity;
     readonly settlement: BrickSettlement;
     readonly interrupted?: boolean;

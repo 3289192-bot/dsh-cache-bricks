@@ -17,7 +17,7 @@
 import { installCollector, type CollectorOptions } from './host/collect'
 import type { HostContextLike } from './host/collect'
 
-export const name = 'dsh-cache-badge'
+export const name = 'dsh-cache-bricks'
 
 /**
  * Install the collector.

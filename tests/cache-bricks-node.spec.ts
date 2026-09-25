@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cacheBadgeDefinition } from '../src/client/cache-badge-node'
+import { cacheBricksDefinition } from '../src/client/cache-bricks-node'
 
 /** Turn opening event. */
 function turnStart(turn: number, seq = 1, time = 1000): any {
@@ -54,19 +54,19 @@ function turnEnd(turn: number, seq: number, time: number): any {
   return { type: 'turn/end', seq, time, data: { turn } }
 }
 
-describe('cacheBadgeDefinition.match', () => {
+describe('cacheBricksDefinition.match', () => {
   it('keys every event of one turn to that turn', () => {
-    expect(cacheBadgeDefinition.match(turnStart(3))).toEqual({ id: 'turn:3', role: 'start' })
-    expect(cacheBadgeDefinition.match(stepStart(3, 1, 2, 1100))).toEqual({ id: 'turn:3', role: 'start' })
-    expect(cacheBadgeDefinition.match(chunk(3, 1, 3, 1200, 'usage', { usage: { inputTokens: 1 } }))).toEqual({ id: 'turn:3', role: 'update' })
-    expect(cacheBadgeDefinition.match(assistantMessage(3, 1, 4, 1300, { inputTokens: 1 }))).toEqual({ id: 'turn:3', role: 'update' })
-    expect(cacheBadgeDefinition.match(turnEnd(3, 9, 1400))).toEqual({ id: 'turn:3', role: 'update' })
+    expect(cacheBricksDefinition.match(turnStart(3))).toEqual({ id: 'turn:3', role: 'start' })
+    expect(cacheBricksDefinition.match(stepStart(3, 1, 2, 1100))).toEqual({ id: 'turn:3', role: 'start' })
+    expect(cacheBricksDefinition.match(chunk(3, 1, 3, 1200, 'usage', { usage: { inputTokens: 1 } }))).toEqual({ id: 'turn:3', role: 'update' })
+    expect(cacheBricksDefinition.match(assistantMessage(3, 1, 4, 1300, { inputTokens: 1 }))).toEqual({ id: 'turn:3', role: 'update' })
+    expect(cacheBricksDefinition.match(turnEnd(3, 9, 1400))).toEqual({ id: 'turn:3', role: 'update' })
   })
 
   it('separates turns and ignores unrelated events', () => {
-    expect(cacheBadgeDefinition.match(turnStart(4))).toEqual({ id: 'turn:4', role: 'start' })
-    expect(cacheBadgeDefinition.match({ type: 'tool/result', seq: 5, data: { turn: 3, step: 1 } })).toBeNull()
-    expect(cacheBadgeDefinition.match({ type: 'turn/start', seq: 5, data: {} })).toBeNull()
+    expect(cacheBricksDefinition.match(turnStart(4))).toEqual({ id: 'turn:4', role: 'start' })
+    expect(cacheBricksDefinition.match({ type: 'tool/result', seq: 5, data: { turn: 3, step: 1 } })).toBeNull()
+    expect(cacheBricksDefinition.match({ type: 'turn/start', seq: 5, data: {} })).toBeNull()
   })
 })
 
@@ -74,8 +74,8 @@ describe('per-turn fold', () => {
   /** Apply one event sequence to a fresh context. */
   function fold(events: any[]): any {
     const [first, ...rest] = events
-    let state = cacheBadgeDefinition.start!({} as any, { event: first } as any)
-    for (const event of rest) state = cacheBadgeDefinition.update!({ state } as any, { event } as any)
+    let state = cacheBricksDefinition.start!({} as any, { event: first } as any)
+    for (const event of rest) state = cacheBricksDefinition.update!({ state } as any, { event } as any)
     return state
   }
 
@@ -162,34 +162,34 @@ describe('per-turn fold', () => {
   })
 })
 
-describe('cacheBadgeDefinition.publication', () => {
+describe('cacheBricksDefinition.publication', () => {
   it('publishes as soon as a step reports usage', () => {
-    expect(cacheBadgeDefinition.publication!({ event: chunk(1, 1, 2, 2000, 'usage', { usage: { inputTokens: 1 } }) } as any)).toBe('immediate')
+    expect(cacheBricksDefinition.publication!({ event: chunk(1, 1, 2, 2000, 'usage', { usage: { inputTokens: 1 } }) } as any)).toBe('immediate')
     // Including on the live row, so the chip keeps up with a step that is still streaming.
-    expect(cacheBadgeDefinition.publication!({ event: liveChunk(1, 1, 2.5, 2050, 'usage', { usage: { inputTokens: 1 } }) } as any)).toBe('immediate')
-    expect(cacheBadgeDefinition.publication!({ event: assistantMessage(1, 1, 3, 2100, { inputTokens: 1 }) } as any)).toBe('immediate')
-    expect(cacheBadgeDefinition.publication!({ event: turnEnd(1, 4, 2200) } as any)).toBe('immediate')
+    expect(cacheBricksDefinition.publication!({ event: liveChunk(1, 1, 2.5, 2050, 'usage', { usage: { inputTokens: 1 } }) } as any)).toBe('immediate')
+    expect(cacheBricksDefinition.publication!({ event: assistantMessage(1, 1, 3, 2100, { inputTokens: 1 }) } as any)).toBe('immediate')
+    expect(cacheBricksDefinition.publication!({ event: turnEnd(1, 4, 2200) } as any)).toBe('immediate')
   })
 
   it('stays quiet for events that do not change the row', () => {
-    expect(cacheBadgeDefinition.publication!({ event: turnStart(1) } as any)).toBe('none')
-    expect(cacheBadgeDefinition.publication!({ event: stepStart(1, 1, 2, 1100) } as any)).toBe('none')
-    expect(cacheBadgeDefinition.publication!({ event: chunk(1, 1, 3, 1200, 'text-delta', { text: 'x' }) } as any)).toBe('none')
+    expect(cacheBricksDefinition.publication!({ event: turnStart(1) } as any)).toBe('none')
+    expect(cacheBricksDefinition.publication!({ event: stepStart(1, 1, 2, 1100) } as any)).toBe('none')
+    expect(cacheBricksDefinition.publication!({ event: chunk(1, 1, 3, 1200, 'text-delta', { text: 'x' }) } as any)).toBe('none')
   })
 })
 
-describe('cacheBadgeDefinition.buildViewNode', () => {
+describe('cacheBricksDefinition.buildViewNode', () => {
   /** Build a context from an event sequence, returning the published node. */
   function nodeFor(events: any[]): any {
     const [first, ...rest] = events
-    let state = cacheBadgeDefinition.start!({} as any, { event: first } as any)
+    let state = cacheBricksDefinition.start!({} as any, { event: first } as any)
     const matches: any[] = [{ event: first, location: { kind: 'turn', turn: { turn: first.data.turn } } }]
     for (const event of rest) {
-      state = cacheBadgeDefinition.update!({ state } as any, { event } as any)
+      state = cacheBricksDefinition.update!({ state } as any, { event } as any)
       matches.push({ event, location: { kind: 'turn', turn: { turn: event.data.turn } } })
     }
-    return cacheBadgeDefinition.buildViewNode!({
-      key: 'k', id: `turn:${String(first.data.turn)}`, kind: 'cache-badge', target: 'chat', state, matches,
+    return cacheBricksDefinition.buildViewNode!({
+      key: 'k', id: `turn:${String(first.data.turn)}`, kind: 'cache-bricks', target: 'chat', state, matches,
       start: { event: first, role: 'start', location: { kind: 'turn', turn: {} } },
     } as any)
   }
@@ -206,7 +206,7 @@ describe('cacheBadgeDefinition.buildViewNode', () => {
   it('publishes the whole turn with the last matched event as its anchor', () => {
     const node = nodeFor(twoSteps)
     expect(node).not.toBeNull()
-    expect(node.kind).toBe('cache-badge')
+    expect(node.kind).toBe('cache-bricks')
     // Anchored at turn/end and published hidden: the node is a data carrier for
     // the composer-dock chip, never a row in the Chat flow.
     expect(node.anchorSeq).toBe(6)
@@ -229,7 +229,7 @@ describe('cacheBadgeDefinition.buildViewNode', () => {
   })
 
   it('publishes nothing at all when the turn was never seen in the window', () => {
-    expect(cacheBadgeDefinition.buildViewNode!({ state: undefined, id: 'turn:9' } as any)).toBeNull()
+    expect(cacheBricksDefinition.buildViewNode!({ state: undefined, id: 'turn:9' } as any)).toBeNull()
   })
 
   it('keeps publishing a turn whose state is gone, once it has been published', () => {
@@ -242,7 +242,7 @@ describe('cacheBadgeDefinition.buildViewNode', () => {
       chunk(7, 1, 9, 120, 'usage', { usage: { inputTokens: 500, cacheReadTokens: 400 } }),
     ])
     expect(first).not.toBeNull()
-    const after = cacheBadgeDefinition.buildViewNode!({ state: undefined, id: 'turn:7', key: 'k', matches: [], start: undefined } as any)
+    const after = cacheBricksDefinition.buildViewNode!({ state: undefined, id: 'turn:7', key: 'k', matches: [], start: undefined } as any)
     expect(after).not.toBeNull()
     expect(after!.data.turn).toBe(7)
   })

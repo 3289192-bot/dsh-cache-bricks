@@ -12,8 +12,8 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { BlobStore } from '../src/host/blob-store'
-import { RequestSummarizer } from '../src/host/observe'
+import { BlobStore } from '../src/core/blob-store'
+import { RequestSummarizer } from '../src/core/observe'
 import { contentRef } from '../src/shared/sha256'
 import { liveCookie, liveGet } from './helpers/live'
 import type { BrickFeed, BrickRecord } from '../src/shared/brick'
@@ -38,15 +38,15 @@ function median(samples: number[]): number {
 
 describe.skipIf(process.env.DSH_BENCH !== '1')('collector cost on a real request', () => {
   it('measures cold and warm summarization, and asserts the warm path stays cheap', async () => {
-    const sessions = await get('/cache-badge/sessions')
+    const sessions = await get('/cache-bricks/sessions')
     const sessionId: string | undefined = sessions?.sessions?.[0]
     if (sessionId === undefined) {
       console.log(`benchmark skipped: no collector at ${BASE}`)
       return
     }
-    const feed: BrickFeed = await get(`/cache-badge/attempts?sessionId=${encodeURIComponent(sessionId)}`)
+    const feed: BrickFeed = await get(`/cache-bricks/attempts?sessionId=${encodeURIComponent(sessionId)}`)
     const brick: BrickRecord = feed.bricks[feed.bricks.length - 1]!
-    const envelope = (await get(`/cache-badge/blob?ref=${encodeURIComponent(brick.request.requestRef!)}`)).value as {
+    const envelope = (await get(`/cache-bricks/blob?ref=${encodeURIComponent(brick.request.requestRef!)}`)).value as {
       toolsRef?: string
       system?: string
       messageRefsRef?: string
@@ -57,14 +57,14 @@ describe.skipIf(process.env.DSH_BENCH !== '1')('collector cost on a real request
     // working tree's.
     const inline = (envelope as { messageRefs?: string[] }).messageRefs
     const list = envelope.messageRefsRef !== undefined
-      ? (await get(`/cache-badge/blob?ref=${encodeURIComponent(envelope.messageRefsRef)}`)).value as { refs: string[] }
+      ? (await get(`/cache-bricks/blob?ref=${encodeURIComponent(envelope.messageRefsRef)}`)).value as { refs: string[] }
       : { refs: inline ?? [] }
     const tools = envelope.toolsRef === undefined
       ? []
-      : ((await get(`/cache-badge/blob?ref=${encodeURIComponent(envelope.toolsRef)}`)).value as { tools: unknown[] }).tools
+      : ((await get(`/cache-bricks/blob?ref=${encodeURIComponent(envelope.toolsRef)}`)).value as { tools: unknown[] }).tools
     const messages: unknown[] = []
     for (const ref of list.refs) {
-      messages.push((await get(`/cache-badge/blob?ref=${encodeURIComponent(ref)}`)).value)
+      messages.push((await get(`/cache-bricks/blob?ref=${encodeURIComponent(ref)}`)).value)
     }
     const megabytes = Buffer.byteLength(JSON.stringify(messages)) / 1048576
     console.log(`request under test: ${brick.identity.id}`)

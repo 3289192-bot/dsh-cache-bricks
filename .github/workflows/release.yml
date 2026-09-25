@@ -3,7 +3,7 @@ name: GitHub release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v0.1.2'
 
 permissions:
   contents: write
@@ -12,27 +12,40 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out tagged source
-        uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
-          node-version: 22.19.0
+          version: 11
 
-      - name: Install pnpm
-        run: npm install --global pnpm@11.19.0
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build package
+      - name: Check types
+        run: pnpm run typecheck
+
+      - name: Build
         run: pnpm run build
 
-      - name: Pack release artifact
-        run: npm pack
+      - name: Run tests
+        run: pnpm test
 
-      - name: Create GitHub release
-        run: gh release create "$GITHUB_REF_NAME" dsh-cache-badge-*.tgz --verify-tag --generate-notes
+      - name: Verify built host
+        run: pnpm run verify:host
+
+      - name: Pack both release archives
+        run: pnpm run pack:latest
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dsh-cache-bricks-${GITHUB_REF_NAME#v}.tgz" "dsh-cache-bricks.tgz" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file docs/release-notes.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

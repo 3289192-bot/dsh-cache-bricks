@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { BlobStore } from '../src/host/blob-store'
+import { BlobStore } from '../src/core/blob-store'
 
 describe('BlobStore', () => {
   it('gives equal payloads the same ref and stores them once', () => {

@@ -59,6 +59,10 @@ describe('formatting', () => {
     expect(formatPercent(0)).toBe('0.0')
     expect(formatPercent(1)).toBe('100.0')
     expect(formatPercent(0.99999)).toBe('99.9')
+    // Downward at the printed precision: the tenth is floored, never rounded up.
+    expect(formatPercent(0.0875)).toBe('8.7')
+    expect(formatPercent(0.9995)).toBe('99.9')
+    expect(formatPercent(-1)).toBe('0.0')
   })
 
   it('abbreviates token counts in the official style', () => {
@@ -80,10 +84,10 @@ describe('formatting', () => {
       hasCacheEvidence: true,
     })!)
     expect(at(1)).toBe('100%')
-    expect(at(0.999)).toBe('99%')
-    expect(at(0.9999)).toBe('99%')
-    expect(at(0.5)).toBe('50%')
-    // Below ten percent the fraction is the whole point, so it keeps a decimal.
+    expect(at(0.999)).toBe('99.9%')
+    expect(at(0.9999)).toBe('99.9%')
+    expect(at(0.5)).toBe('50.0%')
+    // The fraction is kept at every size now, which is what the brick's bigger digit paid for.
     expect(at(0.087)).toBe('8.7%')
     expect(at(0)).toBe('0.0%')
     expect(brickLabel(badgeStatus({ usage: { inputTokens: 9000 }, hasCacheEvidence: false })!)).toBe('n/a')
@@ -111,9 +115,22 @@ describe('badgeStatus', () => {
     expect(status?.hitRatio).toBeCloseTo(150_000 / 151_200, 10)
   })
 
-  it('shows a mid-range hit as a warning', () => {
+  it('shows a hit just under the warning line as amber, however comfortable it looks', () => {
+    // 0.1.0.a: amber starts at 90%, so 85% is amber — on a long session it used to read green.
+    const status = badgeStatus({ usage: { inputTokens: 15_000, cacheReadTokens: 85_000 }, hasCacheEvidence: true })
+    expect(status).toMatchObject({ tone: 'warn', label: 'Cache 85.0%' })
+    expect(badgeStatus({ usage: { inputTokens: 10_100, cacheReadTokens: 89_900 }, hasCacheEvidence: true })?.tone).toBe('warn')
+  })
+
+  it('shows a 43% hit as red, which the old palette called a warning', () => {
     const status = badgeStatus({ usage: { inputTokens: 57_000, cacheReadTokens: 43_000 }, hasCacheEvidence: true })
-    expect(status).toMatchObject({ tone: 'warn', label: 'Cache 43.0%' })
+    expect(status).toMatchObject({ tone: 'critical', label: 'Cache 43.0%' })
+  })
+
+  it('turns red once most of the prompt was paid for again', () => {
+    // 69.9% is red; 70% is amber. The line is the point of the change, so both sides are pinned.
+    expect(badgeStatus({ usage: { inputTokens: 30_100, cacheReadTokens: 69_900 }, hasCacheEvidence: true })?.tone).toBe('critical')
+    expect(badgeStatus({ usage: { inputTokens: 30_000, cacheReadTokens: 70_000 }, hasCacheEvidence: true })?.tone).toBe('warn')
   })
 
   it('turns red below the critical share', () => {
@@ -155,10 +172,11 @@ describe('badgeStatus', () => {
   })
 
   it('keeps the warning band open above the critical one', () => {
-    expect(WARN_BELOW).toBe(0.8)
-    const justBelow = badgeStatus({ usage: { inputTokens: 2000, cacheReadTokens: 7999 }, hasCacheEvidence: true })
+    expect(CRITICAL_BELOW).toBe(0.7)
+    expect(WARN_BELOW).toBe(0.9)
+    const justBelow = badgeStatus({ usage: { inputTokens: 2000, cacheReadTokens: 17_999 }, hasCacheEvidence: true })
     expect(justBelow?.tone).toBe('warn')
-    const atBoundary = badgeStatus({ usage: { inputTokens: 2000, cacheReadTokens: 8000 }, hasCacheEvidence: true })
+    const atBoundary = badgeStatus({ usage: { inputTokens: 2000, cacheReadTokens: 18_000 }, hasCacheEvidence: true })
     expect(atBoundary?.tone).toBe('good')
   })
 })
@@ -167,7 +185,7 @@ describe('badge presentation', () => {
   it('logs one line per step with its accounting', () => {
     const status = badgeStatus({ usage: { inputTokens: 8700, cacheReadTokens: 91_300 }, hasCacheEvidence: true })!
     const line = badgeLogLine(status, { turn: 4, step: 1, provider: 'deepseek-official', at: 0 })
-    expect(line).toContain('[dsh-cache-badge]')
+    expect(line).toContain('[dsh-cache-bricks]')
     expect(line).toContain('turn 4 step 1: Cache 91.3%')
     expect(line).toContain('cached 91.3k / prompt 100k, 8.7k re-billed')
   })

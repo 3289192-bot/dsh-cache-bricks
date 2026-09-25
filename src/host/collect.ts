@@ -19,9 +19,9 @@
  * identity but no request. The ledger pairs them through a per-session FIFO, so
  * whichever channel reports first, the two meet.
  */
-import { BrickLedger, type Observation } from './brick-ledger'
-import { BlobStore } from './blob-store'
-import { createCacheBadgeRouter } from './routes'
+import { BrickLedger, type Observation } from '../core/brick-ledger'
+import { BlobStore } from '../core/blob-store'
+import { createCacheBricksRouter } from './routes'
 import {
   RequestSummarizer,
   chunkObservation,
@@ -34,7 +34,7 @@ import {
   toolResultObservation,
   type ChunkLike,
   type RequestLike,
-} from './observe'
+} from '../core/observe'
 import type { BrickFeed } from '../shared/brick'
 
 /** Structural view of the Cordis context this plugin uses. */
@@ -116,7 +116,7 @@ export function installCollector(ctx: HostContextLike, options: CollectorOptions
       action()
     } catch (error) {
       // Never rethrow: this code sits inside the model-call path.
-      console.warn('[dsh-cache-badge] observation failed:', error instanceof Error ? error.message : error)
+      console.warn('[dsh-cache-bricks] observation failed:', error instanceof Error ? error.message : error)
     }
   }
 
@@ -214,7 +214,7 @@ export function installCollector(ctx: HostContextLike, options: CollectorOptions
     if (!state.warnedUnattributed && state.ledger.unattributedCount > 0) {
       state.warnedUnattributed = true
       console.warn(
-        `[dsh-cache-badge] dropped ${String(state.ledger.unattributedCount)} observation(s) for session `
+        `[dsh-cache-bricks] dropped ${String(state.ledger.unattributedCount)} observation(s) for session `
         + `${sessionId}: no attempt could be identified for them (see feed.unattributed).`,
       )
     }
@@ -459,7 +459,7 @@ export function installCollector(ctx: HostContextLike, options: CollectorOptions
   }
 
   if (options.serve !== false) {
-    const router = createCacheBadgeRouter({
+    const router = createCacheBricksRouter({
       feed: (sessionId) => collector.feed(sessionId),
       sessions: () => collector.sessions(),
       blob: (ref) => collector.blob(ref),

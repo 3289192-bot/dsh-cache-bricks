@@ -18,6 +18,15 @@
  * made of?") and answers it in one gesture instead of a pointer hovering forty
  * tiny slabs. Both layers carry a brick at the same grid position, so a column
  * stays the column it was when the card comes back.
+ *
+ * The card is a **window over the whole board**, not a crop of it: the frame never
+ * changes size, and the content pans inside it along two rails — Turns to the left and
+ * right, rows up and down (see `boardWindow` in `./tetris`). Until a reader pans, the
+ * window sits on the live corner and the board reads exactly as it did before the rails
+ * existed: the newest Turn on the right edge, the floor at the bottom, a finished Turn
+ * sliding the stack one cell left. Panning is whole cells, so a panned board still shows
+ * the grid the bricks fell into; the rails themselves are carved out of the band, so no
+ * brick ever sits under one.
  */
 import {
   ACTIVITY,
@@ -39,18 +48,24 @@ import {
   pitchX,
   pitchY,
   COMPOSER_FALLBACK,
-  auxLaneRow,
+  boardWindow,
   cellPlacement,
-  columnRowLimit,
+  clampScroll,
   fitBoard,
-  visibleColumns,
+  liveScroll,
+  railGeometry,
+  windowCell,
   type BoardColumn,
   type BoardFace,
   type BoardMetrics,
+  type BoardScroll,
+  type BoardWindow,
   type Brick,
+  type RailGeometry,
 } from './tetris'
 import type { LoadReport, LoadRequest } from './navigation'
 import { revealBrick, type RevealElement, type RevealOutcome } from './reveal'
+import type { BrickTarget, HistoricalStepTarget } from './target'
 
 /** Both sides of the card, in the order that keeps cache-first everywhere. */
 const FACES: readonly BoardFace[] = ['cache', 'type']
@@ -67,6 +82,36 @@ const FACES: readonly BoardFace[] = ['cache', 'type']
 const CHROME_H = 16
 
 /**
+ * Thickness of the board's own scroll rails, in CSS pixels.
+ *
+ * Carved out of the band exactly like {@link CHROME_H}: the grid is fitted into what is
+ * left, so no brick is ever underneath a rail. A rail laid *over* the grid would hide
+ * the newest column's digits — the one reading the board exists for — and would swallow
+ * its clicks.
+ */
+const RAIL = 6
+
+/**
+ * Where the grid starts inside the board's box, in CSS pixels.
+ *
+ * The vertical rail takes the **left** edge. The board lives in the blank gutter beside the
+ * transcript, so its right edge is the one that faces the conversation: a rail there would
+ * read as part of the transcript and crowd the newest column, which is the column a reader
+ * is looking at. The grid is inset by exactly the rail, so the rail is the board's own
+ * frame rather than an overlay — no brick is ever underneath it.
+ */
+const GRID_LEFT = RAIL
+
+/** How far the edge fade reaches into the grid, in CSS pixels. */
+const FADE = 9
+
+/** The brick transition: gravity on the way down, a shorter slide when the stack shifts left. */
+const SLAB_TRANSITION = 'bottom 420ms cubic-bezier(.45,.02,.95,.55), right 260ms ease-out'
+
+/** How long a hand-driven pan keeps the bricks from animating their own moves, in milliseconds. */
+const PAN_QUIET_MS = 200
+
+/**
  * Narrowest a colour slice may get, in CSS pixels.
  *
  * A mixed brick's split follows the real ratio between thinking and acting, but a
@@ -74,6 +119,23 @@ const CHROME_H = 16
  * it keeps both halves identifiable while still reading as "much more of one".
  */
 const MIN_SEGMENT_PX = 5
+
+/**
+ * Size of the reading printed on a brick, in CSS pixels.
+ *
+ * **Measured, not chosen by eye.** A brick's inner box is 34x13 (36x15 minus the 1px border), the
+ * label is at most five characters (`99.9%`; an exact full hit prints the shorter `100%`), and the
+ * font stack resolves to a monospace whose advance is 0.55 em on this line of machines. So the
+ * ceiling is `34 / (5 x 0.55) = 12.4px` by width and `13px` by height, and **12px** is the largest
+ * whole size that fits with slack — 13px measures 34.4px even with the tracking below, i.e. it
+ * clips. The old 9px was what a four-character label needed; the decimal is what paid for the
+ * three extra pixels, and `scripts/test-scroll.mjs` measures every printed reading against its own
+ * brick so a font or size regression cannot silently clip the last digit.
+ *
+ * On a platform whose monospace is wider (SF Mono and DejaVu are ~0.6 em, not 0.55), 12px lands
+ * within half a pixel of the edge: the safe-everywhere size is 11px.
+ */
+const BRICK_TEXT_PX = 12
 
 /**
  * Border for a brick.
@@ -102,7 +164,7 @@ function borderCss(brick: Brick): string {
  */
 function createLayer(face: BoardFace): HTMLDivElement {
   const layer = document.createElement('div')
-  layer.dataset.cacheBadgeLayer = face
+  layer.dataset.cacheBricksLayer = face
   Object.assign(layer.style, {
     position: 'absolute',
     top: '0',
@@ -115,23 +177,44 @@ function createLayer(face: BoardFace): HTMLDivElement {
 }
 
 /**
+ * Where a brick came from, as the faces need it.
+ *
+ * `estimated` predates the distinction and meant "not from the live collector"; a replayed brick
+ * is also not from the live collector, but its reading, its activity and its lifecycle are the
+ * session log's own. So the two must not be painted the same way: the fold's face says "this is
+ * a per-step reading", the replay's face shows the brick, dimmed, because what is missing behind
+ * it is the request capture and not the measurement.
+ *
+ * @param brick - the brick.
+ * @returns its provenance, defaulting an untagged estimated brick to the fold it came from.
+ */
+function provenanceOf(brick: Brick): 'live' | 'replay' | 'fold' {
+  if (brick.origin !== undefined) return brick.origin
+  return brick.estimated === true ? 'fold' : 'live'
+}
+
+/** How much of a replayed brick's colour is shown: dimmer than live, brighter than a fold. */
+const REPLAY_OPACITY = 0.88
+
+/**
  * Paint the measuring side: the cache reading, in the cache tone's colours.
  *
  * @param slab - the brick element.
  * @param brick - its data.
  */
 function paintCacheFace(slab: HTMLDivElement, brick: Brick): void {
+  const origin = provenanceOf(brick)
   // A brick the client folded itself is one per *step*, with no attempt identity and no row
   // to navigate to. It keeps its reading and its tone — that percentage **is** measured, from
   // the session events — and says what it is through a dashed edge, a dimmed slab and the
   // board's notice, so a wall of them is never read as a wall of collected requests.
-  if (brick.estimated === true) {
+  if (origin === 'fold') {
     Object.assign(slab.style, {
       background: TONE_BRICK[brick.tone],
       border: `1px dashed ${TONE_EDGE[brick.tone]}`,
       boxShadow: 'none',
       color: TONE_TEXT[brick.tone],
-      font: `${TONE_WEIGHT[brick.tone]} 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace`,
+      font: `${TONE_WEIGHT[brick.tone]} ${String(BRICK_TEXT_PX)}px/1 ui-monospace, SFMono-Regular, Menlo, monospace`,
       fontVariantNumeric: 'tabular-nums',
       letterSpacing: '-0.02em',
       opacity: '0.75',
@@ -139,7 +222,9 @@ function paintCacheFace(slab: HTMLDivElement, brick: Brick): void {
     if (slab.textContent !== brick.label) slab.textContent = brick.label
     return
   }
-  slab.style.opacity = '1'
+  // A replayed brick is a real attempt from the log, drawn dimmer because nothing behind it was
+  // captured; a live brick is drawn at full strength.
+  slab.style.opacity = origin === 'replay' ? String(REPLAY_OPACITY) : '1'
   Object.assign(slab.style, {
     background: TONE_BRICK[brick.tone],
     border: borderCss(brick),
@@ -147,7 +232,7 @@ function paintCacheFace(slab: HTMLDivElement, brick: Brick): void {
     // as a flat swatch.
     boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.18)',
     color: TONE_TEXT[brick.tone],
-    font: `${TONE_WEIGHT[brick.tone]} 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace`,
+    font: `${TONE_WEIGHT[brick.tone]} ${String(BRICK_TEXT_PX)}px/1 ui-monospace, SFMono-Regular, Menlo, monospace`,
     fontVariantNumeric: 'tabular-nums',
     letterSpacing: '-0.02em',
   } satisfies Partial<CSSStyleDeclaration>)
@@ -160,7 +245,7 @@ function paintCacheFace(slab: HTMLDivElement, brick: Brick): void {
  * The face prints **nothing**. At 36x15 the colour is the reading — and the seam
  * between two colours is the reading for a mixed brick — so a two-character label on
  * the one-colour types would make the board look inconsistent while saying nothing
- * the colour had not already said. The label lives in the tooltip, the accessible
+ * the colour had already said. The label lives in the tooltip, the accessible
  * name and the panel's chip, which all have room for words.
  *
  * @param slab - the brick element.
@@ -171,9 +256,12 @@ function paintCacheFace(slab: HTMLDivElement, brick: Brick): void {
  */
 function paintActivityFace(slab: HTMLDivElement, brick: Brick, metrics: BoardMetrics, highlight: boolean): void {
   const floor = MIN_SEGMENT_PX / Math.max(1, metrics.width)
-  if (brick.estimated === true) {
+  const origin = provenanceOf(brick)
+  if (origin === 'fold') {
     // Nothing about this brick's activity was measured — the fold sees usage, not channels —
-    // so this face states that instead of painting a type it cannot support.
+    // so this face states that instead of painting a type it cannot support. A *replayed* brick
+    // is the opposite case and falls through: its channels are the log's own, so its face is
+    // the type it actually was.
     slab.replaceChildren()
     Object.assign(slab.style, {
       background: 'transparent',
@@ -209,7 +297,9 @@ function paintActivityFace(slab: HTMLDivElement, brick: Brick, metrics: BoardMet
     borderRadius: SPAN_RADIUS,
     border: brick.abnormal === 'failed' ? `1px solid ${ERROR_COLOR}` : 'none',
     boxShadow: 'none',
-    opacity: segments.length === 1 && tone === 'system' ? String(SPAN_OPACITY.dim) : String(SPAN_OPACITY.solid),
+    opacity: origin === 'replay'
+      ? String(REPLAY_OPACITY)
+      : segments.length === 1 && tone === 'system' ? String(SPAN_OPACITY.dim) : String(SPAN_OPACITY.solid),
   } satisfies Partial<CSSStyleDeclaration>)
   // A one-colour face prints nothing: the colour is the reading, and the lane word plus what
   // the attempt was doing there live in the tooltip and the panel. At 36x15 a printed word
@@ -225,7 +315,7 @@ function paintActivityFace(slab: HTMLDivElement, brick: Brick, metrics: BoardMet
   slab.style.gap = '0'
   for (const segment of segments) {
     const part = document.createElement('div')
-    part.dataset.cacheBadgeSegment = segment.tone
+    part.dataset.cacheBricksSegment = segment.tone
     Object.assign(part.style, {
       flex: `${String(segment.share)} 1 0`,
       alignSelf: 'stretch',
@@ -256,7 +346,7 @@ function paintActivityFace(slab: HTMLDivElement, brick: Brick, metrics: BoardMet
  * @param brick - its data.
  */
 function paintBadge(slab: HTMLDivElement, brick: Brick): void {
-  const existing = slab.querySelector<HTMLElement>('[data-cache-badge-mark]')
+  const existing = slab.querySelector<HTMLElement>('[data-cache-bricks-mark]')
   if (brick.abnormal === undefined) {
     existing?.remove()
     return
@@ -277,7 +367,7 @@ function paintBadge(slab: HTMLDivElement, brick: Brick): void {
     } satisfies Partial<CSSStyleDeclaration>)
     slab.append(badge)
   }
-  badge.dataset.cacheBadgeMark = mark.glyph
+  badge.dataset.cacheBricksMark = mark.glyph
   if (badge.textContent !== mark.glyph) badge.textContent = mark.glyph
 }
 
@@ -423,6 +513,14 @@ export interface CacheTetrisBoardOptions {
    * make the row exist before scrolling to it.
    */
   readonly load?: (request: LoadRequest) => Promise<LoadReport>
+  /**
+   * What a **folded** brick's step became in the transcript, read from the durable log.
+   *
+   * A folded brick carries a `historical-step` target: the step is known, the row is not.
+   * The board passes this straight through to the reveal, which asks it after loading — see
+   * `resolveHistoricalStep`.
+   */
+  readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined
 }
 
 export class CacheTetrisBoard {
@@ -441,6 +539,18 @@ export class CacheTetrisBoard {
   private laneLabel: HTMLDivElement | undefined
   /** The chrome strip's "no collector" notice. */
   private notice: HTMLDivElement | undefined
+  /** The chrome strip's "back to the newest" control, shown only while the board is panned. */
+  private liveChip: HTMLButtonElement | undefined
+  /** Horizontal rail: Turns to the left and right. */
+  private hRail: HTMLDivElement | undefined
+  private hThumb: HTMLDivElement | undefined
+  /** Vertical rail: rows up and down. */
+  private vRail: HTMLDivElement | undefined
+  private vThumb: HTMLDivElement | undefined
+  /** Edge fades: content hidden beyond the window's left, right and top edges. */
+  private fadeLeft: HTMLDivElement | undefined
+  private fadeRight: HTMLDivElement | undefined
+  private fadeTop: HTMLDivElement | undefined
   /** True while the bricks come from the client's own fold. */
   private estimated = false
   /** One slab map per side. `cache` is canonical: it drives positions and data. */
@@ -455,6 +565,36 @@ export class CacheTetrisBoard {
   private aux: readonly Brick[] = []
   private titles = new Map<string, string>()
   private scroller: HTMLElement | undefined
+  /**
+   * The pan the reader asked for; `undefined` means "follow the live corner".
+   *
+   * Following is not the same as `{ back: 0, up: 0 }`: a running Turn taller than the
+   * board raises the live window (see `liveScroll`), and a board that is following has to
+   * keep doing so as that Turn grows. Only a pan that came from the reader is stored here,
+   * and landing back on the live corner clears it again.
+   */
+  private scroll: BoardScroll | undefined
+  /** Turn columns at the last paint, so a new Turn does not yank a panned window. */
+  private lastColumns = 0
+  /** The window of the last paint: what the rails describe and what a drag moves. */
+  private view: BoardWindow | undefined
+  /** The pointer drag in flight on a rail, if any. */
+  private drag: {
+    axis: 'x' | 'y'
+    pointerId: number
+    from: number
+    to: number
+    base: BoardScroll
+    /** The thumb's own travel along the track, in pixels. */
+    travel: number
+    /** The pan the thumb's whole travel stands for, in cells. */
+    furthest: number
+  } | undefined
+  /** A brick to focus once the next paint has placed it, for arrows that pan the window. */
+  private revealKey: string | undefined
+  /** Until this timestamp a hand-driven pan is in flight, so slabs must not animate. */
+  private panUntil = 0
+  private panTimer: number | undefined
   private frame: number | undefined
   private settle: number | undefined
   private trailing: number | undefined
@@ -501,6 +641,7 @@ export class CacheTetrisBoard {
         ? { accuracy: 'none', row: 'none', load: { status: 'no-loader' }, expanded: false }
         : await revealBrick(scroller, brick.target, {
           ...(this.options.load === undefined ? {} : { load: this.options.load }),
+          ...(this.options.resolve === undefined ? {} : { resolve: this.options.resolve }),
           isCurrent,
         })
       if (isCurrent() && outcome.accuracy === 'exact' && outcome.element !== undefined && scroller !== undefined) {
@@ -518,7 +659,7 @@ export class CacheTetrisBoard {
         if (isCurrent() && outcome.element.isConnected !== false) this.flash(outcome.element, outcome.row)
       }
     } catch (error) {
-      console.warn('[dsh-cache-badge] transcript navigation failed', error)
+      console.warn('[dsh-cache-bricks] transcript navigation failed', error)
       outcome = { accuracy: 'none', row: 'none', load: { status: 'timeout' }, expanded: false }
     }
     if (isCurrent()) this.options.onRevealed?.(brick, outcome)
@@ -530,10 +671,10 @@ export class CacheTetrisBoard {
     const element = row as HTMLElement
     if (typeof element.setAttribute !== 'function') return
     this.clearHighlight?.()
-    const old = element.getAttribute('data-cache-badge-landed')
-    element.setAttribute('data-cache-badge-landed', path)
+    const old = element.getAttribute('data-cache-bricks-landed')
+    element.setAttribute('data-cache-bricks-landed', path)
     const sheet = document.createElement('style')
-    sheet.textContent = `[data-cache-badge-landed] {
+    sheet.textContent = `[data-cache-bricks-landed] {
       background-color: rgba(56, 189, 248, .20) !important;
       background-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #38bdf8) 20%, transparent) !important;
       box-shadow: inset 3px 0 0 var(--dsw-alias-state-business-primary, #38bdf8) !important;
@@ -543,8 +684,8 @@ export class CacheTetrisBoard {
     let timer: ReturnType<typeof setTimeout>
     const clear = (): void => {
       clearTimeout(timer)
-      if (old === null) element.removeAttribute('data-cache-badge-landed')
-      else element.setAttribute('data-cache-badge-landed', old)
+      if (old === null) element.removeAttribute('data-cache-bricks-landed')
+      else element.setAttribute('data-cache-bricks-landed', old)
       sheet.remove()
       if (this.clearHighlight === clear) this.clearHighlight = undefined
     }
@@ -656,6 +797,8 @@ export class CacheTetrisBoard {
     if (this.frame !== undefined) cancelAnimationFrame(this.frame)
     if (this.settle !== undefined) cancelAnimationFrame(this.settle)
     if (this.trailing !== undefined) window.clearTimeout(this.trailing)
+    if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
+    this.drag = undefined
     this.cancelPendingClick()
     ++this.navigationGeneration
     this.clearHighlight?.()
@@ -667,6 +810,15 @@ export class CacheTetrisBoard {
     this.laneRule = undefined
     this.laneLabel = undefined
     this.notice = undefined
+    this.liveChip = undefined
+    this.hRail = undefined
+    this.hThumb = undefined
+    this.vRail = undefined
+    this.vThumb = undefined
+    this.fadeLeft = undefined
+    this.fadeRight = undefined
+    this.fadeTop = undefined
+    this.view = undefined
     this.cacheLayer = undefined
     this.typeLayer = undefined
     this.chip = undefined
@@ -734,7 +886,7 @@ export class CacheTetrisBoard {
       return { host: this.host, floor: this.floor }
     }
     const host = document.createElement('div')
-    host.dataset.cacheBadgeBoard = ''
+    host.dataset.cacheBricksBoard = ''
     Object.assign(host.style, {
       position: 'fixed',
       overflow: 'hidden',
@@ -756,11 +908,12 @@ export class CacheTetrisBoard {
     const rotator = document.createElement('div')
     Object.assign(rotator.style, {
       position: 'absolute',
-      // The card is the grid only: the control strip above it never turns over.
+      // The card is the grid only: the control strip above it and the horizontal rail
+      // below it never turn over.
       top: `${String(CHROME_H)}px`,
-      left: '0',
+      left: `${String(GRID_LEFT)}px`,
       right: '0',
-      bottom: '0',
+      bottom: `${String(RAIL)}px`,
       transformStyle: 'preserve-3d',
       transform: flipTransform(this.face),
       transition: prefersReducedMotion() ? 'none' : `transform ${String(FLIP_MS)}ms cubic-bezier(.4, .05, .25, 1)`,
@@ -775,16 +928,16 @@ export class CacheTetrisBoard {
     const floor = document.createElement('div')
     Object.assign(floor.style, {
       position: 'absolute',
-      left: '0',
+      left: `${String(GRID_LEFT)}px`,
       right: '0',
-      bottom: '0',
+      bottom: `${String(RAIL)}px`,
       height: '1px',
       background: 'rgba(148, 163, 184, 0.28)',
     } satisfies Partial<CSSStyleDeclaration>)
 
     const chip = document.createElement('button')
     chip.type = 'button'
-    chip.dataset.cacheBadgeFlip = ''
+    chip.dataset.cacheBricksFlip = ''
     Object.assign(chip.style, {
       position: 'absolute',
       // Centred in the strip the grid was fitted without, so it overlaps no brick.
@@ -814,7 +967,21 @@ export class CacheTetrisBoard {
       chip.style.opacity = this.face === 'type' ? '1' : '0.55'
     })
 
-    host.append(floor, rotator, chip)
+    const horizontal = this.createRail('x')
+    const vertical = this.createRail('y')
+    const fadeLeft = this.createFade('left')
+    const fadeRight = this.createFade('right')
+    const fadeTop = this.createFade('top')
+    host.append(
+      floor,
+      rotator,
+      fadeLeft,
+      fadeRight,
+      fadeTop,
+      horizontal.rail,
+      vertical.rail,
+      chip,
+    )
     document.body.append(host)
     this.host = host
     this.floor = floor
@@ -822,11 +989,160 @@ export class CacheTetrisBoard {
     this.cacheLayer = cacheLayer
     this.typeLayer = typeLayer
     this.chip = chip
+    this.hRail = horizontal.rail
+    this.hThumb = horizontal.thumb
+    this.vRail = vertical.rail
+    this.vThumb = vertical.thumb
+    this.fadeLeft = fadeLeft
+    this.fadeRight = fadeRight
+    this.fadeTop = fadeTop
     this.syncChip()
     // After the host is on the instance, or the notice would be built into nothing: the
     // strip already exists for the flip control, and the notice lives at its right end.
     this.syncNotice()
+    this.syncLiveChip()
     return { host, floor }
+  }
+
+  /**
+   * Build one scroll rail: a track, a thumb, and the gestures that move the window.
+   *
+   * The rail is a real `role="scrollbar"`: draggable by pointer, wheelable, and — when
+   * there is something to move to — reachable by Tab with the arrow keys, so the board's
+   * history is not pointer-only. It reports the pan in cells (`aria-valuenow` counts from
+   * the **content's** start, like a native scrollbar) and says how much is hidden in words.
+   *
+   * @param axis - which axis this rail moves.
+   * @returns the track and the thumb, both already wired.
+   */
+  private createRail(axis: 'x' | 'y'): { rail: HTMLDivElement; thumb: HTMLDivElement } {
+    const horizontal = axis === 'x'
+    const rail = document.createElement('div')
+    rail.dataset.cacheBricksRail = axis
+    rail.setAttribute('role', 'scrollbar')
+    rail.setAttribute('aria-orientation', horizontal ? 'horizontal' : 'vertical')
+    rail.setAttribute('aria-label', horizontal
+      ? '板面横向滑动：向左看更早的轮次，向右看更新的轮次'
+      : '板面纵向滑动：向上看更高的砖，向下回到地板')
+    // Not in the tab order while there is nothing to scroll; a control that cannot act
+    // should not be a stop.
+    rail.tabIndex = -1
+    Object.assign(rail.style, {
+      position: 'absolute',
+      zIndex: '3',
+      pointerEvents: 'none',
+      borderRadius: '2px',
+      background: 'rgba(148, 163, 184, 0.14)',
+      transition: 'opacity 160ms ease-out',
+      ...(horizontal
+        ? { left: `${String(GRID_LEFT)}px`, bottom: '1px', height: '4px' }
+        : { left: '1px', width: '4px' }),
+    } satisfies Partial<CSSStyleDeclaration>)
+    const thumb = document.createElement('div')
+    Object.assign(thumb.style, {
+      position: 'absolute',
+      borderRadius: '2px',
+      background: 'rgba(148, 163, 184, 0.5)',
+      transition: 'background 120ms ease-out',
+      ...(horizontal ? { top: '0', bottom: '0', left: '0', width: '0' } : { left: '0', right: '0', top: '0', height: '0' }),
+    } satisfies Partial<CSSStyleDeclaration>)
+    rail.append(thumb)
+
+    rail.addEventListener('pointerenter', () => {
+      thumb.style.background = 'rgba(203, 213, 225, 0.85)'
+    })
+    rail.addEventListener('pointerleave', () => {
+      if (this.drag === undefined) thumb.style.background = 'rgba(148, 163, 184, 0.5)'
+    })
+    rail.addEventListener('pointerdown', (event: PointerEvent) => {
+      this.beginRailDrag(axis, event)
+    })
+    rail.addEventListener('pointermove', (event: PointerEvent) => {
+      if (this.drag === undefined || this.drag.pointerId !== event.pointerId) return
+      this.drag.to = horizontal ? event.clientX : event.clientY
+      this.applyDrag()
+    })
+    const finish = (event: PointerEvent): void => {
+      if (this.drag === undefined || this.drag.pointerId !== event.pointerId) return
+      this.drag = undefined
+      if (rail.hasPointerCapture(event.pointerId)) rail.releasePointerCapture(event.pointerId)
+      rail.style.cursor = 'grab'
+      thumb.style.background = 'rgba(148, 163, 184, 0.5)'
+    }
+    rail.addEventListener('pointerup', finish)
+    rail.addEventListener('pointercancel', finish)
+    // Back to the live corner: the gesture a reader reaches for after reading history.
+    rail.addEventListener('dblclick', (event: MouseEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.setScroll(0, 0)
+    })
+    // The wheel only works over the rail: the host is pointer-transparent so the wheel
+    // keeps reaching the transcript everywhere else, and the bricks keep their clicks.
+    rail.addEventListener('wheel', (event: WheelEvent) => {
+      const view = this.view
+      const metrics = this.metrics
+      if (view === undefined || metrics === undefined) return
+      const primary = horizontal ? (event.deltaX === 0 ? event.deltaY : event.deltaX) : event.deltaY
+      if (primary === 0) return
+      const furthest = horizontal ? view.limitScroll.back : view.limitScroll.up
+      if (furthest <= 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      const pitch = horizontal ? pitchX(metrics) : pitchY(metrics)
+      // one to four cells per notch: a trackpad's small deltas stay precise, a mouse wheel
+      // still crosses a screenful of history in a few flicks.
+      const cells = Math.min(4, Math.max(1, Math.round(Math.abs(primary) / pitch)))
+      const step = primary > 0 ? -cells : cells
+      this.setScroll(
+        horizontal ? view.scroll.back + step : view.scroll.back,
+        horizontal ? view.scroll.up : view.scroll.up + step,
+      )
+    }, { passive: false })
+    rail.addEventListener('keydown', (event: KeyboardEvent) => {
+      const view = this.view
+      const metrics = this.metrics
+      if (view === undefined || metrics === undefined) return
+      const furthest = horizontal ? view.limitScroll.back : view.limitScroll.up
+      const page = horizontal ? metrics.columns : Math.max(1, view.limit - 1)
+      const towards = (cells: number): void => {
+        this.setScroll(
+          horizontal ? view.scroll.back + cells : view.scroll.back,
+          horizontal ? view.scroll.up : view.scroll.up + cells,
+        )
+      }
+      // Positive cells move towards the older end on both axes, so the arrow keys read the
+      // way the board does: left/up is further back into history.
+      if (horizontal && event.key === 'ArrowLeft') towards(1)
+      else if (horizontal && event.key === 'ArrowRight') towards(-1)
+      else if (!horizontal && event.key === 'ArrowUp') towards(1)
+      else if (!horizontal && event.key === 'ArrowDown') towards(-1)
+      else if (event.key === 'PageUp') towards(horizontal ? -page : page)
+      else if (event.key === 'PageDown') towards(horizontal ? page : -page)
+      else if (event.key === 'Home') towards(furthest)
+      else if (event.key === 'End') towards(-furthest)
+      else return
+      event.preventDefault()
+      event.stopPropagation()
+    })
+    return { rail, thumb }
+  }
+
+  /** One edge fade, so a hidden direction is visible without moving the window. */
+  private createFade(edge: 'left' | 'right' | 'top'): HTMLDivElement {
+    const fade = document.createElement('div')
+    fade.dataset.cacheBricksFade = edge
+    const towards = edge === 'left' ? 'to right' : edge === 'right' ? 'to left' : 'to bottom'
+    Object.assign(fade.style, {
+      position: 'absolute',
+      zIndex: '1',
+      display: 'none',
+      pointerEvents: 'none',
+      background: `linear-gradient(${towards}, `
+        + 'color-mix(in srgb, var(--dsw-alias-bg-base, #0f172a) 88%, transparent), transparent)',
+      ...(edge === 'top' ? { height: `${String(FADE)}px` } : { width: `${String(FADE)}px` }),
+    } satisfies Partial<CSSStyleDeclaration>)
+    return fade
   }
 
   /**
@@ -866,7 +1182,7 @@ export class CacheTetrisBoard {
     layer.replaceChildren()
     this.slabs.type.clear()
     for (const [key, source] of this.slabs.cache) {
-      const entry = this.createSlab(source.brick, metrics, 'type', source.right, source.bottom, false)
+      const entry = this.createSlab(source.brick, metrics, 'type', source.right, source.bottom, false, !this.isPanning())
       layer.append(entry.element)
       this.slabs.type.set(key, entry)
     }
@@ -938,9 +1254,9 @@ export class CacheTetrisBoard {
     const composerHeight = composerHeightOf(scroller)
     const floor = scrollerRect.bottom - composerHeight - BOARD_INSET
     const gutterHeight = floor - (scrollerRect.top + BOARD_INSET)
-    // The control strip comes out of the band before the grid is fitted, so the grid
-    // is laid out below it and no brick can ever end up under the flip control.
-    const metrics = fitBoard(gutterWidth, gutterHeight - CHROME_H)
+    // The control strip and the two rails come out of the band before the grid is fitted,
+    // so the grid is laid out between them and no brick can ever end up under a control.
+    const metrics = fitBoard(gutterWidth - RAIL, gutterHeight - CHROME_H - RAIL)
     if (metrics === undefined) {
       this.hide()
       return
@@ -951,82 +1267,163 @@ export class CacheTetrisBoard {
     const boardHeight = metrics.rows * pitchY(metrics) - metrics.gap
     const { host } = this.ensureHost()
     host.style.display = 'block'
-    host.style.left = `${String(Math.round(gutterLeft + Math.max(0, gutterWidth - boardWidth)))}px`
-    host.style.width = `${String(boardWidth)}px`
-    host.style.height = `${String(boardHeight + CHROME_H)}px`
-    host.style.top = `${String(Math.round(floor - boardHeight - CHROME_H))}px`
+    host.style.left = `${String(Math.round(gutterLeft + Math.max(0, gutterWidth - boardWidth - RAIL)))}px`
+    host.style.width = `${String(boardWidth + RAIL)}px`
+    host.style.height = `${String(boardHeight + CHROME_H + RAIL)}px`
+    host.style.top = `${String(Math.round(floor - boardHeight - CHROME_H - RAIL))}px`
     this.syncBricks(metrics)
   }
 
   /**
-   * The brick an arrow key should move focus to.
+   * The brick an arrow key asks for, in the board's own geometry.
    *
-   * The board is a grid — a column per Turn, a row per step — so the arrows move
-   * the way the grid reads: left and right between Turns at the same step, up and
-   * down between steps of the same Turn.
+   * The board is a grid — a column per Turn, a row per step — and a column stacks
+   * **upward**: the Turn's first step rests on the floor and every later step lands on top
+   * of it. So ArrowUp means a *later* step and ArrowDown an earlier one, which is the
+   * direction the brick travels on screen rather than the direction the step number does.
    *
    * @param from - the brick focus is on.
    * @param key - the key that was pressed.
-   * @returns the key of the brick to focus, if there is one.
+   * @returns the Turn and step asked for, or undefined for any other key.
    */
-  private neighbour(from: Brick, key: string): string | undefined {
-    const wantTurn = key === 'ArrowLeft' ? from.turn - 1 : key === 'ArrowRight' ? from.turn + 1 : from.turn
-    const wantStep = key === 'ArrowUp' ? from.step - 1 : key === 'ArrowDown' ? from.step + 1 : from.step
-    if (key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'ArrowUp' && key !== 'ArrowDown') return undefined
-    for (const [candidate, live] of this.slabs[this.face]) {
-      if (live.turn === wantTurn && live.step === wantStep && candidate !== from.key) return candidate
+  private neighbourOf(from: Brick, key: string): { turn: number; step: number } | undefined {
+    switch (key) {
+      case 'ArrowLeft': return { turn: from.turn - 1, step: from.step }
+      case 'ArrowRight': return { turn: from.turn + 1, step: from.step }
+      case 'ArrowUp': return { turn: from.turn, step: from.step + 1 }
+      case 'ArrowDown': return { turn: from.turn, step: from.step - 1 }
+      default: return undefined
     }
-    return undefined
   }
 
-  /** Reconcile brick elements with the visible columns, animating the changes. */
+  /**
+   * Move focus one cell, panning the window when the cell is off screen.
+   *
+   * Arrows used to stop at the edge of what happened to be drawn, which is exactly the
+   * wall the rails remove: the window follows the keyboard now, so the whole board is
+   * walkable from the keyboard alone.
+   *
+   * @param from - the brick focus is on.
+   * @param key - the key that was pressed.
+   * @returns true when the key was one of the four arrows.
+   */
+  private focusNeighbour(from: Brick, key: string): boolean {
+    const want = this.neighbourOf(from, key)
+    if (want === undefined) return false
+    for (const [candidate, live] of this.slabs[this.face]) {
+      if (live.turn === want.turn && live.step === want.step && candidate !== from.key) {
+        live.element.focus()
+        return true
+      }
+    }
+    this.panTo(want.turn, want.step)
+    return true
+  }
+
+  /**
+   * Pan the smallest amount that brings one brick inside the window, and focus it there.
+   *
+   * "Smallest amount" is literal: a brick one cell past the right edge comes in at the
+   * right edge, one cell past the top comes in at the top, and a brick already inside
+   * leaves the window where it is. The focus lands on the frame after the pan, once the
+   * slab exists.
+   *
+   * @param turn - the brick's Turn.
+   * @param step - the brick's step.
+   * @returns true when such a brick exists on the board.
+   */
+  private panTo(turn: number, step: number): boolean {
+    const metrics = this.metrics
+    const view = this.view
+    if (metrics === undefined || view === undefined) return false
+    const index = this.columns.findIndex((column) => column.turn === turn)
+    if (index < 0) return false
+    const column = this.columns[index]!
+    const row = column.bricks.findIndex((brick) => brick.step === step)
+    if (row < 0) return false
+    const distance = this.columns.length - 1 - index
+    const at = distance + view.lead - view.scroll.back
+    const visible = row - view.scroll.up
+    const back = at < 0
+      ? distance + view.lead
+      : at > metrics.columns - 1
+        ? distance + view.lead - (metrics.columns - 1)
+        : view.scroll.back
+    const up = visible < 0
+      ? row
+      : visible > view.limit - 1
+        ? row - (view.limit - 1)
+        : view.scroll.up
+    const target = clampScroll({ back, up }, view.limitScroll)
+    this.revealKey = column.bricks[row]!.key
+    this.setScroll(target.back, target.up)
+    return true
+  }
+
+  /** Reconcile brick elements with the window, animating the changes. */
   private syncBricks(metrics: BoardMetrics): void {
     const { host } = this.ensureHost()
     this.metrics = metrics
-    const { columns, lead } = visibleColumns(this.columns, metrics.columns)
-    // The auxiliary lane takes the board's top row when there is anything in it, and the
-    // Turn columns stop below it. Without that, an auxiliary brick would have to be pushed
-    // into a Turn's column — a relationship it does not have.
-    const lane = auxLaneRow(metrics, this.aux.length > 0)
-    const limit = columnRowLimit(metrics, lane !== undefined)
+    // New Turns arrived while the reader was in history: hold the same columns on screen
+    // instead of sliding the window out from under them. A following board (no pan of its
+    // own) wants exactly the opposite — the stack shifts left and the new Turn drops in.
+    if (this.scroll !== undefined && this.scroll.back > 0 && this.columns.length > this.lastColumns) {
+      this.scroll = { back: this.scroll.back + (this.columns.length - this.lastColumns), up: this.scroll.up }
+    }
+    this.lastColumns = this.columns.length
+    const view = boardWindow(this.columns, metrics, this.scroll, this.aux.length > 0)
+    this.view = view
+    // Landing back on the live corner resumes following, so the next brick arrives in view.
+    if (this.scroll !== undefined && view.scroll.back === 0
+      && view.scroll.up === liveScroll(this.columns, view.limit).up) this.scroll = undefined
+    // A pan is a hand-driven move of the whole window: the bricks must not animate their
+    // own slide while it happens, or the board would lag a drag by the drop animation.
+    const smooth = !this.isPanning()
+    const lane = view.lane
     const seen = new Set<string>()
-    const newestIndex = columns.length - 1
+    const newestIndex = this.columns.length - 1
     // The cache side is canonical and always kept current; the type side is only
     // kept current while it is the one showing.
     const faces = this.face === 'type' && this.typeLayer !== undefined ? FACES : (['cache'] as const)
-    for (let index = 0; index < columns.length; index += 1) {
-      const column = columns[index]!
-      const columnFromNewest = newestIndex - index + lead
+    for (let index = 0; index < this.columns.length; index += 1) {
+      const column = this.columns[index]!
       for (let row = 0; row < column.bricks.length; row += 1) {
+        // A brick outside the window is not drawn at all: the board is a window, and a
+        // brick the pan moved out is neither visible nor focusable nor announced.
+        const cell = windowCell(newestIndex - index, row, view.lead, view.scroll, metrics.columns, view.limit)
+        if (cell === undefined) continue
         const brick = column.bricks[row]!
-        // A column taller than the board keeps its lowest bricks; the overflow
-        // leaves the frame exactly like a stack that outgrew the well.
-        if (row >= limit) break
         const key = brick.key
         seen.add(key)
-        const { right, bottom } = cellPlacement(metrics, columnFromNewest, row)
+        const { right, bottom } = cellPlacement(metrics, cell.column, cell.row)
         for (const face of faces) {
           const layer = this.layerOf(face)
           const existing = layer.get(key)
           if (existing === undefined) {
             // A brick only falls on the side the user is looking at; the hidden
             // copy is built at rest, ready for the next turn of the card.
-            const entry = this.createSlab(brick, metrics, face, right, bottom, face === this.face)
+            const entry = this.createSlab(brick, metrics, face, right, bottom, face === this.face && smooth, smooth)
             layer.set(key, entry)
             this.layerElement(face).append(entry.element)
             continue
           }
           this.updateSlab(existing, brick, metrics)
-          if (existing.right === right && existing.bottom === bottom) continue
-          existing.right = right
-          existing.bottom = bottom
-          existing.element.style.right = `${String(right)}px`
-          existing.element.style.bottom = `${String(bottom)}px`
+          this.syncTransition(existing, smooth)
+          if (existing.right !== right) {
+            existing.right = right
+            existing.element.style.right = `${String(right)}px`
+          }
+          if (existing.bottom !== bottom) {
+            existing.bottom = bottom
+            existing.element.style.bottom = `${String(bottom)}px`
+          }
         }
       }
     }
     // The lane: real requests that belong to no Turn, right-aligned like everything else and
-    // capped by the board's width. Nothing is stacked — there is no step order to preserve.
+    // capped by the board's width. Nothing is stacked — there is no step order to preserve —
+    // and the lane is chrome at the window's top row, so panning moves Turns past it rather
+    // than moving it: it belongs to no Turn and therefore to no place on the time axis.
     if (lane !== undefined) {
       const laneBricks = this.aux.slice(-metrics.columns)
       for (let index = 0; index < laneBricks.length; index += 1) {
@@ -1038,12 +1435,13 @@ export class CacheTetrisBoard {
           const layer = this.layerOf(face)
           const existing = layer.get(key)
           if (existing === undefined) {
-            const entry = this.createSlab(brick, metrics, face, right, bottom, false)
+            const entry = this.createSlab(brick, metrics, face, right, bottom, false, smooth)
             layer.set(key, entry)
             this.layerElement(face).append(entry.element)
             continue
           }
           this.updateSlab(existing, brick, metrics)
+          this.syncTransition(existing, smooth)
           if (existing.right === right && existing.bottom === bottom) continue
           existing.right = right
           existing.bottom = bottom
@@ -1061,10 +1459,271 @@ export class CacheTetrisBoard {
       }
     }
     this.syncLaneChrome(metrics, lane)
-    this.syncGhost(host, metrics, columns, limit, lead)
+    this.syncGhost(host, metrics, view)
+    this.syncRails(metrics, view)
+    this.syncFades(metrics, view)
+    this.syncLiveChip(view, metrics.columns * pitchX(metrics) - metrics.gap)
     this.applyInteractivity()
     this.applyTitles()
     this.scheduleSettle()
+    // An arrow key at the window's edge pans to the brick it asked for and then focuses it.
+    const reveal = this.revealKey
+    if (reveal !== undefined) {
+      this.revealKey = undefined
+      this.slabs[this.face].get(reveal)?.element.focus()
+    }
+  }
+
+  /** Move the window, clamped to what the content allows right now. */
+  private setScroll(back: number, up: number): void {
+    const view = this.view
+    if (view === undefined) return
+    const requested = clampScroll({ back, up }, view.limitScroll)
+    const live = liveScroll(this.columns, view.limit)
+    // Landing on the live corner resumes following, so the board keeps up with the session.
+    this.scroll = requested.back === 0 && requested.up === live.up ? undefined : requested
+    this.markPan()
+    this.schedule(true)
+  }
+
+  /**
+   * Note that a hand-driven pan is in flight.
+   *
+   * While it is, slabs drop their transition: a pan moves every brick at once, and the
+   * 420 ms drop animation would turn a drag into a rubber band. The timer restores the
+   * animation afterwards, so the next real drop still falls.
+   */
+  private markPan(): void {
+    this.panUntil = performance.now() + PAN_QUIET_MS
+    if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
+    this.panTimer = window.setTimeout(() => {
+      this.panTimer = undefined
+      this.schedule(true)
+    }, PAN_QUIET_MS + 40)
+  }
+
+  /** True while a hand-driven pan is still settling. */
+  private isPanning(): boolean {
+    return performance.now() < this.panUntil
+  }
+
+  /** Keep a slab's animation in step with whether the window is being panned by hand. */
+  private syncTransition(entry: SlabEntry, smooth: boolean): void {
+    const wanted = smooth ? SLAB_TRANSITION : 'none'
+    if (entry.element.style.transition !== wanted) entry.element.style.transition = wanted
+  }
+
+  /**
+   * Start a drag on a rail.
+   *
+   * A press **on the thumb** keeps the current pan and follows the pointer; a press on the
+   * track pages the window so the thumb centres under the pointer and then keeps dragging —
+   * the two gestures a native scrollbar has, and the reason the track is thick enough to
+   * hit (4 CSS pixels).
+   *
+   * @param axis - which rail was pressed.
+   * @param event - the pointer event.
+   */
+  private beginRailDrag(axis: 'x' | 'y', event: PointerEvent): void {
+    const view = this.view
+    const metrics = this.metrics
+    if (view === undefined || metrics === undefined) return
+    const horizontal = axis === 'x'
+    const furthest = horizontal ? view.limitScroll.back : view.limitScroll.up
+    if (furthest <= 0) return
+    const rail = horizontal ? this.hRail : this.vRail
+    const thumb = horizontal ? this.hThumb : this.vThumb
+    if (rail === undefined || thumb === undefined) return
+    event.preventDefault()
+    event.stopPropagation()
+    const rect = rail.getBoundingClientRect()
+    const thumbRect = thumb.getBoundingClientRect()
+    const track = horizontal ? rect.width : rect.height
+    const length = horizontal ? thumbRect.width : thumbRect.height
+    const pointer = horizontal ? event.clientX - rect.left : event.clientY - rect.top
+    const onThumb = event.target === thumb
+    const paged = onThumb ? undefined : this.railOffset(pointer, track, length, furthest)
+    const base: BoardScroll = {
+      back: horizontal && paged !== undefined ? paged : view.scroll.back,
+      up: !horizontal && paged !== undefined ? paged : view.scroll.up,
+    }
+    rail.setPointerCapture(event.pointerId)
+    rail.style.cursor = 'grabbing'
+    thumb.style.background = 'rgba(203, 213, 225, 0.9)'
+    this.drag = {
+      axis,
+      pointerId: event.pointerId,
+      from: horizontal ? event.clientX : event.clientY,
+      to: horizontal ? event.clientX : event.clientY,
+      base,
+      travel: Math.max(1, track - length),
+      furthest,
+    }
+    if (paged !== undefined) this.setScroll(base.back, base.up)
+  }
+
+  /** The pan an offset along the track stands for, with the thumb centred on the pointer. */
+  private railOffset(pointer: number, track: number, thumb: number, furthest: number): number {
+    const travel = Math.max(1, track - thumb)
+    const fraction = Math.min(1, Math.max(0, (pointer - thumb / 2) / travel))
+    // The thumb's far end is the live corner, so a pointer at the end is pan 0.
+    return Math.round((1 - fraction) * furthest)
+  }
+
+  /** Apply the drag in flight: whole cells, so the grid never lands between bricks. */
+  private applyDrag(): void {
+    const drag = this.drag
+    if (drag === undefined) return
+    const horizontal = drag.axis === 'x'
+    // The thumb follows the pointer **in track space**, not in brick pitches: dragging the
+    // thumb to the end of its travel has to reach the end of the content, or the last Turns
+    // would be unreachable by drag. Whole cells, so the grid never lands between bricks.
+    const moved = ((drag.to - drag.from) / drag.travel) * drag.furthest
+    const cells = Math.round(moved)
+    // Dragging right/down moves towards the live corner, which is a smaller pan on both axes.
+    this.setScroll(
+      horizontal ? drag.base.back - cells : drag.base.back,
+      horizontal ? drag.base.up : drag.base.up - cells,
+    )
+  }
+
+  /**
+   * Keep both rails telling the truth about the window.
+   *
+   * One rail per axis, both anchored at the live corner: at pan 0 the thumb sits at the
+   * track's far end (right, bottom) — where the newest brick is — and travels towards the
+   * content's start as the reader goes back. A rail with nothing to scroll is still drawn,
+   * dimmed and inert, so the board's shape does not change when history outgrows it.
+   *
+   * @param metrics - the window's brick geometry.
+   * @param view - the window this paint is showing.
+   */
+  private syncRails(metrics: BoardMetrics, view: BoardWindow): void {
+    const gridWidth = metrics.columns * pitchX(metrics) - metrics.gap
+    // The vertical rail spans the column pane only: with the lane shown, the pane starts
+    // one row down, and a thumb measured against the whole grid would lie by one row.
+    const paneHeight = view.limit * pitchY(metrics) - metrics.gap
+    const paneTop = CHROME_H + (metrics.rows - view.limit) * pitchY(metrics)
+    // The content is every Turn plus the lead cell — the drop slot a finished Turn leaves
+    // free is part of the board and pans with it.
+    const h = railGeometry(gridWidth, metrics.columns, this.columns.length + view.lead, view.scroll.back)
+    const v = railGeometry(paneHeight, view.limit, view.tallest, view.scroll.up)
+    this.applyRail('x', h, view.limitScroll.back, view.limitScroll.back - view.scroll.back, view.newer > 0 || view.older > 0
+      ? `已回看 ${String(view.newer)} 轮，左侧还有 ${String(view.older)} 轮`
+      : '已显示全部轮次')
+    this.applyRail('y', v, view.limitScroll.up, view.limitScroll.up - view.scroll.up, view.limitScroll.up > 0
+      ? `下方还有 ${String(view.scroll.up)} 行未显示，上方还有 ${String(view.limitScroll.up - view.scroll.up)} 行`
+      : '已显示全部行')
+    const hRail = this.hRail
+    if (hRail !== undefined) hRail.style.width = `${String(gridWidth)}px`
+    const vRail = this.vRail
+    if (vRail !== undefined) {
+      vRail.style.top = `${String(Math.round(paneTop))}px`
+      vRail.style.height = `${String(paneHeight)}px`
+    }
+  }
+
+  /** Place one rail's thumb and publish its accessible state. */
+  private applyRail(
+    axis: 'x' | 'y',
+    geometry: RailGeometry,
+    furthest: number,
+    at: number,
+    text: string,
+  ): void {
+    const horizontal = axis === 'x'
+    const rail = horizontal ? this.hRail : this.vRail
+    const thumb = horizontal ? this.hThumb : this.vThumb
+    if (rail === undefined || thumb === undefined) return
+    if (horizontal) thumb.style.width = `${String(geometry.thumb)}px`
+    else thumb.style.height = `${String(geometry.thumb)}px`
+    if (horizontal) thumb.style.left = `${String(geometry.offset)}px`
+    else thumb.style.top = `${String(geometry.offset)}px`
+    rail.style.pointerEvents = geometry.scrollable ? 'auto' : 'none'
+    rail.style.cursor = geometry.scrollable ? 'grab' : 'default'
+    rail.style.opacity = geometry.scrollable ? '1' : '0.5'
+    // A rail that cannot move is not a tab stop, and says so to assistive technology.
+    if (rail.tabIndex !== (geometry.scrollable ? 0 : -1)) rail.tabIndex = geometry.scrollable ? 0 : -1
+    rail.setAttribute('aria-disabled', geometry.scrollable ? 'false' : 'true')
+    rail.setAttribute('aria-valuemin', '0')
+    rail.setAttribute('aria-valuemax', String(furthest))
+    rail.setAttribute('aria-valuenow', String(Math.min(Math.max(0, at), furthest)))
+    rail.setAttribute('aria-valuetext', text)
+  }
+
+  /**
+   * Show an edge fade in every direction the window has hidden content.
+   *
+   * The rails say how much; the fades say **where**, at a glance, without moving anything:
+   * older Turns to the left, newer ones to the right, higher rows above.
+   */
+  private syncFades(metrics: BoardMetrics, view: BoardWindow): void {
+    const gridWidth = metrics.columns * pitchX(metrics) - metrics.gap
+    const paneHeight = view.limit * pitchY(metrics) - metrics.gap
+    const paneTop = CHROME_H + (metrics.rows - view.limit) * pitchY(metrics)
+    const show = (fade: HTMLDivElement | undefined, visible: boolean, style: Partial<CSSStyleDeclaration>): void => {
+      if (fade === undefined) return
+      fade.style.display = visible ? 'block' : 'none'
+      if (!visible) return
+      Object.assign(fade.style, style)
+    }
+    show(this.fadeLeft, view.older > 0, { left: `${String(GRID_LEFT)}px`, width: `${String(FADE)}px`, top: `${String(Math.round(paneTop))}px`, height: `${String(paneHeight)}px` })
+    show(this.fadeRight, view.newer > 0, { left: `${String(GRID_LEFT + gridWidth - FADE)}px`, width: `${String(FADE)}px`, top: `${String(Math.round(paneTop))}px`, height: `${String(paneHeight)}px` })
+    show(this.fadeTop, view.limitScroll.up > view.scroll.up, { left: `${String(GRID_LEFT)}px`, width: `${String(gridWidth)}px`, top: `${String(Math.round(paneTop))}px`, height: `${String(FADE)}px` })
+  }
+
+  /**
+   * Show the way back while the board is showing history.
+   *
+   * A panned board is the one state that can be misread: old Turns look exactly like the
+   * current ones. So the strip grows a control that names the state and undoes it in one
+   * click — and it is absent, not merely dimmed, while the board is live.
+   */
+  private syncLiveChip(view?: BoardWindow, gridWidth = 0): void {
+    const host = this.host
+    if (host === undefined) return
+    if (this.liveChip === undefined) {
+      const chip = document.createElement('button')
+      chip.type = 'button'
+      chip.dataset.cacheBricksLive = ''
+      Object.assign(chip.style, {
+        position: 'absolute',
+        top: '1px',
+        left: '30px',
+        zIndex: '2',
+        display: 'none',
+        height: '13px',
+        padding: '0 4px',
+        pointerEvents: 'auto',
+        cursor: 'pointer',
+        borderRadius: '4px',
+        border: '1px solid rgba(251, 191, 36, 0.5)',
+        background: 'rgba(15, 23, 42, 0.82)',
+        color: 'rgba(251, 191, 36, 0.95)',
+        font: '700 9px/1 ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif',
+        letterSpacing: '0.02em',
+      } satisfies Partial<CSSStyleDeclaration>)
+      chip.addEventListener('click', (event: MouseEvent) => {
+        event.stopPropagation()
+        this.setScroll(0, 0)
+      })
+      host.append(chip)
+      this.liveChip = chip
+    }
+    const chip = this.liveChip
+    // "Following" is the honest test, not the offsets: a board that follows a Turn taller
+    // than the window is at `up > 0` and is still live.
+    const panned = this.scroll !== undefined
+    chip.style.display = panned ? 'block' : 'none'
+    if (!panned || view === undefined) return
+    const label = gridWidth < 140 ? '⤓' : '⤓ 最新'
+    if (chip.textContent !== label) chip.textContent = label
+    const hidden = [
+      view.newer > 0 ? `右侧 ${String(view.newer)} 轮` : undefined,
+      view.limitScroll.up > view.scroll.up ? `上方 ${String(view.limitScroll.up - view.scroll.up)} 行` : undefined,
+    ].filter((part): part is string => part !== undefined).join('、')
+    chip.title = hidden === '' ? '回到最新：右侧已无更新的轮次' : `回看中：${hidden} 未显示 · 点击回到最新`
+    chip.setAttribute('aria-label', hidden === '' ? '回到最新' : `回看中，${hidden}未显示；回到最新`)
   }
 
   /**
@@ -1086,10 +1745,10 @@ export class CacheTetrisBoard {
     }
     if (this.laneRule === undefined) {
       const rule = document.createElement('div')
-      rule.dataset.cacheBadgeLane = 'rule'
+      rule.dataset.cacheBricksLane = 'rule'
       Object.assign(rule.style, {
         position: 'absolute',
-        left: '0',
+        left: `${String(GRID_LEFT)}px`,
         right: '0',
         zIndex: '1',
         borderTop: '1px dashed rgba(148, 163, 184, 0.35)',
@@ -1100,11 +1759,11 @@ export class CacheTetrisBoard {
     }
     if (this.laneLabel === undefined) {
       const label = document.createElement('div')
-      label.dataset.cacheBadgeLane = 'label'
+      label.dataset.cacheBricksLane = 'label'
       label.textContent = 'SYS'
       Object.assign(label.style, {
         position: 'absolute',
-        left: '2px',
+        left: `${String(GRID_LEFT + 2)}px`,
         zIndex: '2',
         pointerEvents: 'none',
         font: '700 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -1128,7 +1787,7 @@ export class CacheTetrisBoard {
     if (host === undefined) return
     if (this.notice === undefined) {
       const notice = document.createElement('div')
-      notice.dataset.cacheBadgeNotice = ''
+      notice.dataset.cacheBricksNotice = ''
       Object.assign(notice.style, {
         position: 'absolute',
         top: '2px',
@@ -1160,6 +1819,8 @@ export class CacheTetrisBoard {
    * @param right - distance from the board's right edge.
    * @param bottom - distance from the board's floor.
    * @param falling - true when it should drop in from above the well.
+   * @param smooth - true when the slab should animate its own moves; false during a pan, when
+   *   every brick moves at once and the drop animation would read as lag.
    * @returns the live entry, already wired to its gestures.
    */
   private createSlab(
@@ -1169,11 +1830,12 @@ export class CacheTetrisBoard {
     right: number,
     bottom: number,
     falling: boolean,
+    smooth: boolean,
   ): SlabEntry {
     const element = document.createElement('div')
-    element.dataset.cacheBadgeBrick = brick.key
-    element.dataset.cacheBadgeFace = face
-    element.dataset.cacheBadgeKind = brick.kind
+    element.dataset.cacheBricksBrick = brick.key
+    element.dataset.cacheBricksFace = face
+    element.dataset.cacheBricksKind = brick.kind
     Object.assign(element.style, {
       position: 'absolute',
       boxSizing: 'border-box',
@@ -1187,7 +1849,7 @@ export class CacheTetrisBoard {
       pointerEvents: 'auto',
       cursor: 'pointer',
       // Gravity on the way down, a shorter slide when the stack shifts left.
-      transition: 'bottom 420ms cubic-bezier(.45,.02,.95,.55), right 260ms ease-out',
+      transition: smooth ? SLAB_TRANSITION : 'none',
     } satisfies Partial<CSSStyleDeclaration>)
     paintSlab(element, brick, face, metrics, false)
     element.style.right = `${String(right)}px`
@@ -1206,6 +1868,12 @@ export class CacheTetrisBoard {
       falling,
       hovered: false,
       lit: false,
+    }
+    // A brick that was open before the pan moved it out and back keeps its mark: the slab is
+    // new, the record it stands for is not.
+    if (this.selectedKey === brick.key) {
+      entry.filter = element.style.filter
+      element.style.filter = SELECTED_FILTER
     }
     this.bindSlab(entry)
     return entry
@@ -1228,7 +1896,7 @@ export class CacheTetrisBoard {
     const key = paintKeyOf(brick)
     if (entry.paintKey === key) return
     entry.paintKey = key
-    entry.element.dataset.cacheBadgeKind = brick.kind
+    entry.element.dataset.cacheBricksKind = brick.kind
     paintSlab(entry.element, brick, entry.face, metrics, entry.lit)
   }
 
@@ -1289,11 +1957,7 @@ export class CacheTetrisBoard {
         this.toggleFace()
         return
       }
-      const target = this.neighbour(entry.brick, event.key)
-      if (target !== undefined) {
-        event.preventDefault()
-        this.slabs[this.face].get(target)?.element.focus()
-      }
+      if (this.focusNeighbour(entry.brick, event.key)) event.preventDefault()
     })
     // Focus is shown by brightening the slab — never by a ring, which on a 36x15
     // brick is the loudest thing on the board and is drawn by the browser the
@@ -1322,23 +1986,28 @@ export class CacheTetrisBoard {
    * Outline the slot the next brick will fall into, while the newest Turn is
    * still running. It is the one bit of chrome that tells a viewer the pile is
    * live rather than a finished chart.
+   *
+   * The slot belongs to the **live** corner: a panned window is a reading of the past,
+   * and a dashed "the next brick lands here" cell drawn inside it would be a lie about
+   * where the session is.
+   *
+   * @param host - the board's own element.
+   * @param metrics - board geometry.
+   * @param view - the window this paint is showing.
    */
-  private syncGhost(
-    host: HTMLDivElement,
-    metrics: BoardMetrics,
-    columns: readonly BoardColumn[],
-    limit: number,
-    lead: number,
-  ): void {
-    const newest = columns[columns.length - 1]
-    const running = this.face === 'cache' && newest !== undefined && !newest.ended && newest.bricks.length < limit
-    if (!running) {
+  private syncGhost(host: HTMLDivElement, metrics: BoardMetrics, view: BoardWindow): void {
+    const newest = this.columns[this.columns.length - 1]
+    const running = this.scroll === undefined && this.face === 'cache' && newest !== undefined && !newest.ended
+    const cell = running
+      ? windowCell(0, newest.bricks.length, view.lead, view.scroll, metrics.columns, view.limit)
+      : undefined
+    if (cell === undefined) {
       if (this.ghost !== undefined) this.ghost.style.display = 'none'
       return
     }
     if (this.ghost === undefined) {
       const ghost = document.createElement('div')
-      ghost.dataset.cacheBadgeGhost = ''
+      ghost.dataset.cacheBricksGhost = ''
       Object.assign(ghost.style, {
         position: 'absolute',
         boxSizing: 'border-box',
@@ -1351,7 +2020,7 @@ export class CacheTetrisBoard {
       host.append(ghost)
       this.ghost = ghost
     }
-    const { right, bottom } = cellPlacement(metrics, lead, newest.bricks.length)
+    const { right, bottom } = cellPlacement(metrics, cell.column, cell.row)
     this.ghost.style.display = 'block'
     this.ghost.style.right = `${String(right)}px`
     this.ghost.style.bottom = `${String(bottom)}px`
@@ -1370,8 +2039,15 @@ export class CacheTetrisBoard {
         const title = this.titles.get(key)
         if (title === undefined) entry.element.removeAttribute('title')
         else entry.element.setAttribute('title', title)
-        const estimate = entry.brick.estimated === true ? 'estimated step (no host collector running)' : undefined
-      entry.element.setAttribute('aria-label', brickAriaLabel(entry.brick, estimate ?? title))
+        // Three provenances, three sentences: the reader is owed the difference between a
+        // captured request, a log-reconstructed one, and a per-step reading.
+        const origin = provenanceOf(entry.brick)
+        const estimate = origin === 'fold'
+          ? 'estimated step (folded on the client; this collector process has no attempt for it)'
+          : origin === 'replay'
+            ? 'reconstructed from the session log (one brick per settled attempt; no request capture)'
+            : undefined
+        entry.element.setAttribute('aria-label', brickAriaLabel(entry.brick, estimate ?? title))
       }
     }
   }

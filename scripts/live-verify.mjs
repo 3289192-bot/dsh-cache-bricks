@@ -1,5 +1,5 @@
 /**
- * Post-restart live verification for the cache-badge collector.
+ * Post-restart live verification for the cache-bricks collector.
  *
  * Runs against a *running* instance over its own HTTP surface and checks the
  * things only real traffic can prove: that the host half loaded, that it captured
@@ -10,9 +10,10 @@
  *
  * Usage:
  *   node scripts/live-verify.mjs                 # newest log for the token, port 18090
- *   node scripts/live-verify.mjs --port 18083 --home <DSH_HOME_DAILY>
+ *   node scripts/live-verify.mjs --port 18083 --home /path/to/dsh-home
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const args = process.argv.slice(2)
@@ -21,7 +22,7 @@ const option = (name, fallback) => {
   return index === -1 ? fallback : args[index + 1]
 }
 
-const home = option('home', join(process.env.USERPROFILE ?? process.env.HOME ?? process.cwd(), '.dsh-017'))
+const home = option('home', join(homedir(), '.dsh-017'))
 const port = Number(option('port', '18090'))
 const base = `http://127.0.0.1:${String(port)}`
 
@@ -91,14 +92,14 @@ console.log(`instance: ${base}  (home ${home})`)
 // loopback + same-origin, so a local script needs no cookie.
 console.log('\ncollector')
 await authenticate()
-const sessions = await get('/cache-badge/sessions')
+const sessions = await get('/cache-bricks/sessions')
 check('plugin route answers 200', sessions.status === 200, `HTTP ${String(sessions.status)}`)
 if (sessions.status !== 200) {
   const log = newestLog()
   console.log(`\nroute not live. Newest log: ${log ?? '(none)'}`)
   if (log !== undefined) {
-    const lines = readFileSync(log, 'utf8').split('\n').filter((line) => /cache-badge|error|Error/u.test(line))
-    console.log(lines.slice(-10).join('\n') || '(no cache-badge lines in the log)')
+    const lines = readFileSync(log, 'utf8').split('\n').filter((line) => /cache-bricks|error|Error/u.test(line))
+    console.log(lines.slice(-10).join('\n') || '(no cache-bricks lines in the log)')
   }
   console.log('\nCONCLUSION: the host half did not activate; the client keeps using its per-step fallback.')
   process.exitCode = 1
@@ -117,7 +118,7 @@ if (observed.length === 0) {
 console.log('\nfeed')
 let best
 for (const sessionId of observed) {
-  const feed = await get(`/cache-badge/attempts?sessionId=${encodeURIComponent(sessionId)}`)
+  const feed = await get(`/cache-bricks/attempts?sessionId=${encodeURIComponent(sessionId)}`)
   if (feed.status !== 200) continue
   const bricks = Array.isArray(feed.body?.bricks) ? feed.body.bricks : []
   if (best === undefined || bricks.length > best.bricks.length) best = { sessionId, bricks, feed: feed.body }
@@ -160,20 +161,20 @@ console.log(`  ${String(attempts.size)} steps, ${String(retried.length)} of them
 console.log('\nstore')
 const sample = withStream[0] ?? bricks[0]
 if (sample?.raw?.streamRef !== undefined) {
-  const blob = await get(`/cache-badge/blob?ref=${encodeURIComponent(sample.raw.streamRef)}`)
+  const blob = await get(`/cache-bricks/blob?ref=${encodeURIComponent(sample.raw.streamRef)}`)
   check('a stored stream can be read back by ref', blob.status === 200 && Array.isArray(blob.body?.value), `HTTP ${String(blob.status)}`)
 }
 if (sample?.request?.requestRef !== undefined) {
-  const blob = await get(`/cache-badge/blob?ref=${encodeURIComponent(sample.request.requestRef)}`)
+  const blob = await get(`/cache-bricks/blob?ref=${encodeURIComponent(sample.request.requestRef)}`)
   const value = blob.body?.value
   // The envelope holds the config, the system prompt, the tool schemas and the
   // list of message refs — not the messages themselves, which are stored one by
   // one so that a shared prefix is never duplicated.
   const listRef = value?.messageRefsRef
-  const list = listRef === undefined ? undefined : (await get(`/cache-badge/blob?ref=${encodeURIComponent(listRef)}`)).body?.value
+  const list = listRef === undefined ? undefined : (await get(`/cache-bricks/blob?ref=${encodeURIComponent(listRef)}`)).body?.value
   const refs = list?.refs ?? value?.messageRefs
   if (value?.toolsRef !== undefined) {
-    const tools = await get(`/cache-badge/blob?ref=${encodeURIComponent(value.toolsRef)}`)
+    const tools = await get(`/cache-bricks/blob?ref=${encodeURIComponent(value.toolsRef)}`)
     check(
       'the tool schemas dedupe into their own blob',
       tools.status === 200 && Array.isArray(tools.body?.value?.tools) && tools.body.value.tools.length > 0,
@@ -186,7 +187,7 @@ if (sample?.request?.requestRef !== undefined) {
     `HTTP ${String(blob.status)}`,
   )
   if (Array.isArray(refs) && refs.length > 0) {
-    const last = await get(`/cache-badge/blob?ref=${encodeURIComponent(refs[refs.length - 1])}`)
+    const last = await get(`/cache-bricks/blob?ref=${encodeURIComponent(refs[refs.length - 1])}`)
     const message = last.body?.value
     check(
       'an individual message is fetchable through the ref list',
@@ -197,14 +198,14 @@ if (sample?.request?.requestRef !== undefined) {
     // between two requests that both carried it.
     const earlier = bricks[bricks.length - 2]
     if (earlier?.request?.messageCount !== undefined && earlier.request.messageCount > 0) {
-      const earlierEnvelope = await get(`/cache-badge/blob?ref=${encodeURIComponent(earlier.request.requestRef)}`)
+      const earlierEnvelope = await get(`/cache-bricks/blob?ref=${encodeURIComponent(earlier.request.requestRef)}`)
       const earlierValue = earlierEnvelope.body?.value
       // The envelope holds a *pointer* to the ref list (per-message storage), so the list has
       // to be fetched by its own ref — reading `messageRefs` inline silently reported 0.
       const earlierListRef = earlierValue?.messageRefsRef
       const earlierList = earlierListRef === undefined
         ? earlierValue?.messageRefs
-        : (await get(`/cache-badge/blob?ref=${encodeURIComponent(earlierListRef)}`)).body?.value?.refs
+        : (await get(`/cache-bricks/blob?ref=${encodeURIComponent(earlierListRef)}`)).body?.value?.refs
       const overlap = Array.isArray(earlierList)
         ? refs.filter((ref) => earlierList.includes(ref)).length
         : 0
@@ -212,7 +213,7 @@ if (sample?.request?.requestRef !== undefined) {
     }
   }
 }
-const missing = await get('/cache-badge/blob?ref=does-not-exist')
+const missing = await get('/cache-bricks/blob?ref=does-not-exist')
 check('an unknown ref is reported, not invented', missing.status === 404, `HTTP ${String(missing.status)}`)
 
 // Storage sharing: the property the first real session proved necessary. Storing

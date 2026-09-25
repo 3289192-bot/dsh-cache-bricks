@@ -134,6 +134,25 @@ function jumpText(jump: JumpReport, load?: LoadReport): string {
 }
 
 /** The tabs, in order. */
+/** Which of the three provenances a record has; an untagged record is a live capture. */
+function sourceOf(record: BrickRecord): 'host' | 'replay' | 'client' {
+  return record.observedBy === 'replay' ? 'replay' : record.observedBy === 'client' ? 'client' : 'host'
+}
+
+/** The chip's word for each provenance. */
+const SOURCE_LABEL: Record<'host' | 'replay' | 'client', string> = {
+  host: 'host feed',
+  replay: 'log replay',
+  client: 'client fold',
+}
+
+/** And what the chip means when hovered. */
+const SOURCE_TITLE: Record<'host' | 'replay' | 'client', string> = {
+  host: 'Collected by the host half, with the request and stream kept by reference',
+  replay: "Folded from this session's own log by the collector's own observations; no request capture",
+  client: 'Folded in the browser from the session event feed',
+}
+
 export const PANEL_TABS = [
   { id: 'transcript', label: '对话' },
   { id: 'overview', label: 'Overview' },
@@ -313,7 +332,7 @@ function RawTab({ props }: { props: BrickPanelProps }): ReactElement {
       <Heading>Stored by reference</Heading>
       <div style={{ margin: '0 0 6px', color: 'var(--dsw-alias-label-tertiary, #94a3b8)' }}>
         {'Messages are stored one by one, so a request that shares 600 of 602 messages pays for two. '
-          + 'The `messages` list above holds one ref per message; each is fetchable from /cache-badge/blob?ref=…'}
+          + 'The `messages` list above holds one ref per message; each is fetchable from /cache-bricks/blob?ref=…'}
       </div>
       <div style={GRID}>
         {refs.map(([kind, ref]) => (
@@ -358,7 +377,7 @@ function Verbatim({ label, text, tone }: { label: string; text: string; tone?: s
     <div style={{ margin: '6px 0' }}>
       <div style={{ color: 'var(--dsw-alias-label-tertiary, #94a3b8)', fontSize: '11px' }}>{label}</div>
       <pre
-        data-cache-badge-transcript={label}
+        data-cache-bricks-transcript={label}
         style={{
           ...MONO,
           whiteSpace: 'pre-wrap',
@@ -392,7 +411,7 @@ function TranscriptTab({ state, onLoad }: {
 }): ReactElement {
   if (state.status === 'idle') {
     return (
-      <div data-cache-badge-transcript-state="idle">
+      <div data-cache-bricks-transcript-state="idle">
         <Heading>Conversation</Heading>
         <div style={{ color: 'var(--dsw-alias-label-tertiary, #94a3b8)' }}>
           The prompt this turn answered, the assistant text this step committed, and its tool
@@ -413,11 +432,11 @@ function TranscriptTab({ state, onLoad }: {
     )
   }
   if (state.status === 'loading') {
-    return <div data-cache-badge-transcript-state="loading">正在读取这块砖对应的对话…</div>
+    return <div data-cache-bricks-transcript-state="loading">正在读取这块砖对应的对话…</div>
   }
   if (state.status === 'unavailable' || state.view === undefined) {
     return (
-      <div data-cache-badge-transcript-state="unavailable">
+      <div data-cache-bricks-transcript-state="unavailable">
         <Heading>Conversation</Heading>
         <div>
           {state.report?.status === 'no-seq'
@@ -433,7 +452,7 @@ function TranscriptTab({ state, onLoad }: {
   }
   const view = state.view
   return (
-    <div data-cache-badge-transcript-state="ready">
+    <div data-cache-bricks-transcript-state="ready">
       <Heading>{`Turn ${String(view.turn)} · Step ${String(view.step)}`}</Heading>
       {view.loaded
         ? null
@@ -495,14 +514,14 @@ export function BrickPanel(props: BrickPanelProps): ReactElement {
   const activityName = faceEnglish(activity)
   const chips = faceSegments(activity, { portion: reasoningShareOf(record) })
   return (
-    <div style={CARD} data-cache-badge-panel="" role="dialog" aria-label="砖块对话预览" aria-modal="false"
+    <div style={CARD} data-cache-bricks-panel="" role="dialog" aria-label="砖块对话预览" aria-modal="false"
       onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); onClose() } }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
         <strong style={{ fontSize: '13px' }}>
           {`Turn ${String(identity.turn)} · Step ${String(identity.step)}${attempt}`}
         </strong>
         <span
-          data-cache-badge-kind={activity}
+          data-cache-bricks-kind={activity}
           title={`activity: ${activityName}`}
           style={{ display: 'flex', borderRadius: '4px', overflow: 'hidden' }}
         >
@@ -524,10 +543,8 @@ export function BrickPanel(props: BrickPanelProps): ReactElement {
         </span>
         <span style={{ flex: 1, color: 'var(--dsw-alias-label-tertiary, #94a3b8)' }}>{record.settlement}</span>
         <span
-          data-cache-badge-source={record.observedBy === 'client' ? 'client' : 'host'}
-          title={record.observedBy === 'client'
-            ? 'Folded in the browser from the session event feed'
-            : 'Collected by the host half, with the request and stream kept by reference'}
+          data-cache-bricks-source={sourceOf(record)}
+          title={SOURCE_TITLE[sourceOf(record)]}
           style={{
             fontSize: '10px',
             padding: '1px 6px',
@@ -538,7 +555,7 @@ export function BrickPanel(props: BrickPanelProps): ReactElement {
               : 'var(--dsw-alias-state-success-primary, #22c55e)',
           }}
         >
-          {record.observedBy === 'client' ? 'client fold' : 'host feed'}
+          {SOURCE_LABEL[sourceOf(record)]}
         </span>
         {onLocate === undefined ? null : (
           <button
@@ -580,16 +597,26 @@ export function BrickPanel(props: BrickPanelProps): ReactElement {
         ))}
       </div>
 
-      {record.observedBy === 'client' ? (
+      {sourceOf(record) === 'client' ? (
         <div style={{ margin: '6px 0', padding: '6px 8px', borderRadius: '8px', background: 'rgba(148, 163, 184, 0.12)', color: 'var(--dsw-alias-label-tertiary, #94a3b8)' }}>
-          {'Folded client-side from the session event feed: the host half is not serving this session, '
-            + 'so the request, the timed stream and the context snapshot were never captured.'}
+          {'Folded client-side from the session event feed: this step is older than the collector process '
+            + '(a restart, a mid-session start, or an evicted session), so the request, the timed stream and '
+            + "the context snapshot were never captured. The jump still works: it loads this step's history "
+            + 'and lands on the row the durable log gives it — at step precision, not attempt.'}
+        </div>
+      ) : sourceOf(record) === 'replay' ? (
+        <div style={{ margin: '6px 0', padding: '6px 8px', borderRadius: '8px', background: 'rgba(148, 163, 184, 0.12)', color: 'var(--dsw-alias-label-tertiary, #94a3b8)' }}>
+          {'Reconstructed from the session log, one brick per settled attempt: usage, cache accounting, '
+            + 'activity, tools, retries and the row it goes to are the log\'s own, and the timed stream is kept '
+            + 'by reference. What the log never carried is absent rather than guessed — the outgoing request, '
+            + 'the message hashes, the dispatch-time context snapshot, and the dispatch instant itself, so the '
+            + 'TTFT here is measured from the step\'s start.'}
         </div>
       ) : null}
 
       {props.jump === undefined ? null : (
         <div
-          data-cache-badge-jump={props.jump.accuracy}
+          data-cache-bricks-jump={props.jump.accuracy}
           style={{
             margin: '6px 0',
             fontSize: '11px',
@@ -601,7 +628,7 @@ export function BrickPanel(props: BrickPanelProps): ReactElement {
           {jumpText(props.jump, props.jump.load)}
           {props.jump.locate === undefined ? null : (
             <div
-              data-cache-badge-locate={props.jump.locate.status}
+              data-cache-bricks-locate={props.jump.locate.status}
               style={{ ...GRID, margin: '4px 0 0', rowGap: '1px', fontVariantNumeric: 'normal' }}
             >
               {locateRows(props.jump.locate).map((row) => (

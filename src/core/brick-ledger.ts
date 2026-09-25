@@ -284,6 +284,14 @@ export interface LedgerOptions {
   readonly maxBricks?: number
   /** Blob store used for raw payloads. */
   readonly store?: BlobStore
+  /**
+   * What the bricks from this ledger should claim about where they came from.
+   *
+   * `host` (the default) is the live tap. `replay` is the same fold run over a session's
+   * own log, where the request capture and the dispatch-time context do not exist — the
+   * record says so instead of leaving fields that look measured.
+   */
+  readonly observedBy?: 'host' | 'replay'
 }
 
 const DEFAULT_MAX_BRICKS = 400
@@ -293,6 +301,7 @@ export class BrickLedger {
   private readonly sessionId: string
   private readonly maxBricks: number
   private readonly store: BlobStore
+  private readonly observedBy: 'host' | 'replay'
   private readonly drafts: AttemptDraft[] = []
   private readonly pendingDispatches: { at: number; options: DispatchOptions }[] = []
   private attemptCounts = new Map<string, number>()
@@ -312,6 +321,7 @@ export class BrickLedger {
     this.sessionId = sessionId
     this.maxBricks = options.maxBricks ?? DEFAULT_MAX_BRICKS
     this.store = options.store ?? new BlobStore()
+    this.observedBy = options.observedBy ?? 'host'
   }
 
   /** The raw-payload store, so the adapter can stash blobs and hand back refs. */
@@ -456,7 +466,12 @@ export class BrickLedger {
       attemptOrdinal: ordinal,
       ...(observation.attemptId === undefined ? {} : { attemptId: observation.attemptId }),
       ...(observation.revision === undefined ? {} : { revision: observation.revision }),
-      ...(pending === undefined ? {} : { dispatchedAt: pending.at, options: pending.options }),
+      // Dispatch first, then the attempt's own start. A replayed attempt has no dispatch
+      // observation — the log records when an attempt settled, not when it was sent — so its
+      // start instant is the closest origin available, and a TTFT measured from it is honest
+      // as long as it is labelled (see `replaySession`).
+      dispatchedAt: pending?.at ?? observation.at,
+      ...(pending === undefined ? {} : { options: pending.options }),
       ...(chain === undefined ? {} : { retryChainId: chain }),
       ...(this.header === undefined ? {} : { header: this.header }),
       ...(this.pressure === undefined ? {} : { context: this.pressure }),
@@ -867,7 +882,7 @@ export class BrickLedger {
       ...(draft.context?.nodeCount === undefined ? {} : { nodeCount: draft.context.nodeCount }),
     }
     return {
-      observedBy: 'host',
+      observedBy: this.observedBy,
       identity: {
         id: draft.id,
         sessionId: this.sessionId,

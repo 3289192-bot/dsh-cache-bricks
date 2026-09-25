@@ -4,7 +4,7 @@
  * Two rules come straight from the runtime contract (see `docs/runtime-contract.md`):
  *
  * - URLs are **document-relative**. The served page carries `<base href="./">` and
- *   may sit behind a prefix-stripping mount, so `location.origin + '/cache-badge'`
+ *   may sit behind a prefix-stripping mount, so `location.origin + '/cache-bricks'`
  *   would break outside the origin root.
  * - The feed is an optimisation, never a requirement. A composition without a host
  *   half (or an older line) answers 404, and the board must keep working from what

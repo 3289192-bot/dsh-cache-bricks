@@ -1,8 +1,8 @@
-# dsh-cache-badge bundle patch.
+# dsh-cache-bricks bundle patch.
 # Inserted into the profile composition when installed via
 #   dsh plugin --profile web add link:<this-package-path>
 # The plugin row resolves the package by name through the profile's node_modules;
 # the browser half registers the per-step cache badge via conversationEvents.
 - insert:
-    - id: cache-badge
-      name: 'dsh-cache-badge'
+    - id: cache-bricks
+      name: 'dsh-cache-bricks'

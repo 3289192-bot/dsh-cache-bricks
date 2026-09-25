@@ -476,6 +476,20 @@ export interface Brick {
    */
   readonly estimated?: true
   /**
+   * Where this brick came from — what the board is allowed to paint and to claim.
+   *
+   * - `live`: the collector watched the request. Full face, full record.
+   * - `replay`: the session's own log was folded by the same observations (`../core/replay`),
+   *   so the reading, the activity and the lifecycle are the log's own — the type face is
+   *   real. What is missing is the request capture, not the brick.
+   * - `fold`: the browser's reduced per-step fold, which measured usage and nothing else.
+   *   Its activity face stays blank (`~`) because claiming a type here would be a guess.
+   *
+   * Absent means the brick predates the distinction; the board treats that as `live`, which is
+   * what the only source of such bricks was.
+   */
+  readonly origin?: 'live' | 'replay' | 'fold'
+  /**
    * For a `mixed` brick: how much of the face goes to reasoning rather than to tool
    * work. Absent on every other type, which is drawn as one colour.
    */
@@ -624,10 +638,280 @@ export interface VisibleColumns {
  * @returns the visible window, how many columns fell off the left, and the lead.
  */
 export function visibleColumns(columns: readonly BoardColumn[], capacity: number): VisibleColumns {
-  const lead = columns.length > 0 && columns[columns.length - 1]!.ended ? 1 : 0
-  const room = Math.max(0, capacity - lead)
-  const kept = room === 0 ? [] : columns.slice(Math.max(0, columns.length - room))
-  return { columns: kept, evicted: columns.length - kept.length, lead }
+  const { columns: kept, older, lead } = windowColumns(columns, capacity, 0)
+  return { columns: kept, evicted: older, lead }
+}
+
+/**
+ * How far the board is panned away from its live corner.
+ *
+ * The live corner is the newest Turn at the right edge with the floor (row 0) on
+ * screen. Both offsets are **whole cells**, so a panned board still lands on the
+ * same grid the bricks fell into, and both count *hidden* cells: `back` columns
+ * to the right of the window, `up` rows below it.
+ */
+export interface BoardScroll {
+  /** Columns hidden to the right of the window; 0 puts the newest Turn on the right edge. */
+  readonly back: number
+  /** Rows hidden below the window; 0 puts the floor row on screen. */
+  readonly up: number
+}
+
+/** The live corner: nothing hidden on either axis. */
+export const LIVE_SCROLL: BoardScroll = { back: 0, up: 0 }
+
+/** A window over the board content: what is on screen, and how much is not. */
+export interface BoardWindow {
+  /** The Turn columns inside the window, oldest first. */
+  readonly columns: readonly BoardColumn[]
+  /**
+   * Columns reserved to the right of the newest Turn: 1 once the newest Turn has
+   * ended, so the next task drops into the freed column. Part of the content, so it
+   * pans with it.
+   */
+  readonly lead: number
+  /** The auxiliary lane's row inside the window, or undefined when the lane is not shown. */
+  readonly lane: number | undefined
+  /** Rows a Turn column may fill inside the window (the lane takes one when shown). */
+  readonly limit: number
+  /** The pan actually applied, after clamping to what the content allows. */
+  readonly scroll: BoardScroll
+  /** The largest pan this content allows. */
+  readonly limitScroll: BoardScroll
+  /** Tallest column, in bricks: the content's row count. */
+  readonly tallest: number
+  /** Columns hidden to the left of the window (older Turns). */
+  readonly older: number
+  /** Columns hidden to the right of the window (newer Turns, and the live end). */
+  readonly newer: number
+}
+
+/** The lead cell: one free column once the newest Turn has ended. */
+export function leadOf(columns: readonly BoardColumn[]): number {
+  return columns.length > 0 && columns[columns.length - 1]!.ended ? 1 : 0
+}
+
+/** The tallest column, in bricks. */
+export function tallestColumn(columns: readonly BoardColumn[]): number {
+  let tallest = 0
+  for (const column of columns) {
+    if (column.bricks.length > tallest) tallest = column.bricks.length
+  }
+  return tallest
+}
+
+/**
+ * The columns inside a window panned `back` cells to the left of the live edge.
+ *
+ * The lead cell is part of the content and pans with it: at `back === 0` the newest
+ * Turn sits on the right edge (or one cell in from it while the lead is reserved),
+ * and every column keeps the cell placement 1.7.1 gave it, shifted left by exactly
+ * `back` cells.
+ *
+ * @param columns - every known Turn column, oldest first.
+ * @param capacity - columns the window can hold.
+ * @param back - columns hidden to the right of the window.
+ * @returns the columns inside the window, the lead, and how many are hidden on each side.
+ */
+export function windowColumns(
+  columns: readonly BoardColumn[],
+  capacity: number,
+  back: number,
+): { columns: readonly BoardColumn[]; lead: number; older: number; newer: number } {
+  const lead = leadOf(columns)
+  const newestIndex = columns.length - 1
+  const kept: BoardColumn[] = []
+  let older = 0
+  let newer = 0
+  for (let index = 0; index < columns.length; index += 1) {
+    const distance = newestIndex - index + lead - back
+    if (distance < 0) {
+      newer += 1
+      continue
+    }
+    if (distance > capacity - 1) {
+      older += 1
+      continue
+    }
+    kept.push(columns[index]!)
+  }
+  return { columns: kept, lead, older, newer }
+}
+
+/**
+ * The pan that shows the oldest column and the top brick — in other words, the
+ * largest pan the content allows on each axis.
+ *
+ * @param columns - every known Turn column, oldest first.
+ * @param capacity - columns the window can hold.
+ * @param limit - rows a column may fill inside the window.
+ * @param lead - the reserved lead cell.
+ * @returns the largest `back`/`up` the content can honour.
+ */
+export function scrollLimit(
+  columns: readonly BoardColumn[],
+  capacity: number,
+  limit: number,
+  lead: number,
+): BoardScroll {
+  return {
+    back: Math.max(0, columns.length + lead - capacity),
+    up: Math.max(0, tallestColumn(columns) - limit),
+  }
+}
+
+/**
+ * Clamp a pan to what the content allows.
+ * @param scroll - the requested pan.
+ * @param limit - the largest pan this content allows.
+ * @returns the pan to apply, never negative and never past the end.
+ */
+export function clampScroll(scroll: BoardScroll, limit: BoardScroll): BoardScroll {
+  return {
+    back: Math.min(Math.max(0, Math.round(scroll.back)), limit.back),
+    up: Math.min(Math.max(0, Math.round(scroll.up)), limit.up),
+  }
+}
+
+/**
+ * The live anchor: the newest Turn at the right, and the **running Turn's own top
+ * brick** in frame.
+ *
+ * The second half is the one deliberate difference from 1.7.1. A Turn taller than the
+ * board used to lose its newest bricks off the top; while the board is following, the
+ * window now rises just far enough to keep the brick that just landed visible, which
+ * leaves the floor off screen only in the case where the running Turn does not fit at
+ * all. Every normal session — every Turn shorter than the board — still evaluates to
+ * `up: 0`, so the board reads exactly as it did.
+ *
+ * @param columns - every known Turn column, oldest first.
+ * @param limit - rows a column may fill inside the window.
+ * @returns the pan that follows the live edge.
+ */
+export function liveScroll(columns: readonly BoardColumn[], limit: number): BoardScroll {
+  const newest = columns[columns.length - 1]
+  const running = newest !== undefined && !newest.ended ? newest.bricks.length : 0
+  // Only the **running** Turn can push the window up, and only by what it cannot fit:
+  // an older, taller Turn is history, and history is what the vertical rail is for.
+  return { back: 0, up: Math.max(0, running - limit) }
+}
+
+/**
+ * Where one brick sits inside the window, or undefined when the pan moved it out.
+ *
+ * @param columnDistance - cells between this column and the newest Turn (0 = newest).
+ * @param row - the brick's row in its own column (0 = resting on the floor).
+ * @param lead - the reserved lead cell.
+ * @param scroll - the pan applied to the board.
+ * @param capacity - columns the window can hold.
+ * @param limit - rows a column may fill inside the window.
+ * @returns the window cell (`0,0` is the window's bottom-right cell), or undefined.
+ */
+export function windowCell(
+  columnDistance: number,
+  row: number,
+  lead: number,
+  scroll: BoardScroll,
+  capacity: number,
+  limit: number,
+): { readonly column: number; readonly row: number } | undefined {
+  const column = columnDistance + lead - scroll.back
+  if (column < 0 || column > capacity - 1) return undefined
+  const visible = row - scroll.up
+  if (visible < 0 || visible > limit - 1) return undefined
+  return { column, row: visible }
+}
+
+/**
+ * Everything the view needs to paint one board at one pan.
+ *
+ * The single place where "what is on screen" is decided: which columns, which rows,
+ * how far the pan could still go, and how much is hidden on each side. Pure, so the
+ * viewport arithmetic is unit-tested without a DOM.
+ *
+ * @param columns - every known Turn column, oldest first.
+ * @param metrics - the window's brick geometry.
+ * @param scroll - the requested pan, or undefined to follow the live edge.
+ * @param laneShown - whether the auxiliary lane takes the window's top row.
+ * @returns the window, the pan actually applied, and both ends of the rail.
+ */
+export function boardWindow(
+  columns: readonly BoardColumn[],
+  metrics: BoardMetrics,
+  scroll: BoardScroll | undefined,
+  laneShown: boolean,
+): BoardWindow {
+  const lead = leadOf(columns)
+  const limit = columnRowLimit(metrics, laneShown)
+  const limitScroll = scrollLimit(columns, metrics.columns, limit, lead)
+  const applied = clampScroll(scroll ?? liveScroll(columns, limit), limitScroll)
+  const { columns: visible, older, newer } = windowColumns(columns, metrics.columns, applied.back)
+  return {
+    columns: visible,
+    lead,
+    lane: auxLaneRow(metrics, laneShown),
+    limit,
+    scroll: applied,
+    limitScroll,
+    tallest: tallestColumn(columns),
+    older,
+    newer,
+  }
+}
+
+/**
+ * Shortest a rail's thumb may get, in CSS pixels.
+ *
+ * A hundred Turns of history against ten visible columns would otherwise leave a
+ * two-pixel thumb: unreadable as a position and impossible to grab. The thumb is
+ * therefore a **lower bound on the grab handle**, never a claim about the ratio.
+ */
+export const RAIL_MIN_THUMB = 16
+
+/** One rail's geometry, in CSS pixels inside its track. */
+export interface RailGeometry {
+  /** The track's length along its axis. */
+  readonly track: number
+  /** The thumb's length. */
+  readonly thumb: number
+  /** The thumb's offset from the track's start (left for the horizontal rail, top for the vertical one). */
+  readonly offset: number
+  /** True when there is more content than viewport on this axis. */
+  readonly scrollable: boolean
+}
+
+/**
+ * Where a scrollbar's thumb sits, for a track that starts at the content's **end**.
+ *
+ * Both rails are anchored the same way: pan 0 (the live corner) puts the thumb at the
+ * track's far end — right for the horizontal rail, bottom for the vertical one — which
+ * is where a reader expects "the newest brick" to be. The thumb never grows past the
+ * track and never shrinks below `minimum`, so a board with a hundred columns of history
+ * still offers something to grab.
+ *
+ * @param track - the track's length in CSS pixels.
+ * @param viewport - cells the window shows on this axis.
+ * @param content - cells the content needs on this axis.
+ * @param offset - the pan applied, in cells, 0 = live.
+ * @param minimum - shortest a thumb may get, in CSS pixels.
+ * @returns the thumb's length, its offset from the track's start, and whether it can move.
+ */
+export function railGeometry(
+  track: number,
+  viewport: number,
+  content: number,
+  offset: number,
+  minimum = RAIL_MIN_THUMB,
+): RailGeometry {
+  const span = Math.max(1, Math.round(content))
+  const view = Math.min(Math.max(1, Math.round(viewport)), span)
+  if (!(track > 0)) return { track: 0, thumb: 0, offset: 0, scrollable: span > view }
+  const thumb = Math.min(track, Math.max(Math.min(minimum, track), Math.round(track * (view / span))))
+  const furthest = span - view
+  const applied = Math.min(Math.max(0, offset), furthest)
+  // 1 at the live end, 0 at the far end of the content.
+  const at = furthest === 0 ? 1 : 1 - applied / furthest
+  return { track, thumb, offset: Math.round((track - thumb) * at), scrollable: furthest > 0 }
 }
 
 /** Cell placement of one brick: `column` counts from the newest (0 = right edge). */

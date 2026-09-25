@@ -3,7 +3,7 @@ import { type LoadReport } from './navigation';
 /** How one load ended, in one short sentence for the panel. */
 export declare function loadText(report: LoadReport): string;
 /**
- * Services required by the cache-badge browser half.
+ * Services required by the cache-bricks browser half.
  *
  * Only `slots` is a hard dependency (always present on the web surface). The
  * conversation-node registry — where a node Definition is registered — is

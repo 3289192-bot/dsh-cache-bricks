@@ -4,5 +4,5 @@
  * has no host-side behavior — all state lives in the browser conversation
  * projection.
  */
-export declare const name = "dsh-cache-badge/invariant";
+export declare const name = "dsh-cache-bricks/invariant";
 export declare function apply(): void;

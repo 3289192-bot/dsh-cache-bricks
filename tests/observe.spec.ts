@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { BlobStore } from '../src/host/blob-store'
-import { BrickLedger, type Observation } from '../src/host/brick-ledger'
+import { BlobStore } from '../src/core/blob-store'
+import { BrickLedger, type Observation } from '../src/core/brick-ledger'
 import {
   RequestSummarizer,
   chunkObservation,
@@ -16,7 +16,7 @@ import {
   usageFromStream,
   type ChunkLike,
   type StreamRecordLike,
-} from '../src/host/observe'
+} from '../src/core/observe'
 
 /** A durable message as the runtime hands it over. */
 function message(id: string, text: string): { id: string; role: string; content: unknown; source: unknown } {

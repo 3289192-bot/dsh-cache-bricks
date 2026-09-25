@@ -18,10 +18,20 @@
  * made of?") and answers it in one gesture instead of a pointer hovering forty
  * tiny slabs. Both layers carry a brick at the same grid position, so a column
  * stays the column it was when the card comes back.
+ *
+ * The card is a **window over the whole board**, not a crop of it: the frame never
+ * changes size, and the content pans inside it along two rails — Turns to the left and
+ * right, rows up and down (see `boardWindow` in `./tetris`). Until a reader pans, the
+ * window sits on the live corner and the board reads exactly as it did before the rails
+ * existed: the newest Turn on the right edge, the floor at the bottom, a finished Turn
+ * sliding the stack one cell left. Panning is whole cells, so a panned board still shows
+ * the grid the bricks fell into; the rails themselves are carved out of the band, so no
+ * brick ever sits under one.
  */
 import { type BoardColumn, type Brick } from './tetris';
 import type { LoadReport, LoadRequest } from './navigation';
 import { type RevealOutcome } from './reveal';
+import type { BrickTarget, HistoricalStepTarget } from './target';
 /** Options for {@link CacheTetrisBoard}. */
 export interface CacheTetrisBoardOptions {
     /** Called with a brick's key when it is clicked, so the panel can open. */
@@ -41,6 +51,14 @@ export interface CacheTetrisBoardOptions {
      * make the row exist before scrolling to it.
      */
     readonly load?: (request: LoadRequest) => Promise<LoadReport>;
+    /**
+     * What a **folded** brick's step became in the transcript, read from the durable log.
+     *
+     * A folded brick carries a `historical-step` target: the step is known, the row is not.
+     * The board passes this straight through to the reveal, which asks it after loading — see
+     * `resolveHistoricalStep`.
+     */
+    readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined;
 }
 export declare class CacheTetrisBoard {
     private readonly options;
@@ -58,6 +76,18 @@ export declare class CacheTetrisBoard {
     private laneLabel;
     /** The chrome strip's "no collector" notice. */
     private notice;
+    /** The chrome strip's "back to the newest" control, shown only while the board is panned. */
+    private liveChip;
+    /** Horizontal rail: Turns to the left and right. */
+    private hRail;
+    private hThumb;
+    /** Vertical rail: rows up and down. */
+    private vRail;
+    private vThumb;
+    /** Edge fades: content hidden beyond the window's left, right and top edges. */
+    private fadeLeft;
+    private fadeRight;
+    private fadeTop;
     /** True while the bricks come from the client's own fold. */
     private estimated;
     /** One slab map per side. `cache` is canonical: it drives positions and data. */
@@ -72,6 +102,26 @@ export declare class CacheTetrisBoard {
     private aux;
     private titles;
     private scroller;
+    /**
+     * The pan the reader asked for; `undefined` means "follow the live corner".
+     *
+     * Following is not the same as `{ back: 0, up: 0 }`: a running Turn taller than the
+     * board raises the live window (see `liveScroll`), and a board that is following has to
+     * keep doing so as that Turn grows. Only a pan that came from the reader is stored here,
+     * and landing back on the live corner clears it again.
+     */
+    private scroll;
+    /** Turn columns at the last paint, so a new Turn does not yank a panned window. */
+    private lastColumns;
+    /** The window of the last paint: what the rails describe and what a drag moves. */
+    private view;
+    /** The pointer drag in flight on a rail, if any. */
+    private drag;
+    /** A brick to focus once the next paint has placed it, for arrows that pan the window. */
+    private revealKey;
+    /** Until this timestamp a hand-driven pan is in flight, so slabs must not animate. */
+    private panUntil;
+    private panTimer;
     private frame;
     private settle;
     private trailing;
@@ -167,6 +217,20 @@ export declare class CacheTetrisBoard {
     private copies;
     private ensureHost;
     /**
+     * Build one scroll rail: a track, a thumb, and the gestures that move the window.
+     *
+     * The rail is a real `role="scrollbar"`: draggable by pointer, wheelable, and — when
+     * there is something to move to — reachable by Tab with the arrow keys, so the board's
+     * history is not pointer-only. It reports the pan in cells (`aria-valuenow` counts from
+     * the **content's** start, like a native scrollbar) and says how much is hidden in words.
+     *
+     * @param axis - which axis this rail moves.
+     * @returns the track and the thumb, both already wired.
+     */
+    private createRail;
+    /** One edge fade, so a hidden direction is visible without moving the window. */
+    private createFade;
+    /**
      * Turn the whole card over.
      *
      * The back is built at the moment of the flip and kept current while it shows,
@@ -191,19 +255,104 @@ export declare class CacheTetrisBoard {
     private syncChip;
     private paint;
     /**
-     * The brick an arrow key should move focus to.
+     * The brick an arrow key asks for, in the board's own geometry.
      *
-     * The board is a grid — a column per Turn, a row per step — so the arrows move
-     * the way the grid reads: left and right between Turns at the same step, up and
-     * down between steps of the same Turn.
+     * The board is a grid — a column per Turn, a row per step — and a column stacks
+     * **upward**: the Turn's first step rests on the floor and every later step lands on top
+     * of it. So ArrowUp means a *later* step and ArrowDown an earlier one, which is the
+     * direction the brick travels on screen rather than the direction the step number does.
      *
      * @param from - the brick focus is on.
      * @param key - the key that was pressed.
-     * @returns the key of the brick to focus, if there is one.
+     * @returns the Turn and step asked for, or undefined for any other key.
      */
-    private neighbour;
-    /** Reconcile brick elements with the visible columns, animating the changes. */
+    private neighbourOf;
+    /**
+     * Move focus one cell, panning the window when the cell is off screen.
+     *
+     * Arrows used to stop at the edge of what happened to be drawn, which is exactly the
+     * wall the rails remove: the window follows the keyboard now, so the whole board is
+     * walkable from the keyboard alone.
+     *
+     * @param from - the brick focus is on.
+     * @param key - the key that was pressed.
+     * @returns true when the key was one of the four arrows.
+     */
+    private focusNeighbour;
+    /**
+     * Pan the smallest amount that brings one brick inside the window, and focus it there.
+     *
+     * "Smallest amount" is literal: a brick one cell past the right edge comes in at the
+     * right edge, one cell past the top comes in at the top, and a brick already inside
+     * leaves the window where it is. The focus lands on the frame after the pan, once the
+     * slab exists.
+     *
+     * @param turn - the brick's Turn.
+     * @param step - the brick's step.
+     * @returns true when such a brick exists on the board.
+     */
+    private panTo;
+    /** Reconcile brick elements with the window, animating the changes. */
     private syncBricks;
+    /** Move the window, clamped to what the content allows right now. */
+    private setScroll;
+    /**
+     * Note that a hand-driven pan is in flight.
+     *
+     * While it is, slabs drop their transition: a pan moves every brick at once, and the
+     * 420 ms drop animation would turn a drag into a rubber band. The timer restores the
+     * animation afterwards, so the next real drop still falls.
+     */
+    private markPan;
+    /** True while a hand-driven pan is still settling. */
+    private isPanning;
+    /** Keep a slab's animation in step with whether the window is being panned by hand. */
+    private syncTransition;
+    /**
+     * Start a drag on a rail.
+     *
+     * A press **on the thumb** keeps the current pan and follows the pointer; a press on the
+     * track pages the window so the thumb centres under the pointer and then keeps dragging —
+     * the two gestures a native scrollbar has, and the reason the track is thick enough to
+     * hit (4 CSS pixels).
+     *
+     * @param axis - which rail was pressed.
+     * @param event - the pointer event.
+     */
+    private beginRailDrag;
+    /** The pan an offset along the track stands for, with the thumb centred on the pointer. */
+    private railOffset;
+    /** Apply the drag in flight: whole cells, so the grid never lands between bricks. */
+    private applyDrag;
+    /**
+     * Keep both rails telling the truth about the window.
+     *
+     * One rail per axis, both anchored at the live corner: at pan 0 the thumb sits at the
+     * track's far end (right, bottom) — where the newest brick is — and travels towards the
+     * content's start as the reader goes back. A rail with nothing to scroll is still drawn,
+     * dimmed and inert, so the board's shape does not change when history outgrows it.
+     *
+     * @param metrics - the window's brick geometry.
+     * @param view - the window this paint is showing.
+     */
+    private syncRails;
+    /** Place one rail's thumb and publish its accessible state. */
+    private applyRail;
+    /**
+     * Show an edge fade in every direction the window has hidden content.
+     *
+     * The rails say how much; the fades say **where**, at a glance, without moving anything:
+     * older Turns to the left, newer ones to the right, higher rows above.
+     */
+    private syncFades;
+    /**
+     * Show the way back while the board is showing history.
+     *
+     * A panned board is the one state that can be misread: old Turns look exactly like the
+     * current ones. So the strip grows a control that names the state and undoes it in one
+     * click — and it is absent, not merely dimmed, while the board is live.
+     */
+    private syncLiveChip;
     /**
      * Draw the auxiliary lane's own chrome: a dashed rule under it and a `SYS` label.
      *
@@ -227,6 +376,8 @@ export declare class CacheTetrisBoard {
      * @param right - distance from the board's right edge.
      * @param bottom - distance from the board's floor.
      * @param falling - true when it should drop in from above the well.
+     * @param smooth - true when the slab should animate its own moves; false during a pan, when
+     *   every brick moves at once and the drop animation would read as lag.
      * @returns the live entry, already wired to its gestures.
      */
     private createSlab;
@@ -258,6 +409,14 @@ export declare class CacheTetrisBoard {
      * Outline the slot the next brick will fall into, while the newest Turn is
      * still running. It is the one bit of chrome that tells a viewer the pile is
      * live rather than a finished chart.
+     *
+     * The slot belongs to the **live** corner: a panned window is a reading of the past,
+     * and a dashed "the next brick lands here" cell drawn inside it would be a lie about
+     * where the session is.
+     *
+     * @param host - the board's own element.
+     * @param metrics - board geometry.
+     * @param view - the window this paint is showing.
      */
     private syncGhost;
     /**

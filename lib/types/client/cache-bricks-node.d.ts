@@ -3,7 +3,7 @@ import type { CacheUsage } from './logic';
 declare module '@deepseek-ai/dsh-client-ui-chat/client' {
     interface ChatNodeDataMap {
         /** One Turn's per-step prompt-cache row, anchored outside the Turn's fold. */
-        'cache-badge': CacheBadgeNodeData;
+        'cache-bricks': CacheBricksNodeData;
     }
 }
 /** One assistant step's own accounting (one `llm/stream` call). */
@@ -28,14 +28,14 @@ export interface StepSample {
     readonly seq?: number;
 }
 /** State accumulated for one Turn: one sample per assistant step. */
-export interface CacheBadgeState {
+export interface CacheBricksState {
     readonly turn: number;
     readonly steps: ReadonlyMap<number, StepSample>;
     /** True once the Turn's `turn/end` has been seen. */
     readonly ended: boolean;
 }
 /** Published view data: the Turn's steps in step order. */
-export interface CacheBadgeNodeData {
+export interface CacheBricksNodeData {
     readonly turn: number;
     readonly steps: readonly StepSample[];
     readonly ended: boolean;
@@ -57,5 +57,5 @@ export interface CacheBadgeNodeData {
  *
  * A Turn whose provider never reports usage publishes nothing.
  */
-export declare const cacheBadgeDefinition: ConversationNodeDefinition<CacheBadgeState>;
+export declare const cacheBricksDefinition: ConversationNodeDefinition<CacheBricksState>;
 export type { ConversationNodeContext, ConversationViewNode };

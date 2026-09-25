@@ -1,6 +1,6 @@
 import type { UserConfig } from 'tsdown'
 
-const ID = 'dsh-cache-badge'
+const ID = 'dsh-cache-bricks'
 
 /** Module-table entries left external: answered by the loader's require at
  * runtime. Only `react` is actually requested by this bundle (the value

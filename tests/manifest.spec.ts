@@ -16,7 +16,7 @@ describe('package manifest', () => {
   it('ships a bundle patch that inserts this plugin by its own package name', () => {
     expect(pkg.dsh.bundle.patch).toBe('./cordis.patch.yml')
     const patch = readFileSync(`${root}/cordis.patch.yml`, 'utf8')
-    expect(patch).toContain('- id: cache-badge')
+    expect(patch).toContain('- id: cache-bricks')
     expect(patch).toContain(`name: '${pkg.name}'`)
   })
 

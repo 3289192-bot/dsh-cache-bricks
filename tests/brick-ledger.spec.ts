@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { BrickLedger, type Observation } from '../src/host/brick-ledger'
-import { BlobStore } from '../src/host/blob-store'
+import { BrickLedger, type Observation } from '../src/core/brick-ledger'
+import { BlobStore } from '../src/core/blob-store'
 import type { BrickRecord } from '../src/shared/brick'
 
 /** A request that cached a large prefix. */

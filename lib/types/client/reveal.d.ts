@@ -28,7 +28,7 @@
  * browser.
  */
 import type { LoadReport, LoadRequest, LoadStatus } from './navigation';
-import type { BrickTarget, RevealAccuracy, RevealRow } from './target';
+import type { BrickTarget, HistoricalStepTarget, RevealAccuracy, RevealRow } from './target';
 /** The parts of an element this module uses. */
 export interface RevealElement {
     getBoundingClientRect(): RevealRect;
@@ -112,6 +112,18 @@ export interface RevealOptions {
      * found in the DOM as it is, and never pretends the row was loaded.
      */
     readonly load?: (request: LoadRequest) => Promise<LoadReport>;
+    /**
+     * What a folded step became, asked **after** its history is loaded.
+     *
+     * A `historical-step` target names a step, not a row: which row that step produced (a
+     * message half, a tool call, a retry chain) is written in the durable log, not in the DOM.
+     * Injected here — rather than imported — so this module keeps answering exactly one
+     * question ("is that element on screen?") and the log reading stays in `./navigation`.
+     *
+     * Returning `undefined` is a real answer: nothing in the transcript stands for that step,
+     * and the reveal then lands on the Turn and reports `context`.
+     */
+    readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined;
 }
 /** Selector for one Turn's row. */
 export declare function rowSelector(turn: number): string;

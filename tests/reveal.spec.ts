@@ -379,11 +379,82 @@ describe('revealBrick: exact or nothing', () => {
     expect((root as unknown as { scrolls: number[] }).scrolls).toEqual([])
   })
 
-  it('does nothing at all for a brick that has no target', async () => {
+  it('does nothing at all for a brick the contract declares unreachable', async () => {
     const root = scroller({ turns: [4], steps: [{ turn: 4, step: 2, height: 24 }] })
-    const outcome = await revealBrick(root, { kind: 'none', reason: 'client-fold' }, { wait: instant })
+    const outcome = await revealBrick(root, { kind: 'none', reason: 'session-title' }, { wait: instant })
     expect(outcome).toMatchObject({ accuracy: 'none', row: 'none', load: { status: 'nothing-to-load' } })
     expect((root as unknown as { scrolls: number[] }).scrolls).toEqual([])
+  })
+})
+
+describe('a folded brick navigates to its step', () => {
+  it('loads the log position the step was measured from, then lands on the row it became', async () => {
+    // Acceptance case ①: after a restart every brick older than the collector is folded, and
+    // double-clicking one must still page its own history in and land on its step.
+    const root = scroller({ turns: [37], steps: [{ turn: 37, step: 4, height: 24, group: 'reasoning' }] })
+    const { load, requests } = loader({})
+    const outcome = await revealBrick(root, { kind: 'historical-step', turn: 37, step: 4, loadSeq: 28371 }, {
+      wait: instant,
+      load,
+      resolve: () => ({ kind: 'assistant-step', turn: 37, step: 4, part: 'reasoning', loadSeq: 28371 }),
+    })
+    // The official loader was asked for this step's own position — not for a page count.
+    expect(requests).toEqual([28371])
+    expect(outcome).toMatchObject({ accuracy: 'exact', row: 'assistant-step' })
+    expect(outcome.element?.getAttribute?.('data-chat-node-key')).toBe('14:assistant-step37:4')
+  })
+
+  it('lands on the tool call when the step produced no assistant row', async () => {
+    // Acceptance case ③: a step that only called tools has no `assistant-step` node at all;
+    // the call id comes from the durable `tool/call` event, which is what the resolver reads.
+    const root = scroller({ turns: [12], calls: [{ callId: 'call_00_qFeD', height: 24 }] })
+    const outcome = await revealBrick(root, { kind: 'historical-step', turn: 12, step: 3, loadSeq: 500 }, {
+      wait: instant,
+      load: loader({}).load,
+      resolve: () => ({ kind: 'tool-call', turn: 12, step: 3, callId: 'call_00_qFeD' }),
+    })
+    expect(outcome).toMatchObject({ accuracy: 'exact', row: 'tool-call' })
+    expect(outcome.element?.getAttribute?.('data-chat-node-key')).toBe('9:tool-callcall_00_qFeD')
+  })
+
+  it('falls back to the Turn, and says context, when the log offers no row for the step', async () => {
+    // Acceptance case ④'s other half: never a neighbouring step. A step with no message and no
+    // call is still *in* a Turn, and that is the only landing it may claim.
+    const root = scroller({
+      turns: [9],
+      steps: [{ turn: 9, step: 1, height: 24 }, { turn: 9, step: 2, height: 24 }],
+    })
+    const outcome = await revealBrick(root, { kind: 'historical-step', turn: 9, step: 5, loadSeq: 700 }, {
+      wait: instant,
+      load: loader({}).load,
+      resolve: () => undefined,
+    })
+    expect(outcome).toMatchObject({ accuracy: 'context', row: 'turn-header', load: { status: 'loaded', seq: 700 } })
+    // The Turn's own row was reached — the container, not step 1 or 2 dressed up as step 5.
+    expect(outcome.element?.getBoundingClientRect().top).toBe(400)
+  })
+
+  it('reports none, without moving, when the resolved row never renders', async () => {
+    // Resolution is a claim about the log; the DOM still has to produce the row. When it does
+    // not, the honest answer is a miss with the load report attached — not a nearby row.
+    const root = scroller({ turns: [9], steps: [{ turn: 9, step: 1, height: 24 }], process: { turn: 9, expanded: false, reveals: false } })
+    const outcome = await revealBrick(root, { kind: 'historical-step', turn: 9, step: 2, loadSeq: 700 }, {
+      wait: instant,
+      settleMs: 0,
+      load: loader({}).load,
+      resolve: () => ({ kind: 'assistant-step', turn: 9, step: 2, part: 'response' }),
+    })
+    expect(outcome).toMatchObject({ accuracy: 'none', row: 'none' })
+    expect(outcome.load).toMatchObject({ status: 'loaded', seq: 700, rendered: false })
+  })
+
+  it('lands on the Turn, and says the loader was missing, when this core has no session face', async () => {
+    // No face means no log to ask, so the step cannot be resolved — but the Turn is still where
+    // it happened. Landing there with `context` and a `no-loader` report is true; claiming the
+    // step was reached would not be.
+    const root = scroller({ turns: [9], steps: [{ turn: 9, step: 1, height: 24 }] })
+    const outcome = await revealBrick(root, { kind: 'historical-step', turn: 9, step: 1 }, { wait: instant })
+    expect(outcome).toMatchObject({ accuracy: 'context', row: 'turn-header', load: { status: 'no-loader' } })
   })
 })
 

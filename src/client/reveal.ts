@@ -29,7 +29,7 @@
  */
 import type { LoadReport, LoadRequest, LoadStatus } from './navigation'
 import { loadRequestOf } from './navigation'
-import type { BrickTarget, RevealAccuracy, RevealRow } from './target'
+import type { BrickTarget, HistoricalStepTarget, RevealAccuracy, RevealRow } from './target'
 import { accuracyOf, loadSeqOf } from './target'
 import { revealTarget } from './tetris'
 
@@ -113,6 +113,18 @@ export interface RevealOptions {
    * found in the DOM as it is, and never pretends the row was loaded.
    */
   readonly load?: (request: LoadRequest) => Promise<LoadReport>
+  /**
+   * What a folded step became, asked **after** its history is loaded.
+   *
+   * A `historical-step` target names a step, not a row: which row that step produced (a
+   * message half, a tool call, a retry chain) is written in the durable log, not in the DOM.
+   * Injected here — rather than imported — so this module keeps answering exactly one
+   * question ("is that element on screen?") and the log reading stays in `./navigation`.
+   *
+   * Returning `undefined` is a real answer: nothing in the transcript stands for that step,
+   * and the reveal then lands on the Turn and reports `context`.
+   */
+  readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined
 }
 
 /** Selector for one Turn's row. */
@@ -336,6 +348,8 @@ const EXACT_ROWS: Record<BrickTarget['kind'], RevealRow | undefined> = {
   'tool-call': 'tool-call',
   'retry-chain': 'retry-chain',
   compaction: 'compaction',
+  // Not a row on its own: resolved into one of the above first (see `revealHistorical`).
+  'historical-step': undefined,
   none: undefined,
 }
 
@@ -507,6 +521,8 @@ function turnOf(target: BrickTarget): number | undefined {
  * @param wait - the injected sleep.
  * @param settleMs - how long to wait for a just-opened group to lay out.
  * @param load - the unified loader, when this core has a session face.
+ * @param isCurrent - the canceller.
+ * @param known - a load report the caller already produced; then the loader is not asked again.
  * @returns what was reached and what the loader did — the report is returned even on a miss.
  */
 async function landExact(
@@ -516,6 +532,7 @@ async function landExact(
   settleMs: number,
   load: ((request: LoadRequest) => Promise<LoadReport>) | undefined,
   isCurrent: () => boolean,
+  known?: LoadReport,
 ): Promise<LandResult> {
   const shown = findRow(root, target)
   if (shown !== undefined) {
@@ -527,16 +544,16 @@ async function landExact(
       row: shown.row,
       element: shown.element,
       expanded: false,
-      load: { status: 'not-needed', ...(seq === undefined ? {} : { seq }) },
+      load: known ?? { status: 'not-needed', ...(seq === undefined ? {} : { seq }) },
     }
   }
 
   // The history that row is built from may not be in the window yet. This is the only thing
   // that can make it exist, and it is the official loader — not a click on someone else's
   // control, and never a fallback to a nearby row.
-  const report = load === undefined
+  const report = known ?? (load === undefined
     ? { status: 'no-loader' as const }
-    : await load(loadRequestOf(target))
+    : await load(loadRequestOf(target)))
 
   // History coverage and React's DOM commit are separate moments. Re-resolve controls on
   // every tick, including wrappers which did not exist when loadThrough resolved.
@@ -577,6 +594,127 @@ async function landExact(
 }
 
 /**
+ * The Turn's own row, when it has one on screen.
+ *
+ * The Turn container is where its header lives, so this is the honest "somewhere in this Turn"
+ * answer — the one landing this module reports as `context`.
+ *
+ * @param root - the scroll container.
+ * @param turn - the Turn to find.
+ * @returns the Turn's row or its first laid-out step row, when either is rendered.
+ */
+function turnRow(root: RevealScroller, turn: number): RevealElement | undefined {
+  const own = root.querySelector(rowSelector(turn))
+  if (own !== null && own !== undefined && isLaidOut(own)) return own
+  return stepsInTurn(root, turn).find((entry) => isLaidOut(entry.element))?.element
+}
+
+/**
+ * Land on the Turn a step happened in — the fallback for a step with no row of its own.
+ *
+ * This is deliberately **not** a landing on a step: a reader who asked for one request must
+ * never be shown another. It opens the Turn's process group (steps inside a collapsed group
+ * have no height, so nothing is reachable until it does) and reports `turn-header`, which
+ * `accuracyOf` turns into `context`.
+ *
+ * @param root - the scroll container.
+ * @param turn - the Turn to land on.
+ * @param wait - the injected sleep.
+ * @param settleMs - how long to keep checking for a just-opened group to lay out.
+ * @param isCurrent - the canceller.
+ * @returns the row reached and whether a group had to be opened.
+ */
+async function landOnTurn(
+  root: RevealScroller,
+  turn: number,
+  wait: (ms: number) => Promise<void>,
+  settleMs: number,
+  isCurrent: () => boolean,
+): Promise<{ element: RevealElement; expanded: boolean } | undefined> {
+  let expanded = false
+  const tick = 50
+  for (let spent = 0; spent <= settleMs && isCurrent(); spent += tick) {
+    const toggle = findProcessToggle(root, turn)
+    if (toggle !== undefined && toggle.getAttribute?.('aria-expanded') !== 'true'
+      && typeof toggle.click === 'function') {
+      toggle.click()
+      expanded = true
+    }
+    const row = turnRow(root, turn)
+    if (row !== undefined) {
+      scrollToRow(root, row)
+      return { element: row, expanded }
+    }
+    if (spent < settleMs) await wait(tick)
+  }
+  return undefined
+}
+
+/**
+ * Take a folded brick to its step.
+ *
+ * The order is the point of this function, and it is three steps rather than one:
+ *
+ * 1. **load** the log position this step was measured from. The row cannot exist before its
+ *    history does, and neither can the answer to the next question;
+ * 2. **ask the log what the step became** (injected as `resolve`), because a folded brick
+ *    knows its step but not its row;
+ * 3. **land on that row** — and if the log offers none, land on the Turn and say `context`
+ *    rather than picking a neighbouring step to make the gesture look successful.
+ *
+ * @param root - the scroll container.
+ * @param target - the folded brick's step target.
+ * @param options - injected timing, the loader and the resolver.
+ * @param wait - the injected sleep.
+ * @param settleMs - how long to keep checking for a row.
+ * @param isCurrent - the canceller.
+ * @returns the outcome, always with the load report the reader is owed.
+ */
+async function revealHistorical(
+  root: RevealScroller,
+  target: HistoricalStepTarget,
+  options: RevealOptions,
+  wait: (ms: number) => Promise<void>,
+  settleMs: number,
+  isCurrent: () => boolean,
+): Promise<RevealOutcome> {
+  const report = options.load === undefined
+    ? { status: 'no-loader' as const }
+    : await options.load(loadRequestOf(target))
+  if (!isCurrent()) return { accuracy: 'none', row: 'none', load: report, expanded: false }
+
+  const resolved = options.resolve?.(target)
+  if (resolved !== undefined && resolved.kind !== 'none') {
+    // Coverage is already ensured above: a second load here would page history in twice and
+    // report a status that describes the wrong request.
+    const landed = await landExact(root, resolved, wait, settleMs, undefined, isCurrent, report)
+    if (landed.found && landed.row !== undefined && landed.element !== undefined) {
+      return {
+        accuracy: landed.fellBack === true ? 'context' : accuracyOf(landed.row),
+        row: landed.row,
+        load: report,
+        expanded: landed.expanded === true,
+        ...(landed.fellBack === true ? { fellBack: true as const } : {}),
+        element: landed.element,
+      }
+    }
+    // The log says this step is a row; the DOM did not produce it. That is a **miss**, and it
+    // is reported as one — the panel reads `loaded-awaiting-render` and the reader can look at
+    // the cause. Scrolling to the Turn here would quietly turn "the row is missing" into
+    // "here is roughly where it was", which is the rounding-up this module exists to refuse.
+    return { accuracy: 'none', row: 'none', load: { ...report, rendered: false }, expanded: landed.expanded === true }
+  }
+
+  // No row of its own at all — a step that produced neither a message nor a call — or no log to
+  // ask. The Turn is still where it happened, and that is the honest `context` landing.
+  const turn = await landOnTurn(root, target.turn, wait, settleMs, isCurrent)
+  if (turn !== undefined && isCurrent()) {
+    return { accuracy: 'context', row: 'turn-header', load: report, expanded: turn.expanded, element: turn.element }
+  }
+  return { accuracy: 'none', row: 'none', load: { ...report, rendered: false }, expanded: false }
+}
+
+/**
  * Take the reader to the request a brick stands for.
  *
  * @param root - the scroll container.
@@ -593,7 +731,13 @@ export async function revealBrick(
   const settleMs = options.settleMs ?? 4000
   const isCurrent = options.isCurrent ?? (() => true)
 
-  if (!isCurrent() || target.kind === 'none' || EXACT_ROWS[target.kind] === undefined) {
+  if (!isCurrent() || target.kind === 'none') {
+    return { accuracy: 'none', row: 'none', load: { status: 'nothing-to-load' }, expanded: false }
+  }
+  if (target.kind === 'historical-step') {
+    return revealHistorical(root, target, options, wait, settleMs, isCurrent)
+  }
+  if (EXACT_ROWS[target.kind] === undefined) {
     return { accuracy: 'none', row: 'none', load: { status: 'nothing-to-load' }, expanded: false }
   }
 

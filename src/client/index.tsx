@@ -7,18 +7,19 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ReactElement } from 'react'
 import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { Context } from '@deepseek-ai/cordis'
-import { cacheBadgeDefinition, type CacheBadgeNodeData, type StepSample } from './cache-badge-node'
+import { cacheBricksDefinition, type CacheBricksNodeData, type StepSample } from './cache-bricks-node'
 import { badgeLogLine, badgeStatus, brickLabel, hasCacheFields, ttftMs } from './logic'
 import { CacheTetrisBoard } from './tetris-view'
 import type { Brick } from './tetris'
 import { locateResultOf, type RevealOutcome } from './reveal'
 import { BrickFeedClient } from './feed'
 import { BrickPanel, type JumpReport, type RawKind, type TranscriptState } from './panel'
-import { boardFromFeed, boardFromReadings, type BoardData, type StepReading } from './bricks'
+import { boardFromReadings, boardFromSources, type BoardData, type StepReading } from './bricks'
 import {
-  ensureTurnTranscriptLoaded, loadRequestForTurn, readTranscript, sessionFaceOf,
+  durableEvents, ensureTurnTranscriptLoaded, loadRequestForTurn, readTranscript, resolveHistoricalStep, sessionFaceOf,
   type LoadReport, type LoadRequest, type SessionFace,
 } from './navigation'
+import { replaySession } from '../core/replay'
 import { diffBricks } from '../shared/diff'
 import type { BrickFeed, BrickRecord } from '../shared/brick'
 
@@ -32,7 +33,7 @@ import type { BrickFeed, BrickRecord } from '../shared/brick'
 type ChatSelector = <T>(selector: (snapshot: ChatSnapshot) => T) => T
 
 /** The session seat delivers the Chat store selector (ui-chat's SessionStandardProps). */
-interface CacheBadgeBoardProps {
+interface CacheBricksBoardProps {
   useChat?: ChatSelector
   /** Session this seat belongs to (session-scoped seat), when the carrier provides it. */
   sessionId?: string
@@ -89,6 +90,37 @@ function loaderFor(sessionId: string | undefined): (request: LoadRequest) => Pro
   return async (request) => ensureTurnTranscriptLoaded(faceFor(sessionId), request)
 }
 
+/**
+ * The session's own log, folded into bricks — the board's historical source.
+ *
+ * The collector only ever sees this process, so a brick older than it used to lose its type, its
+ * lifecycle and its target. The log has held all of that all along; this reads it with the same
+ * observations the collector uses (`../core/replay`), so a replayed brick means what a live one
+ * means, minus the request capture the log never had.
+ *
+ * Memoised on the window it read: the durable window only grows when something *settles*, so a
+ * long answer costs one replay per step rather than one per chunk.
+ */
+let replayCache: { key: string; feed: BrickFeed } | undefined
+
+function replayOf(sessionId: string | undefined): BrickFeed | undefined {
+  if (sessionId === undefined || sessionId === '') return undefined
+  let face: SessionFace | undefined
+  try {
+    face = faceFor(sessionId)
+  } catch {
+    return undefined
+  }
+  if (face === undefined) return undefined
+  const events = durableEvents(face)
+  if (events.length === 0) return undefined
+  const key = `${sessionId}|${String(events.length)}|${String(events[0]!.seq)}|${String(events[events.length - 1]!.seq)}`
+  if (replayCache?.key === key) return replayCache.feed
+  const report = replaySession(sessionId, events)
+  replayCache = { key, feed: report.feed }
+  return report.feed
+}
+
 /** The session face for this board's session, resolved fresh on every call. */
 function faceFor(sessionId: string | undefined): SessionFace | undefined {
   try { return sessionFaceOf(ctxRef.current?.get('sessions'), sessionId) } catch { return undefined }
@@ -121,11 +153,11 @@ const providersWithCacheEvidence = new Set<string>()
 const unconfirmedNotified = new Set<string>()
 
 /** Every materialized Turn reading, oldest first (visible or hidden nodes). */
-function selectReadings(snapshot: ChatSnapshot): readonly CacheBadgeNodeData[] {
-  const turns: CacheBadgeNodeData[] = []
+function selectReadings(snapshot: ChatSnapshot): readonly CacheBricksNodeData[] {
+  const turns: CacheBricksNodeData[] = []
   for (const node of snapshot.nodes.values()) {
-    if (node.kind !== 'cache-badge') continue
-    const data = node.data as CacheBadgeNodeData | undefined
+    if (node.kind !== 'cache-bricks') continue
+    const data = node.data as CacheBricksNodeData | undefined
     if (data !== undefined) turns.push(data)
   }
   return turns.sort((left, right) => left.turn - right.turn)
@@ -150,7 +182,7 @@ function evidenceFor(sample: StepSample): boolean {
  * event feed per step, so the fold is a fallback with a different granularity — see
  * `./bricks` — and those reduced bricks make no claim about a transcript row.
  */
-function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
+function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
   // `useChat` arrives from ui-chat's SessionStandardProps merge. The guard is
   // invariant for a given seat (a carrier either delivers the face or never
   // does), so the hook order stays stable across renders.
@@ -208,7 +240,7 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
         ) {
           unconfirmedNotified.add(sample.provider)
           console.warn(
-            `[dsh-cache-badge] provider "${sample.provider}" returned usage without `
+            `[dsh-cache-bricks] provider "${sample.provider}" returned usage without `
             + 'cacheReadTokens/cacheWriteTokens; no cache field has been seen for it, so its steps '
             + 'show "n/a" instead of a percentage.',
           )
@@ -243,7 +275,12 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
     setNotice({
       state: outcome.accuracy === 'exact' ? 'success' : 'error',
       text: outcome.accuracy === 'exact'
-        ? `已定位：第 ${String(brick.turn)} 轮 · 第 ${String(brick.step)} 步`
+        // A folded brick lands on its **step**: say so, so a step-level landing is never read
+        // as "this is the request you clicked" (the board's dashes say it too, but the notice
+        // is what a reader actually reads).
+        ? brick.estimated === true
+          ? `已定位：第 ${String(brick.turn)} 轮 · 第 ${String(brick.step)} 步（历史折叠砖：step 级，不含 attempt）`
+          : `已定位：第 ${String(brick.turn)} 轮 · 第 ${String(brick.step)} 步`
         : outcome.fellBack === true
           // Reached, but the row is the same step's other half: say which half is missing
           // rather than reporting a miss that did not happen (or a success that is not one).
@@ -261,7 +298,7 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
       locate: locateResultOf(outcome),
     })
     console.info(
-      `[dsh-cache-badge] ${where}: ${outcome.accuracy} landing · locate=${locateResultOf(outcome).status}`
+      `[dsh-cache-bricks] ${where}: ${outcome.accuracy} landing · locate=${locateResultOf(outcome).status}`
       + `${detail === '' ? '' : ` (${detail})`}`,
     )
   }
@@ -292,6 +329,9 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
         setNotice({ state: 'loading', text: '正在定位这块砖对应的原对话…' })
       },
       load: loaderFor(sessionId),
+      // A folded brick names a step, not a row: ask the durable log which row that step
+      // became, once the jump has loaded the history the answer lives in.
+      resolve: (target) => resolveHistoricalStep(faceFor(sessionId), target),
       // The board repeats what it actually reached rather than upgrading a near miss to a
       // success: `exact` is the brick's own row, `context` the Turn header, `none` nothing.
       onRevealed: (brick, outcome) => { reporter.current(brick, outcome) },
@@ -307,15 +347,28 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
     }
   }, [sessionId])
 
-  // Bricks come from the collector when a host half is answering, and from the
-  // client's own per-step fold otherwise. Both produce the same board shape.
-  const collected = feed !== undefined && feed.sessionId === sessionId && feed.bricks.length > 0
-  const data: BoardData = collected ? boardFromFeed(feed) : boardFromReadings(readingsOf(turns))
+  // Three sources, merged rather than swapped: the collector knows this process's attempts
+  // and nothing older, a replay of the session's own log knows every attempt the client is
+  // holding, and the per-step fold is what is left for a core with no session face at all.
+  // A feed that answered with anything used to replace the history outright, so resuming an
+  // old session dropped every brick older than the collector — and the bricks it dropped were
+  // the ones that had a type and a row to go to. See `boardFromSources`.
+  const readings = readingsOf(turns)
+  const live = feed !== undefined && feed.sessionId === sessionId ? feed : undefined
+  const replayed = replayOf(sessionId)
+  const data: BoardData = live === undefined && replayed === undefined
+    ? boardFromReadings(readings)
+    : boardFromSources({
+      ...(live === undefined ? {} : { live }),
+      ...(replayed === undefined ? {} : { replay: replayed }),
+      readings,
+    })
 
   useEffect(() => {
     boardRef.current?.setColumns(data.columns, data.titles, data.aux)
-    // The board says so when it is showing folded steps instead of collected requests: a
-    // hundred outline bricks must never be readable as a hundred real ones.
+    // The notice is for a board that is *entirely* folded, where "one brick per step,
+    // no attempt telemetry" is true of every brick. In a mixed board the claim is per
+    // brick — the restored ones are drawn dashed — so a whole-board notice would lie.
     boardRef.current?.setEstimated(data.estimated === true)
   }, [sessionId, data.columns, data.titles, data.aux, data.estimated])
 
@@ -353,7 +406,7 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
       setTranscript(view === undefined ? { status: 'unavailable', report } : { status: 'ready', view, report })
     }).catch((error: unknown) => {
       if (!isCurrent()) return
-      console.warn('[dsh-cache-badge] preview read failed', error)
+      console.warn('[dsh-cache-bricks] preview read failed', error)
       // `seq` is optional under `exactOptionalPropertyTypes`: report the position only when
       // there is one, rather than carrying an explicit `undefined` into the panel's copy.
       setTranscript({
@@ -366,7 +419,7 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
   }, [sessionId, selected, previewReload, record?.settlementSeq, record?.settlement, record?.tools.length])
 
   const notification = notice === undefined ? null : (
-    <div role="status" aria-live="polite" data-cache-badge-notice={notice.state}
+    <div role="status" aria-live="polite" data-cache-bricks-notice={notice.state}
       style={{ position: 'fixed', top: '64px', right: '20px', zIndex: 1001, maxWidth: 'min(420px, 90vw)',
         padding: '10px 14px', borderRadius: '8px', background: 'var(--dsw-alias-bg-layer-1, #18202b)',
         color: 'var(--dsw-alias-label-primary, #e5e7eb)', boxShadow: '0 4px 20px #0004', fontSize: '13px' }}>
@@ -421,7 +474,7 @@ function CacheBadgeBoard(props: CacheBadgeBoardProps): ReactElement | null {
         void feedClientRef.current?.blob(ref).then((value) => {
           if (selectedRef.current !== key) return
           setRaw((current) => ({ ...current, [kind]: value }))
-        }).catch((error: unknown) => console.warn('[dsh-cache-badge] raw read failed', error))
+        }).catch((error: unknown) => console.warn('[dsh-cache-bricks] raw read failed', error))
       }}
       {...(feed === undefined ? {} : { store: feed.store })}
     />
@@ -452,7 +505,7 @@ function useFeed(sessionId: string | undefined): BrickFeed | undefined {
 }
 
 /** Map the client-side per-step fold onto the fallback brick source. */
-function readingsOf(turns: readonly CacheBadgeNodeData[] | undefined): StepReading[] {
+function readingsOf(turns: readonly CacheBricksNodeData[] | undefined): StepReading[] {
   const readings: StepReading[] = []
   for (const data of turns ?? []) {
     for (const sample of data.steps) {
@@ -479,7 +532,7 @@ function readingsOf(turns: readonly CacheBadgeNodeData[] | undefined): StepReadi
 }
 
 /**
- * Services required by the cache-badge browser half.
+ * Services required by the cache-bricks browser half.
  *
  * Only `slots` is a hard dependency (always present on the web surface). The
  * conversation-node registry — where a node Definition is registered — is
@@ -496,14 +549,14 @@ function readingsOf(turns: readonly CacheBadgeNodeData[] | undefined): StepReadi
 export const inject = ['slots']
 
 /** The register-capable Definition registry surface the badge Definition needs. */
-interface CacheBadgeRegistry {
+interface CacheBricksRegistry {
   register(definition: unknown): () => void
 }
 
 /** Structural registry read across the two core service names. */
-function registerCacheBadgeDefinition(
+function registerCacheBricksDefinition(
   ctx: Context,
-  registerAt: (registry: CacheBadgeRegistry) => void,
+  registerAt: (registry: CacheBricksRegistry) => void,
 ): void {
   const readService = (name: string): unknown => {
     try {
@@ -512,14 +565,14 @@ function registerCacheBadgeDefinition(
       return undefined
     }
   }
-  const asRegistry = (value: unknown): CacheBadgeRegistry | undefined => {
+  const asRegistry = (value: unknown): CacheBricksRegistry | undefined => {
     if (value === null || typeof value !== 'object') return undefined
     const node = value as { register?: (definition: unknown) => () => void; events?: unknown }
-    if (typeof node.register === 'function') return node as CacheBadgeRegistry
+    if (typeof node.register === 'function') return node as CacheBricksRegistry
     const events = node.events
     if (events !== null && typeof events === 'object') {
       const eventsNode = events as { register?: (definition: unknown) => () => void }
-      if (typeof eventsNode.register === 'function') return eventsNode as CacheBadgeRegistry
+      if (typeof eventsNode.register === 'function') return eventsNode as CacheBricksRegistry
     }
     return undefined
   }
@@ -527,7 +580,7 @@ function registerCacheBadgeDefinition(
     ?? asRegistry(readService('conversationEvents'))
   if (registry === undefined) {
     console.warn(
-      '[dsh-cache-badge] conversation-node registry unavailable; the brick board is disabled. '
+      '[dsh-cache-bricks] conversation-node registry unavailable; the brick board is disabled. '
       + 'Expected the registry on browser service uiConversation.events (or legacy conversationEvents).',
     )
     return
@@ -546,17 +599,17 @@ export function apply(ctx: Context): void {
   let definitionRegistered = false
   ctx.slots.inject('conversation.chat.node', () => {
     if (!definitionRegistered) {
-      registerCacheBadgeDefinition(ctx, (registry) => {
+      registerCacheBricksDefinition(ctx, (registry) => {
         try {
-          const dispose = registry.register(cacheBadgeDefinition)
+          const dispose = registry.register(cacheBricksDefinition)
           // The Definition is owned by the registry's core context; tie the
           // disposer to this fiber so an unload/reload does not leave a stale
-          // `cache-badge` Definition that makes the next run throw
+          // `cache-bricks` Definition that makes the next run throw
           // "already registered".
           ctx.effect(() => dispose)
           definitionRegistered = true
         } catch (error) {
-          console.warn('[dsh-cache-badge] failed to register the badge node; the brick board is disabled.', error)
+          console.warn('[dsh-cache-bricks] failed to register the badge node; the brick board is disabled.', error)
         }
       })
     }
@@ -570,7 +623,7 @@ export function apply(ctx: Context): void {
   // because no seat exists in the blank gutter beside it.
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
     name: 'conversation.composer.dock',
-    id: 'cache-badge',
+    id: 'cache-bricks',
     order: 1,
-  }, CacheBadgeBoard))
+  }, CacheBricksBoard))
 }

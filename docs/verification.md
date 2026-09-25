@@ -1,62 +1,166 @@
 # Verification record
 
-Evidence that the attempt-level black box works, from five layers that check
-different things. Each layer exists because the one below it could not catch what
-it catches.
+> **This record began with `dsh-cache-bricks` 0.1.0**, a new project whose code and verification record start from
+> `dsh-cache-badge` 1.7.2 (frozen, unchanged, with its own package id). The name,
+> the package id and the version line are new; the brick contract, the data model and the three
+> fixes below are inherited verbatim, and the 0.1 gate at the top of this file is their
+> re-measurement.
+>
+> For whoever reads this later, the three defects that shaped that code: the collector's feed used
+> to *replace* the folded history (1.7.2-a), a folded brick could not be opened in the conversation
+> (1.7.2-a, `historical-step`), and history had no type because the log was read by a poorer reader
+> than the live path (1.7.2-c, `src/core/replay.ts`).
 
-## 1.7.1 — the click/navigation repair, and what is still owed
+## 0.1.2 — public GitHub distribution
 
-`1.7.1-clickfix.1` was an uploaded patch to the client half (single click previews the
-conversation and reads its log; double click locates and highlights; six client files). It was
-reviewed here against the real source, and **three defects in it were fixed before freezing as
-`1.7.1`**:
+The 0.1.2 release starts from the `v0.1.1` stable commit. No `src/` runtime implementation changed. The changes are distribution and documentation: the package version, exact `0.1.7-rc.2` DSH client peer range, prebuilt `lib/` files, portable verification-script defaults, synthetic release screenshots, and a GitHub-only release workflow.
 
-1. **It did not type-check.** The package was produced with transpile-only tooling; under this
-   repo's `exactOptionalPropertyTypes` the read-failure report passed `seq: number | undefined`
-   into an optional field. (`src/client/index.tsx`.)
-2. **It deleted a documented fallback.** `findRow` had been changed from "prefer the half the
-   attempt began in, otherwise the step's other half" to a hard filter. A reasoning brick whose
-   reasoning half the host does not draw could then no longer be located at all, even with its
-   step on screen. Now: the reveal loop only ever accepts the brick's own half; **after** the
-   whole settle budget, if that half was never rendered, the step's other half is reached and
-   reported as `step-other-half` — `context`, never `exact`, never highlighted, and the notice
-   says which half was missing instead of claiming a miss or a success.
-3. **The screen-reader label lost the Turn number** ("double click locates" without saying
-   where). Restored: `定位到第 N 轮并高亮`.
+On the 0.1.2 release checkout:
 
-The first version of fix (2) was itself wrong and is worth recording: it gave up on the declared
-half after one 50 ms tick, which turned this patch's own "reasoning mounts 850 ms late" case
-into a fallback on the visible response row — measured, not theorised (the patch's browser check
-`Later reasoning mount is not replaced by earlier visible response` timed out). The budget is now
-always spent before "never rendered" is concluded.
+- `pnpm install --frozen-lockfile` and `pnpm run typecheck` succeeded;
+- `pnpm run build` produced the host, client, invariant, and type artifacts;
+- `pnpm test` passed **367 tests, 2 skipped** across 23 files;
+- `pnpm run verify:host` passed all built-host checks;
+- `node scripts/test-scroll.mjs --shot <directory> --showcase` passed **47/47** in Chromium with React 18 and synthetic DSH services. The two public screenshots are cropped from this synthetic run, not a private conversation.
 
-**Verified before the freeze**
+The live 0.1.7-rc.2 instance was still running 0.1.1 during this packaging work. Its live behavior is recorded below; a separate full live UI run against the 0.1.2 package was not performed. The 0.1.2 support scope is rc.2 only. Historical 0.1.6-alpha.1 contract comparisons below do not extend that support scope.
 
-| Layer | Result |
-|---|---|
-| `pnpm run typecheck` | clean (the patch as uploaded was not) |
-| `pnpm run test` | **316 passed | 2 skipped** — the 10 tests encoding the old interaction contract were updated, 4 new ones pin the new behaviour (own-half preference, the other-half fallback, "never exact", the panel's rendering of it) |
-| `pnpm run build` | 84.03 kB client bundle; comments and host half intact |
-| `node scripts/verify-host-artifact.mjs` | **31 checks**, all passed (`lib/index.js` is byte-identical to the 1.7.0 build, SHA-256 `58ad4ffa…` — the patch does not touch the collector, so no host restart) |
-| `pnpm run check:contracts` | 0.1.6-alpha.1 vs 0.1.7-rc.2: every member identical |
-| `node scripts/test-clickfix.mjs` (the patch's own suite) | **29/29** in real Chromium + React 18 (mocked DSH services) |
-| `pnpm run verify:live` | green on the live instance: 10,193 messages carried, 234 stored (97.7% shared), tools hash constant, TTFT measured, no request stores a message it already shared |
-| `pnpm run verify:ui` | **partially run and then stopped at the operator's request.** It had reached the interaction checks that matter most here — census 48 bricks (45 with a row, 0 needing a group opened, 0 unlocatable), `one click opens the record and does not move the conversation` ✓ — before being cancelled, so the real-instance pass is **not** complete |
+## 0.1.1 — stable
 
-**Still owed (the honest list)**
+This is the line's first **stable** release: the brick contract, the data model and the rendering
+rules are frozen here, and anything after it starts at 0.1.2 and has to justify itself against this
+record.
 
-- A full real-instance `verify:ui` against the frozen bundle, in particular the two checks that
-  changed with this contract: `selecting a brick reads its conversation without a second click`
-  and `a single click previews without marking a row`, plus the promise that survives unchanged —
-  `reading the conversation leaves the chat where it was`. The patch's own author flagged the
-  same gap: whether the real host holds its viewport while `loadThrough` prepends history is
-  only observable on a live instance.
-- The preview pages back up to 24 times to reach a Turn's start; on a very long Turn that is a
-  lot of history to prepend at once, and the viewport behaviour in that case is the one thing
-  the mocked fixture cannot exercise.
-- The locale is now mixed: the new tab `对话` and the two buttons/notices are Chinese while the
-  other seven tabs and the diagnostic rows stay English. Deliberately left as the patch author
-  wrote it, pending a decision.
+What it contains, in one place:
+
+- the identity of a new project (`dsh-cache-bricks`, plugin id `cache-bricks`, `/cache-bricks/*`
+  routes, `data-cache-bricks-*` DOM attributes, `[dsh-cache-bricks]` logs), cut from
+  `dsh-cache-badge` 1.7.2 and independent of it;
+- three inherited fixes: the collector's feed **joins** the replayed history per attempt, history
+  bricks are **navigable** (`historical-step` and, from the replay, attempt-exact targets), and
+  history **has a type** because the session log is folded by the same observations the live tap
+  uses (`src/core/replay.ts`, three provenances `host` / `replay` / `client`);
+- the palette from 0.1.0.a: **amber below 90%, red below 70%**, with the critical wording moved off
+  "the cache was rebuilt" (a false diagnosis at 43%, which is red now).
+
+Re-measured on this exact commit, so the stable claim is not inherited on faith:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **367 passed, 2 skipped** in 23 files;
+- `pnpm run test:scroll` — **47/47** in a real browser, including the palette check that drives
+  99% / 85% / 60% through the real mapping and asserts the three tone materials reach the pixels;
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `pnpm run check:contracts` — the client contract is member-identical across the two cores;
+- live on :18090 (the new package is what the instance serves: `/cache-bricks/*` 200,
+  `/cache-badge/*` 404): the board renders, the type face is painted for reconstructed history, and
+  no page error is raised. No amber or red brick exists on this machine's data to point at — the
+  lowest cache read in any session log is 99.7% — which is why the palette is verified against
+  fixtures and pinned boundaries rather than against a live low-cache step.
+
+## 0.1.0.a — the palette answers sooner
+
+The tone boundaries move from **red below 10% / amber below 80%** to **red below 70% / amber below
+90%** (`CRITICAL_BELOW`, `WARN_BELOW` in `src/client/logic.ts`).
+
+That is not a cosmetic shift, and the constants say why: at 10% only a rebuilt cache could reach
+red, so red *meant* "the prefix was thrown away". At 70% red means "this call re-billed most of its
+prompt" — a 30% loss on a 400k prompt is 120k tokens at full price, and it used to be painted amber
+and scrolled past. Amber moves with it for the same reason: a tenth of a long prefix re-billed is
+the tail this board exists to watch.
+
+The wording moved with the thresholds: the critical reason is now "most of the prefix was
+re-billed" rather than "the cache was rebuilt", which would be a false diagnosis at 43% — and 43%
+is red now.
+
+Boundaries are pinned on both sides, in `tests/logic.spec.ts`: 69.9% red / 70% amber / 89.9% amber
+/ 90% green, with the earlier cases re-stated (a 43% hit is red rather than a warning). The
+`minor` floor is untouched: a prompt under 1,000 tokens stays grey whatever its ratio, so the new
+red cannot be diluted by tiny steps.
+
+The browser suite now exercises the mapping end to end rather than only the table: the fixture's
+three steps carry 99% / 85% / 60%, so they travel the real path (ratio -> `badgeStatus` -> tone ->
+fill), and one new check asserts the three tone materials actually reach the pixels
+(`rgba(34, 197, 94, 0.18)` / `rgba(234, 179, 8, 0.85)` / `rgb(220, 38, 38)`). Screenshots of that
+board are in the record's companion run: green floor row, amber middle row, red stack above it.
+
+Gate: `pnpm run typecheck` clean; `pnpm test` **367 passed, 2 skipped**; `pnpm run test:scroll`
+**47/47** (was 46 — the palette check is the new one); `pnpm run verify:host` all checks passed;
+`pnpm run build` clean.
+
+Worth recording for whoever looks for a red brick on this machine and does not find one: the local
+workload's cache reads are 99.7% at their **lowest** (15 live bricks, and no step under 70% in any
+session log), so the new bands have no real data here. The palette is therefore verified against
+fixtures and boundaries, not against a live red brick.
+
+## 0.1.0 — the new project's gate
+
+This is the re-measurement of the inherited code under the new name, id and version line. Nothing
+in the sources changed except the identity (`dsh-cache-badge` -> `dsh-cache-bricks`, the plugin id,
+the route namespace, the DOM attribute prefix and the log prefix), so a green gate here means the
+rename did not cost anything.
+
+- `pnpm run typecheck` clean;
+- `pnpm test`: **360 passed, 7 skipped** in 23 files. The skips are the checks that talk to a
+  running instance, and they skip for a reason worth recording: the instance on :18090 is still
+  the **frozen** `dsh-cache-badge` (it was composed at startup), so `/cache-bricks/*` answers 404
+  until this package is installed and `dsh web` restarts. The offline half of that check — the
+  replay against the newest real session log — runs and passes:
+  **2061 events -> 311 bricks, 0 unattributed, types `tool/mixed/output/reasoning`, targets
+  `assistant-step`/`tool-call`, 8 ended Turns**;
+- `pnpm run test:scroll`: **46/46** in a real browser (the window, the rails, the printed readings);
+- `pnpm run verify:host`: all checks passed on the built artifact (fake ctx, a replayed session with
+  a retry, read back through the plugin's own route);
+- `pnpm run check:contracts`: the client contract is still member-identical across the two cores;
+- `pnpm run build`: `lib/client.js` 123.76 kB (gzip 36.92), `lib/index.js` 78.05 kB (gzip 22.00).
+
+## 1.7.2-c — historical brick reconstruction
+
+The third defect in the same seam, and the one that made the other two worth generalising: a brick
+older than the collector had no **type**. Not because the session log lacked the activity — it
+carries the settled attempt's whole compact stream — but because the browser folded the log down to
+per-step usage readings, and the board painted every folded brick as a blank dashed placeholder.
+
+So the fold itself was shared instead of re-implemented: `observe.ts`, `brick-ledger.ts` and
+`blob-store.ts` moved to `src/core/` (they were always pure — no DSH imports, no IO), and
+`src/core/replay.ts` runs the collector's own observations over a session's durable events.
+
+Reconstructed per attempt, from the log alone: usage and the three cache buckets, reasoning/text/tool
+counters off the compact stream's runs, tool call ids/arguments/results, retry chains and attempt
+ordinals, the finish reason, the settlement `seq` — and therefore the **activity type**, the
+**lifecycle** and an **attempt-exact navigation target**. Not reconstructed, and reported as absent:
+the outgoing request and its message hashes, the dispatch-time context snapshot, the provider's raw
+request, and the dispatch instant (a replayed TTFT is measured from `step/start`).
+
+The board now merges three sources per attempt — live collector, replayed log, per-step fold — and
+`BrickRecord.observedBy` carries `host` / `replay` / `client`, which the panel reports verbatim and
+the faces paint differently (solid / dimmed solid / dashed placeholder).
+
+Verification:
+
+- `pnpm run typecheck` clean; **365 tests in 22 files** (was 356 in 21). `tests/replay-log.spec.ts`
+  holds both layers: fixtures that pin the semantics (a retried step becomes two bricks with the
+  chain's row; the compact stream's runs are counted once; a settlement that names no step is
+  counted rather than guessed at) and a check against the newest real session under
+  `DSH_SESSION_ROOT`;
+- that real-log check, on this machine's newest session: **1725 events -> 257 bricks, 0
+  unattributed, types `tool/mixed/output/reasoning`, targets `assistant-step/tool-call`, 6 ended
+  Turns** — the same input the per-step fold turned into one type with no row to go to;
+- `pnpm run test:scroll` still **46/46** (the window, the rails and the printed readings against
+  the rewritten merge), and `pnpm run verify:host` / `check:contracts` unchanged;
+- live 18090, session `e7166b4f` (collector state long gone, feed empty): the board shows **10
+  bricks, 0 dashed, 0 placeholders, 0 page errors**, labels in one decimal, and every brick's
+  accessible name reads "reconstructed from the session log (one brick per settled attempt; no
+  request capture)". Flipping the board with its own control shows the **activity face painted** —
+  purple Model bricks, orange Tool bricks and the purple/orange split — where the fold produced a
+  wall of `~`;
+- the same session, double-clicking a **replayed** brick: `exact` landing on
+  `14:assistant-step55:1` (part `reasoning`), reported as "已定位：第 55 轮 · 第 1 步" with no
+  step-level qualifier, because the replayed brick really is that attempt.
+
+**What the client costs now:** `lib/client.js` grew 98.78 kB -> 123.71 kB (gzip 29.31 -> 36.93 kB),
+which is the price of the shared fold running in the browser. It is memoised on the durable window,
+and that window only grows when something settles — a long answer costs one replay per step, not one
+per chunk.
 
 ## 0. rc.2 re-verification (2026-09-24)
 
@@ -310,7 +414,7 @@ Isolation evidence (all on 0.1.7-rc.1, this instance):
 | **the harness's own Turn navigator** to the same turn | the same error, the same missing rows |
 | the same navigator with this plugin's Definition **unregistered** | identical — so the plugin is not the cause |
 
-`host-patches/system-message-never-withdraw/` carries the minimal fix and its evidence:
+The local `host-patches/system-message-never-withdraw/` experiment (not included in this public repository) carried the minimal fix and its evidence:
 
 - `patch.mjs` — idempotent, `.orig` backup, three invariants mirroring the sibling Definition
   (never materialized + invisible → `null`; materialized + invisible → same key, hidden;
@@ -335,18 +439,18 @@ With the patch applied, the same live checks read:
 | Instance | State |
 |---|---|
 | 017 (**0.1.7-rc.2**) | Installed, both halves active, re-verified above — including the two-sided board and the click-to-jump in a real browser. Client bundle rev served from `lib/client.js`; host half loaded at boot. **The host half in the running process predates the rc.2 sync** (it was loaded before the rebuild), so `toolHistory` capture, the per-kind prefix baseline and the excluded-mark checks take effect on the next `dsh web` start; the client half is picked up by a page reload. |
-| daily (0.1.6-alpha.1) | **Installed but not running.** The profile pins `link:<PLUGIN_PATH>`, `dsh.profile.bundles` ends with it, and the symlink resolves. Its host half activates on the instance's next start; the client half needs no further work. |
+| daily (0.1.6-alpha.1) | **Historical check only; unsupported in 0.1.2.** At the time of this check, a local checkout link was installed but the instance was not running. No complete live UI run was recorded on this version. |
 
 The two-sided board, the type labels and the click-to-jump are **client-half only**,
 so `pnpm run build` is enough for a running instance to pick them up. The rc.2 sync changed
 **both** halves — the collector gained the tool-history capture and the per-kind prefix
 baseline — so that round needs a `dsh web` restart to be live.
 
-To verify daily once it is up (the same checks, different port):
+Historical commands for a separate 0.1.6-alpha.1 instance (outside 0.1.2 support):
 
 ```sh
-node scripts/live-verify.mjs --port 18083 --home '<DSH_HOME_DAILY>'
-node scripts/ui-verify.mjs --port 18083 --home '<DSH_HOME_DAILY>'
+node scripts/live-verify.mjs --port 18083 --home /path/to/dsh-home
+node scripts/ui-verify.mjs --port 18083 --home /path/to/dsh-home
 node -e "process.env.DSH_LIVE_PORT='18083'" && pnpm exec vitest run tests/panel-live.spec.ts
 ```
 

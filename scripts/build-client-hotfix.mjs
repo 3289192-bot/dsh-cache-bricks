@@ -45,7 +45,7 @@ const entryId = visit(entry)
 const table = [...modules].map(([id,body]) => `${JSON.stringify(id)}: (module, exports, load, external) => {\n${body}\n}`).join(',\n')
 const body = `const factories={${table}};const cache=Object.create(null);function load(id){if(cache[id])return cache[id].exports;const m={exports:{}};cache[id]=m;factories[id](m,m.exports,load,external);return m.exports;}`
 mkdirSync(resolve(root,'lib'), {recursive:true})
-writeFileSync(resolve(root,'lib/client.js'), `/* dsh-cache-badge 1.7.1-clickfix.1; browser-only hotfix */\nwindow.__ModuleLoader__.load({id:"dsh-cache-badge",factory:(external)=>{${body}return load(${JSON.stringify(entryId)});}});\n`)
+writeFileSync(resolve(root,'lib/client.js'), `/* dsh-cache-bricks 1.7.1-clickfix.1; browser-only hotfix */\nwindow.__ModuleLoader__.load({id:"dsh-cache-bricks",factory:(external)=>{${body}return load(${JSON.stringify(entryId)});}});\n`)
 if (process.env.DSH_TEST_BUNDLE) writeFileSync(process.env.DSH_TEST_BUNDLE, `window.__brickModules=((external)=>{${body}return load;})(id=>window.__testExternals[id]);\n`)
 for (const [path, data] of declarations) { mkdirSync(dirname(path), {recursive:true}); writeFileSync(path,data) }
 console.log(`Built browser bundle: ${modules.size} local modules; externals: ${[...external].join(', ')}. Host artifact was not rebuilt.`)

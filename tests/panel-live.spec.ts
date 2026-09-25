@@ -28,11 +28,11 @@ const HOME = process.env.DSH_LIVE_HOME ?? join(homedir(), '.dsh-017')
 async function liveFeed(): Promise<BrickFeed | undefined> {
   try {
     const cookie = await liveCookie(BASE, HOME)
-    const list = await liveGet(BASE, '/cache-badge/sessions', cookie) as { sessions?: string[] } | undefined
+    const list = await liveGet(BASE, '/cache-bricks/sessions', cookie) as { sessions?: string[] } | undefined
     if (list === undefined) return undefined
     let best: BrickFeed | undefined
     for (const sessionId of list.sessions ?? []) {
-      const feed = await liveGet(BASE, `/cache-badge/attempts?sessionId=${encodeURIComponent(sessionId)}`, cookie) as BrickFeed | undefined
+      const feed = await liveGet(BASE, `/cache-bricks/attempts?sessionId=${encodeURIComponent(sessionId)}`, cookie) as BrickFeed | undefined
       if (feed === undefined) continue
       if (best === undefined || feed.bricks.length > best.bricks.length) best = feed
     }

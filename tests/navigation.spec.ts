@@ -18,6 +18,7 @@ import {
   loadRequestForTurn,
   loadRequestOf,
   readTranscript,
+  resolveHistoricalStep,
   sessionFaceOf,
   type SessionFace,
   type WindowSnapshot,
@@ -257,5 +258,82 @@ describe('readTranscript: the conversation, from the session’s own log', () =>
 
   it('refuses a compaction, which belongs to no turn', () => {
     expect(readTranscript(face({ window: stepWindow() }), 0, 0, 57)).toBeUndefined()
+  })
+})
+
+describe('resolving a folded step against the durable log', () => {
+  /** One Turn with four steps: a thinking one, a tool-only one, a retried one, a silent one. */
+  const log = (): WindowSnapshot => window([
+    { type: 'turn/start', seq: 100, data: { turn: 4 } },
+    { type: 'step/start', seq: 101, data: { turn: 4, step: 1 } },
+    {
+      type: 'assistant/message',
+      seq: 102,
+      data: {
+        turn: 4,
+        step: 1,
+        message: { content: [{ type: 'reasoning', text: 'weighing it' }, { type: 'text', text: 'here is why' }] },
+      },
+    },
+    { type: 'step/start', seq: 103, data: { turn: 4, step: 2 } },
+    { type: 'tool/call', seq: 104, data: { turn: 4, step: 2, callId: 'call_9', name: 'bash', arguments: '{}' } },
+    { type: 'tool/result', seq: 105, data: { message: { toolCallId: 'call_9', content: [{ type: 'text', text: 'ok' }] } } },
+    { type: 'step/start', seq: 106, data: { turn: 4, step: 3 } },
+    { type: 'llm/retry', seq: 107, data: { turn: 4, step: 3, retryId: 'r-7', retry: 1, delayMs: 500 } },
+    { type: 'step/start', seq: 108, data: { turn: 4, step: 4 } },
+    { type: 'assistant/attempt', seq: 109, data: { turn: 4, step: 4, stream: [] } },
+  ])
+
+  it('sends a thinking step to its reasoning half and a speaking step to its response half', () => {
+    // Acceptance case ②: the ordinary answer. Which half is decided by what the step actually
+    // contains — the same rule the collected path uses — so the two paths cannot disagree.
+    const face_ = face({ window: log() })
+    expect(resolveHistoricalStep(face_, { kind: 'historical-step', turn: 4, step: 1, loadSeq: 102 }))
+      .toEqual({ kind: 'assistant-step', turn: 4, step: 1, part: 'reasoning', loadSeq: 102 })
+
+    const spoke = face({ window: window([
+      { type: 'turn/start', seq: 100, data: { turn: 4 } },
+      { type: 'step/start', seq: 101, data: { turn: 4, step: 1 } },
+      {
+        type: 'assistant/message',
+        seq: 102,
+        data: { turn: 4, step: 1, message: { content: [{ type: 'text', text: 'only an answer' }] } },
+      },
+    ]) })
+    expect(resolveHistoricalStep(spoke, { kind: 'historical-step', turn: 4, step: 1, loadSeq: 102 }))
+      .toEqual({ kind: 'assistant-step', turn: 4, step: 1, part: 'response', loadSeq: 102 })
+  })
+
+  it('sends a tool-only step to the call the log recorded, by call id', () => {
+    // Acceptance case ③: no assistant row exists for this step; the call id is the only thing
+    // that can name its row, and it comes from the durable `tool/call` event.
+    const resolved = resolveHistoricalStep(face({ window: log() }), { kind: 'historical-step', turn: 4, step: 2, loadSeq: 104 })
+    expect(resolved).toEqual({ kind: 'tool-call', turn: 4, step: 2, callId: 'call_9', loadSeq: 104 })
+  })
+
+  it('sends a retried step to the retry chain, and never to a neighbouring step', () => {
+    // Acceptance case ④: the retry schedule is durable, so the scene that holds both attempts
+    // together is reachable without any collector state — and step 3 stays step 3.
+    const resolved = resolveHistoricalStep(face({ window: log() }), { kind: 'historical-step', turn: 4, step: 3, loadSeq: 107 })
+    expect(resolved).toEqual({ kind: 'retry-chain', turn: 4, step: 3, retryId: 'r-7', loadSeq: 107 })
+    expect(resolved).not.toMatchObject({ step: 2 })
+    expect(resolved).not.toMatchObject({ step: 4 })
+  })
+
+  it('offers no row for a step that produced neither a message nor a call', () => {
+    // An attempt that settled with nothing to show. The reveal lands on the Turn and says
+    // `context`; this function's job is to refuse to name a row that does not exist.
+    expect(resolveHistoricalStep(face({ window: log() }), { kind: 'historical-step', turn: 4, step: 4, loadSeq: 109 }))
+      .toBeUndefined()
+  })
+
+  it('leaves the log position off when the fold measured no position', () => {
+    const resolved = resolveHistoricalStep(face({ window: log() }), { kind: 'historical-step', turn: 4, step: 1 })
+    expect(resolved).toEqual({ kind: 'assistant-step', turn: 4, step: 1, part: 'reasoning' })
+  })
+
+  it('says nothing at all without a session face, instead of guessing from the DOM', () => {
+    expect(resolveHistoricalStep(undefined, { kind: 'historical-step', turn: 4, step: 1, loadSeq: 102 }))
+      .toBeUndefined()
   })
 })

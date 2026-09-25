@@ -8,7 +8,7 @@
  * deliberate edit to this file.
  */
 import { describe, expect, it } from 'vitest'
-import { BrickLedger, type Observation } from '../src/host/brick-ledger'
+import { BrickLedger, type Observation } from '../src/core/brick-ledger'
 import { boardFromFeed, boardFromReadings, targetOf } from '../src/client/bricks'
 import { accuracyOf, type BrickTarget } from '../src/client/target'
 import { EMPTY_COUNTERS, deriveMetrics } from '../src/shared/metrics'
@@ -75,14 +75,15 @@ describe('a brick is one dispatched request', () => {
 })
 
 describe('the client fold never claims to be a request', () => {
-  it('marks its bricks estimated and gives them no target', () => {
+  it('marks its bricks estimated, and aims them at the step rather than an attempt', () => {
     const data = boardFromReadings([
-      { turn: 3, step: 7, tone: 'good', label: '99%', ended: true, usage: { inputTokens: 10, cacheReadTokens: 90 } },
+      { turn: 3, step: 7, tone: 'good', label: '99%', ended: true, usage: { inputTokens: 10, cacheReadTokens: 90 }, seq: 42 },
     ])
     expect(data.estimated).toBe(true)
     const [brick] = data.columns[0]!.bricks
     expect(brick?.estimated).toBe(true)
-    expect(brick?.target).toEqual({ kind: 'none', reason: 'client-fold' })
+    // Step-exact, not attempt-exact: the fold measured a step, and that is all it may claim.
+    expect(brick?.target).toEqual({ kind: 'historical-step', turn: 3, step: 7, loadSeq: 42 })
     // And it does not pretend to carry an auxiliary call either.
     expect(data.aux).toEqual([])
   })

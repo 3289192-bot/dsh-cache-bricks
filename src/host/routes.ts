@@ -104,11 +104,11 @@ function json(response: RouteResponseLike, status: number, body: unknown): void 
  * @param deps - ledger access.
  * @returns a handler suitable for `webServer.register`, plus the path it serves.
  */
-export function createCacheBadgeRouter(deps: RouterDeps, options: RouterOptions = {}): {
+export function createCacheBricksRouter(deps: RouterDeps, options: RouterOptions = {}): {
   readonly path: string
   readonly handler: (request: RouteRequestLike, response: RouteResponseLike) => void
 } {
-  const path = options.basePath ?? '/cache-badge'
+  const path = options.basePath ?? '/cache-bricks'
   const handler = (request: RouteRequestLike, response: RouteResponseLike): void => {
     // The harness's policy first: it is the same one /api uses, so this route is
     // exactly as reachable as the rest of the GUI and no more.

@@ -170,10 +170,10 @@ describe('BrickPanel', () => {
   it('names which half produced the brick, so the source is never a guess', () => {
     const host = render({ record: record({ observedBy: 'host' }) })
     expect(host).toContain('host feed')
-    expect(host).toContain('data-cache-badge-source="host"')
+    expect(host).toContain('data-cache-bricks-source="host"')
     const client = render({ record: record({ observedBy: 'client', request: {}, context: undefined, raw: {} }) })
     expect(client).toContain('client fold')
-    expect(client).toContain('data-cache-badge-source="client"')
+    expect(client).toContain('data-cache-bricks-source="client"')
     // A record from a build that predates the marker still reads as host-collected.
     expect(render({ record: record() })).toContain('host feed')
   })
@@ -216,7 +216,7 @@ describe('BrickPanel', () => {
         locate: { status: 'step-other-half', row: 'assistant-step', element },
       },
     })
-    expect(markup).toContain('data-cache-badge-locate="step-other-half"')
+    expect(markup).toContain('data-cache-bricks-locate="step-other-half"')
     expect(markup).toContain('Chat projection')
     expect(markup).toContain('~ assistant-step: the other half')
     expect(markup).not.toContain('✓ assistant-step')

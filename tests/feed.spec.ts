@@ -47,15 +47,15 @@ class FakeEventSource {
 
 describe('documentRelative', () => {
   it('resolves against the page base, so a mounted proxy keeps working', () => {
-    expect(documentRelative('cache-badge/attempts', 'http://127.0.0.1:18090/'))
-      .toBe('http://127.0.0.1:18090/cache-badge/attempts')
+    expect(documentRelative('cache-bricks/attempts', 'http://127.0.0.1:18090/'))
+      .toBe('http://127.0.0.1:18090/cache-bricks/attempts')
     // Served under a prefix-stripping mount: the route must follow the mount.
-    expect(documentRelative('cache-badge/attempts', 'http://host/prefix/app/'))
-      .toBe('http://host/prefix/app/cache-badge/attempts')
+    expect(documentRelative('cache-bricks/attempts', 'http://host/prefix/app/'))
+      .toBe('http://host/prefix/app/cache-bricks/attempts')
   })
 
   it('does not fall over when there is no document', () => {
-    expect(documentRelative('cache-badge/attempts', '')).toBe('http://localhost/cache-badge/attempts')
+    expect(documentRelative('cache-bricks/attempts', '')).toBe('http://localhost/cache-bricks/attempts')
   })
 })
 
@@ -72,7 +72,7 @@ describe('BrickFeedClient', () => {
     client.start('s1', (next) => seen.push(next))
     await vi.waitFor(() => { expect(seen).toHaveLength(1) })
     expect(client.state).toBe('live')
-    expect(fetchImpl.mock.calls[0]![0]).toBe('http://127.0.0.1:18090/cache-badge/attempts?sessionId=s1')
+    expect(fetchImpl.mock.calls[0]![0]).toBe('http://127.0.0.1:18090/cache-bricks/attempts?sessionId=s1')
 
     // A live frame replaces the snapshot.
     const source = FakeEventSource.instances.at(-1)!
@@ -118,7 +118,7 @@ describe('BrickFeedClient', () => {
     const client = new BrickFeedClient({ baseUri: 'http://x/', fetchImpl })
     expect(await client.blob('abc')).toEqual({ messages: ['hi'] })
     expect(await client.blob('gone')).toBeUndefined()
-    expect(calls.every((url) => url.startsWith('http://x/cache-badge/blob?'))).toBe(true)
+    expect(calls.every((url) => url.startsWith('http://x/cache-bricks/blob?'))).toBe(true)
   })
 
   it('stops following when asked', async () => {

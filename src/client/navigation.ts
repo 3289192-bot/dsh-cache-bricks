@@ -31,7 +31,7 @@
  * Everything is structural and injectable — the plugin imports none of these packages at
  * runtime — so the whole strategy is testable without a browser.
  */
-import type { BrickTarget } from './target'
+import type { BrickTarget, HistoricalStepTarget } from './target'
 
 /** One entry of the session's contiguous event window. */
 export interface WindowEntry {
@@ -337,6 +337,56 @@ export interface TranscriptView {
   readonly covers: boolean
   /** True when the beginning of the turn is present in the window. */
   readonly loaded: boolean
+}
+
+/** The rows a folded step can resolve to: the three that name a place in a Turn. */
+type ResolvedStepRow = Extract<BrickTarget, { kind: 'assistant-step' | 'tool-call' | 'retry-chain' }>
+
+/**
+ * What a folded step actually became, read from the durable log.
+ *
+ * A folded brick knows its `(turn, step)` and the log position it was measured from — and the
+ * session's own log is the authority on what happened there. So the question "where does this
+ * brick go?" is answerable without any collector state: load that position, read the step, and
+ * land on the row it produced. The decision mirrors `targetOf` for collected records, on
+ * purpose — the two paths must not disagree about which row a step with a message, a call and a
+ * retry belongs to:
+ *
+ * 1. a retry chain wins, because that is the only row that shows the attempts together;
+ * 2. otherwise the message's own half: reasoning if the step thought, response if it only spoke;
+ * 3. otherwise the first tool call — a step that only called tools has no assistant row at all;
+ * 4. otherwise `undefined`, and the reveal falls back to the Turn itself, reported as `context`.
+ *    Never a neighbouring step: "near enough" is what this whole module exists to refuse.
+ *
+ * @param face - the session face, or undefined when this core has none.
+ * @param target - the folded brick's target.
+ * @returns the concrete row, or undefined when the log offers none (not loaded far enough yet,
+ *   or a step that produced neither a message nor a call).
+ */
+export function resolveHistoricalStep(
+  face: SessionFace | undefined,
+  target: HistoricalStepTarget,
+): BrickTarget | undefined {
+  if (face === undefined) return undefined
+  const { turn, step } = target
+  const loadSeq = target.loadSeq
+  // The same log position the step was measured from: whatever row this step became is at or
+  // before it, so carrying it keeps one load answering both "which row" and "how far back".
+  const seq = (resolved: ResolvedStepRow): ResolvedStepRow => (loadSeq === undefined ? resolved : { ...resolved, loadSeq })
+  // The retry schedule is durable, and it is about this step. `turn`/`step` are optional on
+  // the event, so an event that names only a retry id is not evidence about this step.
+  const retry = durableEvents(face).find((event) => event.type === 'llm/retry'
+    && event.data.turn === turn && event.data.step === step && typeof event.data.retryId === 'string')
+  if (retry !== undefined) {
+    return seq({ kind: 'retry-chain', turn, step, retryId: retry.data.retryId as string })
+  }
+  const view = readTranscript(face, turn, step, loadSeq)
+  if (view === undefined) return undefined
+  if (view.reasoning !== '') return seq({ kind: 'assistant-step', turn, step, part: 'reasoning' })
+  if (view.text !== '') return seq({ kind: 'assistant-step', turn, step, part: 'response' })
+  const callId = view.calls[0]?.callId
+  if (callId !== undefined) return seq({ kind: 'tool-call', turn, step, callId })
+  return undefined
 }
 
 /** The text of the blocks of one kind in a message's content, in order. */

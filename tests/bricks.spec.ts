@@ -4,6 +4,7 @@ import {
   activityOf,
   boardFromFeed,
   boardFromReadings,
+  boardFromSources,
   contentOf,
   labelOfRatio,
   reasoningShareOf,
@@ -11,6 +12,7 @@ import {
   titleFor,
   ttftShareOf,
   toneOfRatio,
+  type StepReading,
 } from '../src/client/bricks'
 import { CHANNEL, brickEdges } from '../src/client/tetris'
 import { EMPTY_COUNTERS, deriveMetrics } from '../src/shared/metrics'
@@ -61,7 +63,8 @@ function feed(bricks: BrickRecord[], endedTurns?: number[]): BrickFeed {
 describe('toneOfRatio', () => {
   it('maps the reading onto the same tones the badges use', () => {
     expect(toneOfRatio(0.992, 320_453)).toBe('good')
-    expect(toneOfRatio(0.43, 320_453)).toBe('warn')
+    expect(toneOfRatio(0.43, 320_453)).toBe('critical')
+    expect(toneOfRatio(0.85, 320_453)).toBe('warn')
     expect(toneOfRatio(0.087, 320_453)).toBe('critical')
   })
 
@@ -78,9 +81,14 @@ describe('toneOfRatio', () => {
 
 describe('labelOfRatio', () => {
   it('rounds down, so a partial hit never reads as 100%', () => {
-    expect(labelOfRatio(0.999)).toBe('99%')
+    expect(labelOfRatio(0.999)).toBe('99.9%')
+    expect(labelOfRatio(0.5)).toBe('50.0%')
+    // The one string that would need a sixth character drops the decimal instead: an exact
+    // full hit is not a rounded-up 99.9, and a brick only has room for five.
     expect(labelOfRatio(1)).toBe('100%')
     expect(labelOfRatio(0.087)).toBe('8.7%')
+    // Rounding is downward at the printed precision: never an overstated hit.
+    expect(labelOfRatio(0.99999)).toBe('99.9%')
     expect(labelOfRatio(undefined)).toBe('n/a')
   })
 })
@@ -186,6 +194,167 @@ describe('boardFromReadings (the no-host-half fallback)', () => {
     expect(record.raw.streamRef).toBeUndefined()
     expect(record.tools).toHaveLength(0)
     expect(record.context).toBeUndefined()
+  })
+})
+
+/** One client-side reading, for the fallback half of a merged board. */
+function reading(turn: number, step: number, overrides: Partial<StepReading> = {}): StepReading {
+  return { turn, step, tone: 'good', label: '99%', ended: true, ...overrides }
+}
+
+describe('boardFromSources (durable history + live attempts)', () => {
+  it('keeps the folded history when the collector only has the newest Turn', () => {
+    // The acceptance case: a session whose history is Turns 1-20, resumed after the
+    // collector restarted, so the feed holds nothing but the new Turn 21.
+    const history = Array.from({ length: 20 }, (_, index) => reading(index + 1, 1))
+    const data = boardFromSources({ live: feed([record({ turn: 21, step: 1 })]), readings: history })
+    expect(data.columns.map((column) => column.turn)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+    ])
+    expect(data.columns[19]!.bricks.map((brick) => brick.key)).toEqual(['20:1'])
+    expect(data.columns[20]!.bricks.map((brick) => brick.key)).toEqual(['s1:21:1:0'])
+    // Board order is oldest-first across both sources, so "compare with the previous" holds.
+    expect(data.order).toHaveLength(21)
+    expect(data.order[0]).toBe('1:1')
+    expect(data.order.at(-1)).toBe('s1:21:1:0')
+  })
+
+  it('interleaves a folded column with the collected bricks of the same Turn', () => {
+    const data = boardFromSources({ live: feed([record({ turn: 2, step: 3 })]), readings: [reading(1, 1), reading(1, 2), reading(2, 1)] })
+    expect(data.columns.map((column) => column.turn)).toEqual([1, 2])
+    expect(data.columns[1]!.bricks.map((brick) => brick.key)).toEqual(['2:1', 's1:2:3:0'])
+  })
+
+  it('replaces only the steps the collector has, and keeps every attempt of them', () => {
+    const data = boardFromSources({
+      live: feed([
+        record({ turn: 20, step: 3, attemptOrdinal: 0, settlement: 'attempt', finish: { reason: 'error' } }),
+        record({ turn: 20, step: 3, attemptOrdinal: 1 }),
+      ]),
+      readings: [reading(20, 2), reading(20, 3), reading(20, 4)],
+    })
+    const column = data.columns[0]!
+    // The merge key is the step, not the brick: one folded brick must not sit beside the
+    // two real attempts of the same step and turn it into three.
+    expect(column.bricks.map((brick) => brick.key)).toEqual(['20:2', 's1:20:3:0', 's1:20:3:1', '20:4'])
+    expect(data.records.get('20:3')).toBeUndefined()
+    expect(data.records.get('s1:20:3:0')).toBeDefined()
+    // The failed attempt and the retry that replaced it both survive.
+    expect(column.bricks.filter((brick) => brick.step === 3).map((brick) => brick.failed === true)).toEqual([true, false])
+  })
+
+  it('does not lose the history when the feed goes from empty to one brick', () => {
+    // What a collector restart (or an LRU eviction of the session) looks like from the
+    // browser: a feed that answered nothing a moment ago answers with one new attempt.
+    const history = [reading(1, 1), reading(2, 1), reading(3, 1)]
+    const before = boardFromSources({ live: feed([]), readings: history })
+    expect(before.columns).toHaveLength(3)
+    // Nothing collected at all: the whole board is the fold, and says so.
+    expect(before.estimated).toBe(true)
+
+    const after = boardFromSources({ live: feed([{ ...record({ turn: 4, step: 1 }), observedBy: 'host' }]), readings: history })
+    expect(after.columns.map((column) => column.turn)).toEqual([1, 2, 3, 4])
+    // Mixed board: the claim is per brick now, never the whole board.
+    expect(after.estimated).toBeUndefined()
+    expect(after.columns[0]!.bricks[0]!.estimated).toBe(true)
+    expect(after.records.get('1:1')!.observedBy).toBe('client')
+    expect(after.columns[3]!.bricks[0]!.estimated).toBeUndefined()
+    expect(after.records.get('s1:4:1:0')!.observedBy).toBe('host')
+  })
+
+  it('lets either half end a Turn, keeps the auxiliary lane, and needs no host to fold', () => {
+    // The collector died mid-Turn and never saw the `turn/end` its log recorded.
+    const ended = boardFromSources({ live: feed([record({ turn: 7, step: 2 })], []), readings: [reading(7, 1, { ended: true })] })
+    expect(ended.columns[0]!.ended).toBe(true)
+    // A Turn the collector has not finished stays open when the log agrees.
+    const running = boardFromSources({ live: feed([record({ turn: 7, step: 2 })], []), readings: [reading(7, 1, { ended: false })] })
+    expect(running.columns[0]!.ended).toBe(false)
+
+    const withAux = boardFromSources({
+      live: feed([{ ...record({ turn: 0, step: 0 }), route: { provider: 'p', model: 'm', purpose: 'compaction' } }, record({ turn: 5, step: 1 })], [5]),
+      readings: [reading(1, 1)],
+    })
+    expect(withAux.columns.map((column) => column.turn)).toEqual([1, 5])
+    expect(withAux.aux).toHaveLength(1)
+    expect(withAux.order).toEqual(['1:1', 's1:5:1:0', 's1:0:0:0'])
+  })
+
+  it('keeps Turns 1-80 on the board while Turn 81 lands as an exact collected brick', () => {
+    // Acceptance case ⑤: the merged board must hold both halves at once, each with the
+    // precision it actually has — and the restored bricks must still be *navigable*.
+    const history = Array.from({ length: 80 }, (_, index) => reading(index + 1, 1))
+    const live = { ...record({ turn: 81, step: 1 }), settlementSeq: 900, observedBy: 'host' as const }
+    const data = boardFromSources({ live: feed([live]), readings: history })
+    expect(data.columns).toHaveLength(81)
+    const restored = data.columns[79]!.bricks[0]!
+    const collected = data.columns[80]!.bricks[0]!
+    expect(restored.key).toBe('80:1')
+    expect(restored.estimated).toBe(true)
+    expect(restored.target.kind).toBe('historical-step')
+    expect(collected.key).toBe('s1:81:1:0')
+    expect(collected.estimated).toBeUndefined()
+    // The collected brick keeps the attempt target its record produced.
+    expect(collected.target).toEqual({ kind: 'assistant-step', turn: 81, step: 1, part: 'response', loadSeq: 900 })
+  })
+
+  it('is the fallback board, unchanged, when there is no feed to merge', () => {
+    const history = [reading(2, 3, { label: '8.7%', tone: 'critical' })]
+    const data = boardFromSources({ readings: history })
+    expect(data.estimated).toBe(true)
+    expect(data.columns[0]!.bricks[0]!.key).toBe('2:3')
+    expect(data.columns[0]!.bricks[0]!.label).toBe('8.7%')
+  })
+})
+
+describe('boardFromSources: the replayed log under the live feed', () => {
+  /** A replay feed around replayed records. */
+  const replayed = (bricks: BrickRecord[]): BrickFeed => ({
+    sessionId: 's1',
+    bricks: bricks.map((brick) => ({ ...brick, observedBy: 'replay' as const })),
+    endedTurns: [],
+    store: { blobs: 0, bytes: 0 },
+  })
+
+  it('fills the attempts the collector does not have, and lets the collector win its own', () => {
+    // The case the whole tier exists for: attempt 0 happened before the collector started, and
+    // attempt 1 it watched. Merging per *step* would throw the failed attempt away.
+    const data = boardFromSources({
+      live: feed([{ ...record({ turn: 5, step: 2, attemptOrdinal: 1 }), observedBy: 'host' }]),
+      replay: replayed([
+        record({ turn: 5, step: 1, attemptOrdinal: 0 }),
+        record({ turn: 5, step: 2, attemptOrdinal: 0, settlement: 'attempt', finish: { reason: 'error' } }),
+        record({ turn: 5, step: 2, attemptOrdinal: 1 }),
+      ]),
+    })
+    const column = data.columns[0]!
+    expect(column.bricks.map((brick) => [brick.step, brick.attempt])).toEqual([[1, 0], [2, 0], [2, 1]])
+    // The live record won the attempt both sources have; the replayed one filled the rest.
+    expect(column.bricks.map((brick) => brick.origin)).toEqual(['replay', 'replay', 'live'])
+    expect(data.records.get('s1:5:2:1')!.observedBy).toBe('host')
+    expect(data.records.get('s1:5:2:0')!.observedBy).toBe('replay')
+  })
+
+  it('drops the folded brick for a step the replay already covers, so nothing is counted twice', () => {
+    const data = boardFromSources({
+      replay: replayed([record({ turn: 3, step: 1 }), record({ turn: 3, step: 2 })]),
+      readings: [reading(3, 1), reading(3, 2), reading(3, 3)],
+    })
+    const keys = data.columns[0]!.bricks.map((brick) => brick.key)
+    // Steps 1 and 2 came from the log; only step 3, which it does not have, is a folded brick.
+    expect(keys).toEqual(['s1:3:1:0', 's1:3:2:0', '3:3'])
+    expect(data.columns[0]!.bricks.map((brick) => brick.origin)).toEqual(['replay', 'replay', 'fold'])
+  })
+
+  it('needs no collector at all to draw a typed, navigable history', () => {
+    // A restart with no live traffic yet: everything on the board is the log's own, and every
+    // brick is attempt-level with a real target — what the fold alone could never do.
+    const data = boardFromSources({ replay: replayed([
+      { ...record({ turn: 9, step: 1 }), settlementSeq: 120 },
+      { ...record({ turn: 9, step: 2 }), settlementSeq: 130 },
+    ]) })
+    expect(data.estimated).toBeUndefined()
+    expect(data.columns[0]!.bricks.map((brick) => brick.estimated)).toEqual([undefined, undefined])
+    expect(data.columns[0]!.bricks[0]!.target).toEqual({ kind: 'assistant-step', turn: 9, step: 1, part: 'response', loadSeq: 120 })
   })
 })
 
@@ -412,14 +581,25 @@ describe('targetOf: identity is the attempt, the anchor is what shows it', () =>
     expect(targetOf(unidentified)).toEqual({ kind: 'none', reason: 'no-compaction-id' })
   })
 
-  it('gives a client-folded brick no target at all, because it has no identity', () => {
-    // Those bricks are one per *step*, folded from the event feed: there is nothing in
-    // the transcript they could claim to be, and pretending otherwise is what made the
-    // model ambiguous in the first place.
+  it('gives a client-folded brick a step target, not an attempt it cannot back', () => {
+    // Those bricks are one per *step*, folded from the event feed, so they must not claim to
+    // be one request — but the step is still a real place in the conversation, and the durable
+    // log says which row it became. Navigable at step granularity, never at attempt
+    // granularity: the target says `historical-step` and the brick stays `estimated`.
     const folded = boardFromReadings([
-      { turn: 1, step: 1, tone: 'good', label: '99%', ended: true, usage: { inputTokens: 10, cacheReadTokens: 90 } },
+      { turn: 1, step: 1, tone: 'good', label: '99%', ended: true, usage: { inputTokens: 10, cacheReadTokens: 90 }, seq: 28371 },
     ])
-    expect(folded.columns[0]!.bricks[0]!.target).toEqual({ kind: 'none', reason: 'client-fold' })
+    expect(folded.columns[0]!.bricks[0]!.target).toEqual({ kind: 'historical-step', turn: 1, step: 1, loadSeq: 28371 })
+    expect(folded.columns[0]!.bricks[0]!.estimated).toBe(true)
+  })
+
+  it('leaves the log position off a folded brick that was measured without one', () => {
+    // No seq means no page to ask for: the target still says which step it is, and the loader
+    // answers `no-seq` rather than guessing a position.
+    const folded = boardFromReadings([
+      { turn: 2, step: 4, tone: 'good', label: '99%', ended: true, usage: { inputTokens: 10, cacheReadTokens: 90 } },
+    ])
+    expect(folded.columns[0]!.bricks[0]!.target).toEqual({ kind: 'historical-step', turn: 2, step: 4 })
   })
 
   it('carries the target onto the board from the host feed', () => {
