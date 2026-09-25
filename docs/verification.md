@@ -13,7 +13,7 @@
 
 ## 0.1.2 — public GitHub distribution
 
-The 0.1.2 release starts from the `v0.1.1` stable commit. No `src/` runtime implementation changed. The changes are distribution and documentation: the package version, exact `0.1.7-rc.2` DSH client peer range, prebuilt `lib/` files, portable verification-script defaults, synthetic release screenshots, and a GitHub-only release workflow.
+The 0.1.2 release starts from the local `v0.1.1` stable commit; the public GitHub line starts at `v0.1.2`. No `src/` runtime implementation changed. The changes are distribution and documentation: the package version, exact `0.1.7-rc.2` DSH client peer range, prebuilt `lib/` files, portable verification-script defaults, synthetic release screenshots, and a GitHub-only release workflow.
 
 On the 0.1.2 release checkout:
 
