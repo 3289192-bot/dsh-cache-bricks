@@ -47,9 +47,8 @@ The repository includes the built `lib/` files, so GitHub installation does not 
 
 ## Compatibility / 兼容性
 
-- The plugin targets the DSH web profile. Its manifest declares compatibility with DSH client packages `>=0.1.6-alpha.1 <0.1.8-0`; it is not limited to `0.1.7-rc.2`.
-- Full live and browser verification was completed on DSH `0.1.7-rc.2`. DSH `0.1.6-alpha.1` received cross-version API/contract checks, but not the same full live UI run. Other versions inside the declared range have not all been individually verified.
-- The development dependencies are pinned to `0.1.7-rc.2` for the verified build; that pin is not the plugin's declared runtime minimum.
+- **Supported runtime: DSH `0.1.7-rc.2` Web profile only.** Use this plugin only with that exact DSH version; other DSH versions are unsupported.
+- The complete live-instance and browser verification was performed on DSH `0.1.7-rc.2`.
 
 ## Data and permissions / 数据与权限
 
