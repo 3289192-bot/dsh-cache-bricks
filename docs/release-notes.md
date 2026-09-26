@@ -4,6 +4,7 @@
 - 回看更早记录时按需加载历史，减少重复处理整段会话。
 - 修复补载历史后棋盘位置跳动，保持当前阅读位置。
 - 优化长会话的棋盘渲染，减少屏幕外砖块带来的开销。
+- 更正安装说明：主页、版本标签和下载包内的 README 统一指向 `v0.1.4`。
 
 **[下载完整版 v0.1.4](https://github.com/3289192-bot/dsh-cache-bricks/releases/download/v0.1.4/dsh-cache-bricks-0.1.4.tgz)** · [功能与使用说明](https://github.com/3289192-bot/dsh-cache-bricks#readme)
 
