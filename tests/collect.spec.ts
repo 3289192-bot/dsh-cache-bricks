@@ -1,425 +1,338 @@
-import { describe, expect, it, vi } from 'vitest'
-import { installCollector, type HostContextLike } from '../src/host/collect'
-import { createCacheBricksRouter, type RouteRequestLike, type RouteResponseLike } from '../src/host/routes'
+/**
+ * The taps.
+ *
+ * Three things are worth pinning about the host half, and none of them are about features:
+ *
+ * 1. **It never changes the call.** `llm/stream` is a waterfall — returning anything but `next()`
+ *    would replace the model's stream — so the returned value is asserted to be the very object
+ *    the next listener produced.
+ * 2. **It never throws into the model-call path.** A hostile request object, a broken frame, a
+ *    settlement with nonsense in it: all of them are absorbed, because this code runs between the
+ *    agent and the model.
+ * 3. **A settled request is exactly one brick**, and a token-level delta costs nothing at all.
+ */
+import { describe, expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { zstdCompressSync } from 'node:zlib'
+import { installCollector, type Collector, type HostContextLike } from '../src/host/collect'
+import { createBrickRouter } from '../src/host/routes'
+import type { BrickFeed } from '../src/shared/cache-brick'
 
-/** A response fake that records what the router did. */
-function fakeResponse(): RouteResponseLike & { body: string; headers: Record<string, string>; status?: number; events: string[] } {
-  const headers: Record<string, string> = {}
-  const state = {
-    statusCode: 0,
-    headers,
-    body: '',
-    events: [] as string[],
-    setHeader(name: string, value: string) {
-      headers[name.toLowerCase()] = value
+/** A host context that records the taps and can emit on them. */
+function host(): HostContextLike & {
+  emit(event: string, ...args: unknown[]): void
+  readonly registered: string[]
+} {
+  const listeners = new Map<string, Array<(...args: never[]) => unknown>>()
+  const registered: string[] = []
+  const services = new Map<string, unknown>()
+  return {
+    registered,
+    on(event, listener) {
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
       return undefined
     },
-    writeHead(status: number, extra: Record<string, string>) {
-      state.statusCode = status
-      for (const [name, value] of Object.entries(extra)) headers[name.toLowerCase()] = value
+    get(name) { return services.get(name) },
+    inject(names, callback) {
+      registered.push(...names)
+      // The web server is present in this fake as soon as it is asked for.
+      callback({
+        on: () => undefined,
+        get: (name: string) => (name === 'webServer'
+          ? { register: (route: { path: string }) => { registered.push(route.path); return () => {} } }
+          : undefined),
+        inject: () => undefined,
+        effect: (callback: () => void) => { callback(); return undefined },
+      } as unknown as HostContextLike)
       return undefined
     },
-    write(chunk: string) {
-      state.events.push(chunk)
-      return undefined
-    },
-    end(body?: string) {
-      if (body !== undefined) state.body = body
-      return undefined
-    },
-    on() {
-      return undefined
+    effect(callback) { callback(); return undefined },
+    emit(event, ...args) {
+      for (const listener of listeners.get(event) ?? []) listener(...(args as never[]))
     },
   }
-  return state
 }
 
-/** A request fake. */
-function fakeRequest(url: string, method = 'GET', headers: Record<string, string> = {}): RouteRequestLike {
-  return { method, url, headers: { host: '127.0.0.1:18090', ...headers }, socket: { remoteAddress: '127.0.0.1' } }
+/**
+ * The plugin's own route over a collector, so a test asks exactly what a browser asks.
+ *
+ * The read is fired by the request and finishes asynchronously, so the answer to the *first* look
+ * may arrive before the log has been read; a second look is what a browser does anyway (its stream
+ * pushes the result).
+ */
+function createRouterFor(collector: Collector): { handler: (request: unknown, response: unknown) => void } {
+  return createBrickRouter({
+    bricks: (sessionId) => collector.feed(sessionId),
+    sessions: () => collector.sessions(),
+    subscribe: (sessionId, sink) => collector.subscribe(sessionId, sink as (feed: unknown) => void),
+    looked: (sessionId) => { collector.looked?.(sessionId) },
+  })
 }
 
-describe('the route namespace', () => {
-  const deps = {
-    feed: (sessionId: string) => (sessionId === 's1' ? { sessionId, bricks: [], store: { blobs: 0, bytes: 0 } } : undefined),
-    sessions: () => ['s1'],
-    blob: (ref: string) => (ref === 'abc' ? { value: 1 } : undefined),
-    subscribe: () => () => undefined,
-  }
-
-  it('serves the sessions and the feed of one session', () => {
-    const { handler, path } = createCacheBricksRouter(deps)
-    expect(path).toBe('/cache-bricks')
-    const sessions = fakeResponse()
-    handler(fakeRequest('/cache-bricks/sessions'), sessions)
-    expect(JSON.parse(sessions.body)).toEqual({ sessions: ['s1'] })
-
-    const feed = fakeResponse()
-    handler(fakeRequest('/cache-bricks/attempts?sessionId=s1'), feed)
-    expect(feed.statusCode).toBe(200)
-    expect(JSON.parse(feed.body).sessionId).toBe('s1')
-  })
-
-  it('says 404 rather than inventing a feed for an unobserved session', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const response = fakeResponse()
-    handler(fakeRequest('/cache-bricks/attempts?sessionId=nope'), response)
-    expect(response.statusCode).toBe(404)
-  })
-
-  it('requires a session id and refuses an unknown route', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const missing = fakeResponse()
-    handler(fakeRequest('/cache-bricks/attempts'), missing)
-    expect(missing.statusCode).toBe(400)
-    const unknown = fakeResponse()
-    handler(fakeRequest('/cache-bricks/nope'), unknown)
-    expect(unknown.statusCode).toBe(404)
-  })
-
-  it('resolves a blob by ref and reports an evicted one', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const ok = fakeResponse()
-    handler(fakeRequest('/cache-bricks/blob?ref=abc'), ok)
-    expect(JSON.parse(ok.body)).toEqual({ ref: 'abc', value: { value: 1 } })
-    const gone = fakeResponse()
-    handler(fakeRequest('/cache-bricks/blob?ref=zzz'), gone)
-    expect(gone.statusCode).toBe(404)
-  })
-
-  it('honours a configured base path instead of slicing a hardcoded one', () => {
-    const { handler, path } = createCacheBricksRouter(deps, { basePath: '/badge/v2' })
-    expect(path).toBe('/badge/v2')
-    const response = fakeResponse()
-    handler(fakeRequest('/badge/v2/sessions'), response)
-    expect(response.statusCode).toBe(200)
-    expect(JSON.parse(response.body)).toEqual({ sessions: ['s1'] })
-  })
-
-  it('defers to the harness request policy when one is available', () => {
-    const seen: unknown[] = []
-    const { handler } = createCacheBricksRouter(deps, {
-      guard: (request) => {
-        seen.push(request)
-        return 401
+/** Ask for one session's bricks the way the board does, waiting out the log read. */
+async function askBricks(router: { handler: (request: unknown, response: unknown) => void }, sessionId: string): Promise<BrickFeed | undefined> {
+  const ask = (): BrickFeed | undefined => {
+    let body = ''
+    router.handler(
+      { url: `/cache-bricks/bricks?sessionId=${sessionId}`, method: 'GET', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } },
+      {
+        setHeader() {},
+        end(chunk?: string) { if (chunk !== undefined) body += chunk },
       },
-    })
-    const response = fakeResponse()
-    handler(fakeRequest('/cache-bricks/sessions'), response)
-    expect(seen).toHaveLength(1)
-    expect(response.statusCode).toBe(401)
+    )
+    const parsed = JSON.parse(body) as BrickFeed & { error?: string }
+    return parsed.error === undefined ? parsed : undefined
+  }
+  let payload = ask()
+  for (let attempt = 0; attempt < 40 && payload === undefined; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    payload = ask()
+  }
+  // One more look after the read has certainly finished: the first successful answer may have
+  // overtaken the backfill.
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  return ask() ?? payload
+}
+
+/** One settled step's durable event data. */
+function settlement(turn: number, step: number, usage: { inputTokens: number; cacheReadTokens?: number }) {
+  return { turn, step, usage }
+}
+
+describe('the model-call tap', () => {
+  it('returns exactly what the next listener produced', () => {
+    const ctx = host()
+    installCollector(ctx, { serve: false })
+    const stream = { chunks: ['a', 'b'] }
+    let received: unknown
+    ctx.emit('llm/stream', { sessionId: 'S' }, () => { received = stream; return stream })
+    expect(received).toBe(stream)
   })
 
-  it('treats an unidentifiable peer as remote, not as local', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const response = fakeResponse()
-    handler({ method: 'GET', url: '/cache-bricks/sessions', headers: { host: '127.0.0.1:18090' } }, response)
-    expect(response.statusCode).toBe(403)
+  it('counts a dispatched request without touching it', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    // A frozen request, like the loop's own: reading it is fine, writing it throws.
+    const request = Object.freeze({ sessionId: 'S', messages: Object.freeze([{ role: 'user' }]) })
+    ctx.emit('llm/stream', request, () => 'stream')
+    expect(collector.feed('S')?.dispatched).toBe(1)
+    expect(collector.feed('S')?.bricks).toEqual([])
   })
 
-  it('refuses anything that is not a local, same-origin GET', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const remote = fakeResponse()
-    handler({ ...fakeRequest('/cache-bricks/sessions'), socket: { remoteAddress: '10.0.0.9' } }, remote)
-    expect(remote.statusCode).toBe(403)
-
-    const crossOrigin = fakeResponse()
-    handler(fakeRequest('/cache-bricks/sessions', 'GET', { origin: 'https://evil.example' }), crossOrigin)
-    expect(crossOrigin.statusCode).toBe(403)
-
-    const posted = fakeResponse()
-    handler(fakeRequest('/cache-bricks/sessions', 'POST'), posted)
-    expect(posted.statusCode).toBe(405)
-
-    // A same-origin Origin header (what the page itself sends) is allowed.
-    const sameOrigin = fakeResponse()
-    handler(fakeRequest('/cache-bricks/sessions', 'GET', { origin: 'http://127.0.0.1:18090' }), sameOrigin)
-    expect(sameOrigin.statusCode).toBe(200)
-  })
-
-  it('opens an SSE stream with the right headers and pushes the current feed', () => {
-    const { handler } = createCacheBricksRouter(deps)
-    const response = fakeResponse()
-    handler(fakeRequest('/cache-bricks/stream?sessionId=s1'), response)
-    expect(response.headers['content-type']).toContain('text/event-stream')
-    expect(response.headers['cache-control']).toContain('no-transform')
-    expect(response.events.join('')).toContain('event: feed')
+  it('survives a request whose fields throw on read', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    const hostile = { get sessionId(): string { throw new Error('no') } }
+    expect(() => { ctx.emit('llm/stream', hostile, () => 'stream') }).not.toThrow()
+    // The request is counted under `unknown`, which is where an unreadable session belongs.
+    expect(collector.feed('unknown')?.dispatched).toBe(1)
   })
 })
 
-/** A context fake that captures listeners and services. */
-function fakeContext(services: Record<string, unknown> = {}): {
-  ctx: HostContextLike
-  listeners: Map<string, (...args: unknown[]) => unknown>
-  effects: number
-} {
-  const listeners = new Map<string, (...args: unknown[]) => unknown>()
-  const state = { effects: 0 }
-  const ctx: HostContextLike = {
-    on(name, listener) {
-      listeners.set(name, listener as (...args: unknown[]) => unknown)
-      return undefined
-    },
-    get(name) {
-      return services[name]
-    },
-    inject(_names, callback) {
-      callback(ctx)
-      return undefined
-    },
-    effect(callback) {
-      const dispose = callback()
-      state.effects += 1
-      return dispose
-    },
+describe('one settled request, one brick', () => {
+  it('turns a turn of events into a brick in the session feed', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    ctx.emit('llm/stream', { sessionId: 'S' }, () => 'stream')
+    ctx.emit('agent/assistant-stream', {
+      agent: { session: { id: 'S' } },
+      frame: { type: 'start', turn: 3, step: 1, attemptId: 'a1', time: 1_000 },
+    })
+    ctx.emit('agent/assistant-stream', {
+      agent: { session: { id: 'S' } },
+      frame: { type: 'chunk', chunk: { type: 'usage', usage: { inputTokens: 20, cacheReadTokens: 1_980 } } },
+    })
+    // Nothing yet: a request in flight has no reading to show.
+    expect(collector.feed('S')?.bricks).toEqual([])
+    ctx.emit('session/event', { id: 'S' }, { type: 'assistant/message', time: 1_500, data: settlement(3, 1, { inputTokens: 20, cacheReadTokens: 1_980 }) })
+
+    const feed = collector.feed('S') as BrickFeed
+    expect(feed.bricks).toHaveLength(1)
+    expect(feed.bricks[0]!.id).toBe('S:3:1:0')
+    expect(feed.bricks[0]!.tone).toBe('good')
+    expect(feed.dispatched).toBe(1)
+  })
+
+  it('does not count a token-level delta or wake anyone for it', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    let pushes = 0
+    collector.subscribe('S', () => { pushes += 1 })
+    ctx.emit('agent/assistant-stream', { agent: { session: { id: 'S' } }, frame: { type: 'start', turn: 1, step: 1 } })
+    for (let index = 0; index < 2_000; index += 1) {
+      ctx.emit('agent/assistant-stream', {
+        agent: { session: { id: 'S' } },
+        frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'x' } },
+      })
+    }
+    // Two thousand deltas: no brick, no push. This is the whole reason the plugin is cheap.
+    expect(pushes).toBe(0)
+    expect(collector.feed('S')?.bricks).toEqual([])
+  })
+
+  it('pushes once when a retry chain settles, not once per event', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    let pushes = 0
+    collector.subscribe('S', () => { pushes += 1 })
+    ctx.emit('agent/assistant-stream', { agent: { session: { id: 'S' } }, frame: { type: 'start', turn: 1, step: 1 } })
+    ctx.emit('session/event', { id: 'S' }, { type: 'assistant/attempt', time: 10, data: settlement(1, 1, { inputTokens: 900 }) })
+    ctx.emit('agent/assistant-stream', { agent: { session: { id: 'S' } }, frame: { type: 'start', turn: 1, step: 1 } })
+    ctx.emit('session/event', { id: 'S' }, { type: 'assistant/message', time: 20, data: settlement(1, 1, { inputTokens: 20, cacheReadTokens: 1_980 }) })
+    expect(collector.feed('S')?.bricks).toHaveLength(2)
+    // The first settlement pushes immediately; the second lands inside the coalescing window, so
+    // the browser gets at most one more repaint rather than one per attempt.
+    expect(pushes).toBeLessThanOrEqual(2)
+  })
+
+  it('marks a Turn finished when the log says so', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    ctx.emit('session/event', { id: 'S' }, { type: 'turn/end', data: { turn: 2 } })
+    expect(collector.feed('S')?.endedTurns).toEqual([2])
+  })
+
+  it('ignores an event that is not a settlement, and never throws on a malformed one', () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false })
+    expect(() => {
+      ctx.emit('session/event', { id: 'S' }, { type: 'tool/call', data: { turn: 1, step: 1 } })
+      ctx.emit('session/event', { id: 'S' }, { type: 'assistant/message', data: { turn: 'x', step: null } })
+      ctx.emit('session/event', { id: 'S' }, { type: 'assistant/attempt', data: {} })
+      ctx.emit('session/event', { id: 'S' }, undefined)
+      ctx.emit('agent/assistant-stream', { agent: {} })
+      ctx.emit('agent/assistant-stream', undefined)
+    }).not.toThrow()
+    expect(collector.feed('S')?.bricks).toEqual([])
+  })
+})
+
+describe('serving', () => {
+  it('registers its route on the web server', () => {
+    const ctx = host()
+    installCollector(ctx, {})
+    expect(ctx.registered).toContain('webServer')
+    expect(ctx.registered).toContain('/cache-bricks')
+  })
+
+  it('observes without serving when asked to', () => {
+    const ctx = host()
+    installCollector(ctx, { serve: false })
+    expect(ctx.registered).not.toContain('webServer')
+  })
+
+  it('honours a different prefix for the route', () => {
+    const ctx = host()
+    installCollector(ctx, { basePath: '/bricks-lite' })
+    expect(ctx.registered).toContain('/bricks-lite')
+  })
+})
+
+
+/**
+ * The one thing Lite reads from history: a session's own log, once, when a browser looks at it.
+ *
+ * The trigger matters as much as the read. An active session's past is the least interesting thing
+ * about it, and reading every session's log at startup would be exactly the "scan everything" this
+ * line exists to avoid — so the cost is paid when a *reader* asks, and once per session.
+ */
+describe('backfilling a session from its log', () => {
+  /** A harness log for one session: header, then a frame per append, as the artifact is written. */
+  function writeLog(root: string, sessionId: string, frames: readonly unknown[][]): string {
+    const dir = join(root, '--workspace--', sessionId)
+    mkdirSync(dir, { recursive: true })
+    const path = join(dir, 'session.v4.jsonl.zstd')
+    // The artifact's first frame holds the session header — the file starts with a frame, not with
+    // a plaintext line (measured on a real log: magic at byte 0).
+    const header = zstdCompressSync(Buffer.from(`${JSON.stringify({ type: 'session', version: 4, id: sessionId })}\n`, 'utf8'))
+    const body = frames.map((lines) => zstdCompressSync(Buffer.from(`${lines.map((line) => JSON.stringify(line)).join('\n')}\n`, 'utf8')))
+    writeFileSync(path, Buffer.concat([header, ...body]))
+    return path
   }
-  return { ctx, listeners, get effects() { return state.effects } }
-}
 
-/** A frozen loop-built request, as the agent loop hands it to the waterfall. */
-function frozenRequest(overrides: Record<string, unknown> = {}): unknown {
-  return Object.freeze({
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-flash',
-    messages: Object.freeze([
-      Object.freeze({ id: 'm1', role: 'user', content: Object.freeze([{ type: 'text', text: 'hi' }]), source: Object.freeze({ kind: 'user' }) }),
-    ]),
-    sessionId: 's1',
-    signal: new AbortController().signal,
-    ...overrides,
-  })
-}
-
-describe('the collector tap on the model-call path', () => {
-  it('returns the downstream stream untouched, so the request is not changed', () => {
-    const { ctx, listeners } = fakeContext()
-    installCollector(ctx, { serve: false })
-    const tap = listeners.get('llm/stream')!
-    const stream = { marker: 'the real adapter stream' }
-    const next = vi.fn(() => stream)
-    const returned = tap(frozenRequest(), next)
-    expect(next).toHaveBeenCalledTimes(1)
-    // Identity, not equality: anything else would replace the model's stream.
-    expect(returned).toBe(stream)
+  const settled = (turn: number, step: number, inputTokens: number, cacheReadTokens: number): unknown => ({
+    type: 'assistant/message',
+    time: 1_000 * turn + step,
+    data: { turn, step, usage: { inputTokens, cacheReadTokens } },
   })
 
-  it('still returns next() when its own observation throws', () => {
-    const { ctx, listeners } = fakeContext()
-    installCollector(ctx, { serve: false })
-    const tap = listeners.get('llm/stream')!
-    // A hostile request object that throws on every property read.
-    const broken = new Proxy({}, { get() { throw new Error('boom') }, ownKeys() { throw new Error('boom') } })
-    const stream = { marker: 'stream' }
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-    const returned = tap(broken as unknown, () => stream)
-    warn.mockRestore()
-    expect(returned).toBe(stream)
+  it('fills an old session when a reader asks for its bricks, and only then', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cache-bricks-logs-'))
+    writeLog(root, 'session-old', [
+      [settled(1, 1, 20, 1_980), settled(1, 2, 400, 600)],
+      [{ type: 'turn/end', data: { turn: 1 } }, settled(2, 1, 10, 990)],
+    ])
+    const ctx = host()
+    // A fresh collector has seen nothing: the session does not exist as far as live traffic goes.
+    installCollector(ctx, { serve: false, logsRoots: [root] })
+    const feed = installCollector(ctx, { serve: false, logsRoots: [root] })
+
+    // Nothing is read until someone looks: `feed()` alone does not trigger it.
+    expect(feed.feed('session-old')).toBeUndefined()
+
+    // The route is what a browser hits, and it is what triggers the read.
+    const router = createRouterFor(feed)
+    const payload = await askBricks(router, 'session-old')
+    expect(payload.bricks).toHaveLength(3)
+    expect(payload.bricks.map((brick) => [brick.turn, brick.step])).toEqual([[1, 1], [1, 2], [2, 1]])
+    expect(payload.bricks[0]!.hitRatio).toBeCloseTo(1_980 / 2_000, 6)
+    expect(payload.bricks[0]!.tone).toBe('good')
+    expect(payload.backfilled).toBe(3)
+    expect(payload.endedTurns).toEqual([1])
+    // The reading is the log's own, and the brick still carries nothing but its eleven fields.
+    expect(Object.keys(payload.bricks[0]!).sort()).toEqual([
+      'attempt', 'cacheReadTokens', 'cacheWriteTokens', 'finishedAt', 'hitRatio', 'id', 'inputTokens',
+      'startedAt', 'step', 'tone', 'turn',
+    ])
   })
 
-  it('never writes to the request it observes', () => {
-    const { ctx, listeners } = fakeContext()
-    installCollector(ctx, { serve: false })
-    const request = frozenRequest()
-    const tap = listeners.get('llm/stream')!
-    // A frozen object throws on assignment in strict mode; reaching the end is
-    // the assertion.
-    expect(() => tap(request, () => ({}))).not.toThrow()
-    expect(Object.isFrozen(request)).toBe(true)
+  it('lets the live path own a step the log also has', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cache-bricks-logs-'))
+    writeLog(root, 'session-both', [[settled(9, 1, 20, 80)], [settled(9, 1, 20, 980)]])
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false, logsRoots: [root] })
+    // The live half sees this step first: its attempt is the one being billed, so the log's
+    // settlements for the same step are not allowed to duplicate it or steal its ordinal.
+    collector.feeds.for('session-both').attempts.settle({ turn: 9, step: 1, usage: { inputTokens: 30, cacheReadTokens: 970 } })
+
+    const router = createRouterFor(collector)
+    const payload = await askBricks(router, 'session-both')
+    expect(payload.bricks).toHaveLength(1)
+    expect(payload.bricks[0]!.inputTokens).toBe(30)
+    expect(payload.backfilled).toBe(0)
   })
 
-  it('folds a whole attempt into a brick, and a retry into a second one', () => {
-    const { ctx, listeners } = fakeContext()
-    const collector = installCollector(ctx, { serve: false })
-    const stream = listeners.get('llm/stream')!
-    const frames = listeners.get('agent/assistant-stream')!
-    const events = listeners.get('session/event')!
-    const agent = { session: { id: 's1' } }
-
-    events('session/event' === '' ? undefined : { id: 's1' }, {
-      type: 'request/header',
-      seq: 300,
-      data: { reason: 'initial', header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' }, tools: [{ name: 'read' }] } },
-    })
-
-    // Attempt 0 fails.
-    stream(frozenRequest(), () => ({}))
-    frames({ agent, frame: { type: 'start', attemptId: 's1:1', revision: 1, turn: 5, step: 3 } })
-    frames({ agent, frame: { type: 'chunk', time: 1000, chunk: { type: 'usage', usage: { inputTokens: 400, outputTokens: 5, cacheReadTokens: 0 } } } })
-    frames({ agent, frame: { type: 'chunk', time: 1010, chunk: { type: 'finish', reason: { kind: 'error', failure: { message: 'rate limited', code: 'rate_limit' } } } } })
-    frames({ agent, frame: { type: 'end', revision: 2, outcome: { kind: 'committed', eventType: 'assistant/attempt', seq: 301 } } })
-    events({ id: 's1' }, {
-      type: 'llm/retry',
-      // The real `LlmRetryEventData` names the attempt being replaced; the collector is not
-      // allowed to guess which draft that is.
-      data: { retryId: 'r1', turn: 5, step: 3, provider: 'deepseek-official', mode: 'normal', policyKey: 'k', retry: 1, maxRetries: 3, delayMs: 1000, failure: { message: 'rate limited', code: 'rate_limit' } },
-    })
-
-    // Attempt 1 succeeds with a cached prefix.
-    stream(frozenRequest(), () => ({}))
-    frames({ agent, frame: { type: 'start', attemptId: 's1:2', revision: 3, turn: 5, step: 3 } })
-    const firstTokenAt = Date.now() + 150
-    frames({ agent, frame: { type: 'chunk', time: firstTokenAt, chunk: { type: 'reasoning-delta', text: 'think' } } })
-    frames({ agent, frame: { type: 'chunk', time: 2100, chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 40, cacheReadTokens: 200_000 } } } })
-    frames({ agent, frame: { type: 'chunk', time: 2110, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } } })
-    events({ id: 's1' }, { type: 'tool/call', seq: 302, time: 2120, data: { callId: 'c1', name: 'read', arguments: '{"path":"a"}' } })
-    frames({ agent, frame: { type: 'end', revision: 4, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 303 } } })
-    events({ id: 's1' }, { type: 'tool/result', time: 2500, data: { message: { toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }], isError: false } } })
-
-    const feed = collector.feed('s1')!
-    expect(feed.bricks).toHaveLength(2)
-    const [failed, retried] = feed.bricks
-    expect(failed!.settlement).toBe('attempt')
-    expect(failed!.finish?.reason).toBe('error')
-    expect(failed!.retry?.maxRetries).toBe(3)
-    expect(retried!.settlement).toBe('message')
-    expect(retried!.identity.attemptOrdinal).toBe(1)
-    expect(retried!.metrics.promptTokens).toBe(200_100)
-    // TTFT is dispatch → first token, so it lands near the 150ms we waited after dispatch.
-    expect(retried!.metrics.ttftMs).toBeGreaterThanOrEqual(150)
-    expect(retried!.metrics.ttftMs).toBeLessThan(1000)
-    expect(retried!.request.toolsHash).toBeTruthy()
-    expect(retried!.request.headerReason).toBe('initial')
-    expect(retried!.tools[0]?.name).toBe('read')
-    expect(retried!.tools[0]?.resultAt).toBe(2500)
-    expect(feed.store.blobs).toBeGreaterThan(0)
+  it('reads a session once, however many times it is asked', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cache-bricks-logs-'))
+    writeLog(root, 'session-once', [[settled(1, 1, 10, 90)]])
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false, logsRoots: [root] })
+    const router = createRouterFor(collector)
+    await askBricks(router, 'session-once')
+    await askBricks(router, 'session-once')
+    expect(collector.feed('session-once')?.bricks).toHaveLength(1)
   })
 
-  it('reads the context snapshot from the meter and the projections at dispatch', () => {
-    const measured: unknown[] = []
-    const services = {
-      sessions: { get: (id: string) => (id === 's1' ? { id: 's1', requestHeader: () => ({ config: {} }) } : undefined) },
-      tokenMeter: {
-        measure: (session: unknown) => {
-          measured.push(session)
-          return {
-            baseline: { kind: 'usage', tokens: 317_464 },
-            surfaceDeltaTokens: 2947,
-            totalTokens: 320_411,
-            surfaceTokens: 317_229,
-            nodes: [{ seq: 1 }, { seq: 2 }],
-          }
-        },
-      },
-      sessionProjections: {
-        stateOf: (_session: unknown, key: string) => (key === 'contextPressure'
-          ? { contextWindow: 1_000_000, pressureTokens: 317_464, surfaceTokens: 317_229, sampledSurfaceTokens: 314_282 }
-          : { systemTokens: 18_344, toolsTokens: 31_221, messageTokens: 274_661 }),
-      },
-    }
-    const { ctx, listeners } = fakeContext(services as Record<string, unknown>)
-    const collector = installCollector(ctx, { serve: false })
-    listeners.get('llm/stream')!(frozenRequest(), () => ({}))
-    listeners.get('agent/assistant-stream')!({ agent: { session: { id: 's1' } }, frame: { type: 'start', turn: 1, step: 1 } })
-    listeners.get('agent/assistant-stream')!({
-      agent: { session: { id: 's1' } },
-      frame: { type: 'chunk', time: 5, chunk: { type: 'usage', usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3 } } },
-    })
-    const [brick] = collector.feed('s1')!.bricks
-    expect(measured).toHaveLength(1)
-    expect(brick!.context?.contextWindow).toBe(1_000_000)
-    expect(brick!.context?.pressureTokens).toBe(317_464)
-    // projectedTokens = pressure + surface - sampledSurface
-    expect(brick!.context?.projectedTokens).toBe(317_464 + 317_229 - 314_282)
-    expect(brick!.context?.systemTokens).toBe(18_344)
-    expect(brick!.context?.baselineKind).toBe('usage')
-    expect(brick!.context?.nodeCount).toBe(2)
-    expect(brick!.context?.meterRef).toBeTruthy()
-    expect(collector.blob(brick!.context!.meterRef!)).toBeTruthy()
+  it('counts live traffic when there is no log to read, and says nothing about a past it cannot see', async () => {
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false, logsRoots: [join(tmpdir(), 'cache-bricks-nothing-here')] })
+    const router = createRouterFor(collector)
+    const payload = await askBricks(router, 'session-unknown')
+    expect(payload).toBeUndefined()
+    expect(collector.feed('session-unknown')).toBeUndefined()
   })
 
-  it('registers its routes through webServer, and stays inert without one', () => {
-    const registered: { kind: string; path: string }[] = []
-    const services = { webServer: { register: (route: { kind: string; path: string }) => { registered.push(route); return () => undefined } } }
-    const withServer = fakeContext(services as Record<string, unknown>)
-    installCollector(withServer.ctx)
-    expect(registered).toHaveLength(1)
-    expect(registered[0]!.path).toBe('/cache-bricks')
-    expect(registered[0]!.kind).toBe('prefix')
-
-    let injected = 0
-    const noServer: HostContextLike = {
-      on: () => undefined,
-      get: () => undefined,
-      inject(_names, callback) {
-        injected += 1
-        callback(noServer)
-        return undefined
-      },
-      effect: () => undefined,
-    }
-    expect(() => installCollector(noServer)).not.toThrow()
-    expect(injected).toBe(1)
-  })
-
-  it('pushes a new feed to subscribers as bricks arrive', async () => {
-    const { ctx, listeners } = fakeContext()
-    const collector = installCollector(ctx, { serve: false })
-    const seen: number[] = []
-    const unsubscribe = collector.subscribe('s1', (feed) => seen.push(feed.bricks.length))
-    listeners.get('llm/stream')!(frozenRequest(), () => ({}))
-    listeners.get('agent/assistant-stream')!({ agent: { session: { id: 's1' } }, frame: { type: 'start', turn: 1, step: 1 } })
-    listeners.get('agent/assistant-stream')!({
-      agent: { session: { id: 's1' } },
-      frame: { type: 'end', outcome: { kind: 'committed', eventType: 'assistant/message', seq: 9 } },
-    })
-    // Sends are coalesced to one per 100 ms, so the state after the final
-    // observation arrives on the trailing timer rather than inline — and it only
-    // arrives while the subscriber is still attached.
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    expect(seen.length).toBeGreaterThan(0)
-    expect(seen.at(-1)).toBe(1)
-    unsubscribe()
-  })
-
-  it('observes an auxiliary call through a pass-through wrapper', async () => {
-    const { ctx, listeners } = fakeContext()
-    const collector = installCollector(ctx, { serve: false })
-    const tap = listeners.get('llm/stream')!
-    const chunks = [
-      { type: 'text-delta', index: 0, text: 'compacted summary' },
-      { type: 'usage', usage: { inputTokens: 520_000, outputTokens: 300, cacheReadTokens: 1000 } },
-      { type: 'finish', reason: { kind: 'stop' } },
-    ]
-    async function* upstream() {
-      for (const chunk of chunks) yield chunk
-    }
-    const request = { ...frozenRequest() as object, purpose: 'compaction' }
-    const returned = tap(request, () => upstream())
-
-    // The wrapper is not the same object (it has to be iterated to be observed),
-    // but it must deliver exactly the same chunks, in order, unmodified.
-    expect(returned).not.toBe(upstream)
-    const seen: unknown[] = []
-    for await (const chunk of returned as AsyncIterable<unknown>) seen.push(chunk)
-    expect(seen).toEqual(chunks)
-
-    const [brick] = collector.feed('s1')!.bricks
-    expect(brick?.identity.turn).toBe(0)
-    expect(brick?.route.purpose).toBe('compaction')
-    expect(brick?.metrics.textChars).toBe('compacted summary'.length)
-    expect(brick?.metrics.promptTokens).toBe(521_000)
-    expect(brick?.finish?.reason).toBe('stop')
-    // Its end is observed by the wrapper, so it settles rather than hanging.
-    expect(brick?.settlement).toBe('message')
-  })
-
-  it('does not wake the browser for token-level deltas', async () => {
-    const { ctx, listeners } = fakeContext()
-    const collector = installCollector(ctx, { serve: false })
-    const seen: number[] = []
-    collector.subscribe('s1', (feed) => seen.push(feed.bricks.length))
-    const stream = listeners.get('llm/stream')!
-    const frames = listeners.get('agent/assistant-stream')!
-    const agent = { session: { id: 's1' } }
-    stream(frozenRequest(), () => ({}))
-    frames({ agent, frame: { type: 'start', turn: 1, step: 1 } })
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    const afterStart = seen.length
-    // 1500 deltas must not become 1500 feeds.
-    for (let index = 0; index < 1500; index += 1) {
-      frames({ agent, frame: { type: 'chunk', time: index, chunk: { type: 'text-delta', index: 0, text: 'x' } } })
-    }
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    expect(seen.length).toBe(afterStart)
+  it('does not read any log when backfill is off', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cache-bricks-logs-'))
+    writeLog(root, 'session-off', [[settled(1, 1, 10, 90)]])
+    const ctx = host()
+    const collector = installCollector(ctx, { serve: false, backfill: false, logsRoots: [root] })
+    const router = createRouterFor(collector)
+    await askBricks(router, 'session-off')
+    expect(collector.feed('session-off')).toBeUndefined()
   })
 })

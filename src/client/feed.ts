@@ -1,160 +1,126 @@
 /**
  * The browser's end of the collector's HTTP surface.
  *
- * Two rules come straight from the runtime contract (see `docs/runtime-contract.md`):
+ * Two rules come straight from the runtime contract (`docs/runtime-contract.md`), and both are
+ * inherited unchanged from the full line because they are about the *harness*, not about bricks:
  *
- * - URLs are **document-relative**. The served page carries `<base href="./">` and
- *   may sit behind a prefix-stripping mount, so `location.origin + '/cache-bricks'`
- *   would break outside the origin root.
- * - The feed is an optimisation, never a requirement. A composition without a host
- *   half (or an older line) answers 404, and the board must keep working from what
- *   the client can observe by itself — so every failure here resolves to
- *   `unavailable` instead of throwing into a render.
+ * - URLs are **document-relative**. The served page carries `<base href="./">` and may sit behind
+ *   a prefix-stripping mount, so `location.origin + '/cache-bricks'` breaks outside the origin
+ *   root.
+ * - The feed is an optimisation, never a requirement. A composition with no host half answers
+ *   404, and the board must say "no collector" rather than draw an empty gutter that looks like a
+ *   cold cache.
+ *
+ * Bricks are flat, so the protocol is one sentence: *here are the bricks now*. No refs to
+ * resolve, no second request, no reconciliation.
  */
-import type { BrickFeed, BrickRecord } from '../shared/brick'
+import type { BrickFeed } from '../shared/cache-brick'
 
-/** What the client knows about the host feed. */
-export type FeedState = 'idle' | 'connecting' | 'live' | 'unavailable'
+/** The route prefix the host half serves (`host/routes.ts`). */
+export const BASE_PATH = '/cache-bricks'
 
-/** Injected browser APIs, so the client can be unit-tested without a DOM. */
+/** How a feed client reports what it has. `undefined` means "no collector answering". */
+export type FeedSink = (feed: BrickFeed | undefined) => void
+
+/** Injected browser APIs, so this module is unit-testable without a DOM. */
 export interface FeedEnvironment {
   /** Base URI to resolve against; defaults to `document.baseURI`. */
   readonly baseUri?: string
   readonly fetchImpl?: typeof fetch
-  /** `EventSource` constructor; `undefined` disables live updates. */
+  /** `EventSource` constructor; `undefined` disables pushes and leaves the snapshot. */
   readonly eventSourceImpl?: typeof EventSource | undefined
 }
 
-/** Resolve a path against the document base, whatever the mount point is. */
+/**
+ * Resolve a path against the document base, whatever the mount point is.
+ * @param path - the plugin's own route, e.g. `/cache-bricks/bricks`.
+ * @param baseUri - the page's base URI.
+ * @returns an absolute URL string.
+ */
 export function documentRelative(path: string, baseUri: string): string {
   const base = baseUri === '' ? 'http://localhost/' : baseUri
-  return new URL(path, base).toString()
+  return new URL(path.replace(/^\//u, ''), base).toString()
 }
 
-/** One attempt removed of its blob refs, so the panel knows whether to fetch. */
-export function hasRawPayloads(record: BrickRecord): boolean {
-  return record.raw.streamRef !== undefined || record.request.requestRef !== undefined
+/** A session the collector knows about, with nothing in it yet. */
+export function emptyFeed(sessionId: string): BrickFeed {
+  return { sessionId, bricks: [], dropped: 0, endedTurns: [], backfilled: 0, dispatched: 0 }
 }
 
-/** Subscribes to the collector and hands the board a feed whenever it changes. */
+/**
+ * Follow one session.
+ *
+ * The snapshot is fetched first, so a board that opens mid-turn draws the bricks that already
+ * exist; the stream then replaces the whole feed whenever a request settles. A torn frame costs
+ * one repaint, never correctness: every push is the complete list.
+ */
 export class BrickFeedClient {
-  private readonly environment: FeedEnvironment
   private source: EventSource | undefined
   private stopped = false
-
-  /** Latest state, so a late subscriber can paint immediately. */
-  state: FeedState = 'idle'
-
-  /** Latest feed received, if any. */
-  feed: BrickFeed | undefined
+  private readonly environment: FeedEnvironment
 
   constructor(environment: FeedEnvironment = {}) {
     this.environment = environment
   }
 
-  /** The URL of one route, resolved for the current mount. */
-  url(route: string): string {
-    const base = this.environment.baseUri ?? (typeof document === 'undefined' ? '' : document.baseURI)
-    return documentRelative(`cache-bricks/${route}`, base)
-  }
-
   /**
-   * Begin following a session.
-   * @param sessionId - the session whose bricks to show.
-   * @param onFeed - called with every feed received.
-   * @returns a stop function.
+   * Start following a session.
+   *
+   * @param sessionId - the session the board belongs to.
+   * @param sink - called with the bricks whenever they change.
+   * @returns a function that stops following.
    */
-  start(sessionId: string, onFeed: (feed: BrickFeed) => void): () => void {
+  start(sessionId: string, sink: FeedSink): () => void {
     this.stopped = false
-    this.state = 'connecting'
-    void this.fetchOnce(sessionId, onFeed)
-    this.openStream(sessionId, onFeed)
-    return () => { this.stop() }
-  }
-
-  /** Stop following, closing any stream. */
-  stop(): void {
-    this.stopped = true
-    this.source?.close()
-    this.source = undefined
-  }
-
-  /** One snapshot fetch; a failure marks the feed unavailable rather than throwing. */
-  private async fetchOnce(sessionId: string, onFeed: (feed: BrickFeed) => void): Promise<void> {
-    const doFetch = this.environment.fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined)
-    if (doFetch === undefined) {
-      this.state = 'unavailable'
-      return
-    }
+    void this.snapshot(sessionId, sink)
+    const EventSourceImpl = 'eventSourceImpl' in this.environment
+      ? this.environment.eventSourceImpl
+      : (globalThis as { EventSource?: typeof EventSource }).EventSource
+    if (EventSourceImpl === undefined) return () => { this.stopped = true }
+    const url = documentRelative(
+      `${BASE_PATH}/stream?sessionId=${encodeURIComponent(sessionId)}`,
+      this.environment.baseUri ?? document.baseURI,
+    )
     try {
-      const response = await doFetch(this.url(`attempts?sessionId=${encodeURIComponent(sessionId)}`), {
-        headers: { accept: 'application/json' },
-      })
-      if (!response.ok) {
-        // 404 means the collector has not observed this session, which is the
-        // normal state on a composition that has no host half at all — and the
-        // usual cause when there is one is a session id the host never saw, so
-        // name it instead of failing silently.
-        this.state = 'unavailable'
-        if (response.status === 404) {
-          console.info(
-            `[dsh-cache-bricks] the host collector has no observations for session ${sessionId} `
-            + '(HTTP 404); the board falls back to the client-side fold.',
-          )
-        }
-        return
-      }
-      const feed = await response.json() as BrickFeed
-      if (this.stopped) return
-      this.feed = feed
-      this.state = 'live'
-      onFeed(feed)
-    } catch {
-      this.state = 'unavailable'
-    }
-  }
-
-  /** Live updates, when the browser and the host both support them. */
-  private openStream(sessionId: string, onFeed: (feed: BrickFeed) => void): void {
-    const Ctor = this.environment.eventSourceImpl ?? (typeof EventSource === 'function' ? EventSource : undefined)
-    if (Ctor === undefined) return
-    try {
-      const source = new Ctor(this.url(`stream?sessionId=${encodeURIComponent(sessionId)}`))
-      source.addEventListener('feed', (event: MessageEvent<string>) => {
+      const source = new EventSourceImpl(url)
+      this.source = source
+      source.addEventListener('bricks', (event) => {
         if (this.stopped) return
         try {
-          const feed = JSON.parse(event.data) as BrickFeed
-          this.feed = feed
-          this.state = 'live'
-          onFeed(feed)
+          sink(JSON.parse((event as MessageEvent<string>).data) as BrickFeed)
         } catch {
-          // A malformed frame is not worth disturbing the board for.
+          // A torn frame is not worth a broken board: the next settlement sends a whole one.
         }
       })
-      source.addEventListener('error', () => {
-        // The stream may reconnect on its own; the snapshot path already covers
-        // the case where it cannot.
-        if (this.state === 'connecting') this.state = 'unavailable'
-      })
-      this.source = source
+      // A stream that dies says so, so the board stops claiming to be live.
+      source.addEventListener('error', () => { if (!this.stopped) sink(undefined) })
     } catch {
-      // EventSource throws on an unusable URL; the snapshot fetch already ran.
+      sink(undefined)
+    }
+    return () => {
+      this.stopped = true
+      this.source?.close()
+      this.source = undefined
     }
   }
 
-  /** Fetch one stored payload by ref, or undefined when it was evicted. */
-  async blob(ref: string): Promise<unknown> {
-    const doFetch = this.environment.fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined)
-    if (doFetch === undefined) return undefined
+  /** Read the current bricks once, so the first paint is not blank. */
+  private async snapshot(sessionId: string, sink: FeedSink): Promise<void> {
+    const baseUri = this.environment.baseUri ?? document.baseURI
+    const url = documentRelative(`${BASE_PATH}/bricks?sessionId=${encodeURIComponent(sessionId)}`, baseUri)
+    const fetchImpl = this.environment.fetchImpl ?? fetch
     try {
-      const response = await doFetch(this.url(`blob?ref=${encodeURIComponent(ref)}`), {
-        headers: { accept: 'application/json' },
-      })
-      if (!response.ok) return undefined
-      const body = await response.json() as { value?: unknown }
-      return body.value
+      const response = await fetchImpl(url, { headers: { accept: 'application/json' } })
+      if (this.stopped) return
+      if (!response.ok) {
+        // 404 is "this session has no bricks yet" — a real answer from a live collector, not a
+        // failure; anything else means the collector is not there.
+        sink(response.status === 404 ? emptyFeed(sessionId) : undefined)
+        return
+      }
+      sink(await response.json() as BrickFeed)
     } catch {
-      return undefined
+      if (!this.stopped) sink(undefined)
     }
   }
 }

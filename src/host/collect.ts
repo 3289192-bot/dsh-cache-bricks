@@ -1,456 +1,248 @@
 /**
- * The host half's collector: a read-only tap on the model-call path plus the
- * ledger and HTTP surface behind it.
+ * The host half: watch real model calls, and drop a brick when one settles.
  *
- * The whole design rests on one promise: **observing a request must not change
- * it**. DSH makes that easy to keep, and hard to break silently:
+ * Three taps, and the smallest possible amount of work behind each:
  *
- * - `llm/stream` is a waterfall, so its listener *is* the dispatch: the value it
- *   returns is the stream the agent loop consumes. Every path through this module
- *   returns `next()` — a listener that returns nothing would replace the model's
- *   stream with `undefined`.
- * - A loop-built request arrives deep-frozen, so writing to it throws rather than
- *   corrupting the prompt; this module only reads.
- * - Observation happens inside `try`/`catch`: a bug in the ledger must never turn
- *   into a failed model call.
+ * | tap | what it is for | what is done with it |
+ * |---|---|---|
+ * | `llm/stream` | the request itself | counted — a request that settles is a brick, and the count says so |
+ * | `agent/assistant-stream` | identity (`turn`, `step`, `attemptId`) and live chunks | `start` opens an attempt; a `usage` chunk is a placeholder; **deltas are not looked at** |
+ * | `session/event` | the durable settlement with the billed usage | the brick: one per `assistant/message` / `assistant/attempt` |
  *
- * Attempt identity is the other half of the design. `llm/stream` carries the
- * request but no turn/step/attempt id; `agent/assistant-stream` carries the
- * identity but no request. The ledger pairs them through a per-session FIFO, so
- * whichever channel reports first, the two meet.
+ * That is the whole collector. There is no blob store, no request summarizer, no context
+ * snapshot, no retry bookkeeping and no tool tracking, because none of them are part of a brick
+ * (see `shared/cache-brick.ts`). The only structural care taken is the one that matters: this
+ * code runs **inside the model-call path**, so every read of a payload is guarded, `next()` is
+ * always returned untouched, and nothing is ever thrown back into the caller.
  */
-import { BrickLedger, type Observation } from '../core/brick-ledger'
-import { BlobStore } from '../core/blob-store'
-import { createCacheBricksRouter } from './routes'
-import {
-  RequestSummarizer,
-  chunkObservation,
-  compactionObservation,
-  contextObservation,
-  headerObservation,
-  retryObservation,
-  settlementObservation,
-  toolCallObservation,
-  toolResultObservation,
-  type ChunkLike,
-  type RequestLike,
-} from '../core/observe'
-import type { BrickFeed } from '../shared/brick'
+import { AttemptTracker, type AttemptFrame } from './attempt-tracker'
+import { BrickFeeds, type SessionFeed } from './brick-feed'
+import { createBrickRouter, type BricksRouter } from './routes'
+import { readSessionLog } from './session-log'
 
-/** Structural view of the Cordis context this plugin uses. */
+/** The parts of the plugin's Cordis context this half uses, structurally. */
 export interface HostContextLike {
-  on(name: string, listener: (...args: never[]) => unknown, options?: { global?: boolean; prepend?: boolean }): unknown
+  on(event: string, listener: (...args: never[]) => unknown, options?: { global?: boolean; prepend?: boolean }): unknown
   get(name: string): unknown
-  inject(names: readonly string[], callback: (ctx: HostContextLike) => void): unknown
-  effect(callback: () => void | (() => void)): unknown
+  inject(names: string[], callback: (ctx: HostContextLike) => void): unknown
+  effect(callback: () => void): unknown
 }
 
-/** One session's observation state. */
-interface SessionState {
-  readonly ledger: BrickLedger
-  readonly summarizer: RequestSummarizer
-  readonly listeners: Set<(feed: BrickFeed) => void>
-  /** True once the first dropped observation has been reported for this session. */
-  warnedUnattributed: boolean
-}
-
-/** Session lookup surface, as `@deepseek-ai/dsh-session` provides it. */
-interface SessionsLike {
-  get(id: string): unknown
-}
-
-/** Token meter surface, as `@deepseek-ai/dsh-token-meter` provides it. */
-interface TokenMeterLike {
-  measure(session: unknown, header?: unknown): {
-    readonly baseline?: { readonly kind?: string; readonly tokens?: number }
-    readonly surfaceDeltaTokens?: number
-    readonly totalTokens?: number
-    readonly surfaceTokens?: number
-    readonly nodes?: readonly unknown[]
-  }
-}
-
-/** Projection surface, as `@deepseek-ai/dsh-session-projection` provides it. */
-interface ProjectionsLike {
-  stateOf(session: unknown, key: string): unknown
-}
-
-/** Options for {@link installCollector}. */
+/** Capacity and serving options, from the plugin row's config. */
 export interface CollectorOptions {
-  /** Bricks kept per session in memory. */
-  readonly maxBricks?: number
-  /** Session states kept before the least recently used is dropped. */
-  readonly maxSessions?: number
-  /** Bytes kept per session in the blob store. */
-  readonly maxStoreBytes?: number
-  /** Route namespace base path. */
+  /** Bricks kept per session, newest last. */
+  readonly capacity?: number
+  /** Sessions kept. */
+  readonly sessions?: number
+  /** Route prefix; defaults to `/cache-bricks`. */
   readonly basePath?: string
-  /** Disable the HTTP surface (used by tests). */
+  /**
+   * Read a session's own log once, when a browser first asks for its bricks (default true).
+   *
+   * This is the only history this build touches, and it is why an old session is not a blank
+   * gutter: the log's settled attempts become the same eleven-field bricks, oldest first, into the
+   * same ring. Set false for a host that must not read session artifacts at all.
+   */
+  readonly backfill?: boolean
+  /** Extra log roots to search, in order; defaults to `$DSH_SESSION_ROOT` then `$DSH_HOME/sessions`. */
+  readonly logsRoots?: readonly string[]
+  /** Set false to observe without serving (headless profiles, tests). */
   readonly serve?: boolean
 }
 
-/** The collector handle, exposed so a host can inspect what was gathered. */
+/** The collector's own surface, for tests and hosts. */
 export interface Collector {
-  readonly store: BlobStore
-  feed(sessionId: string): BrickFeed | undefined
-  sessions(): readonly string[]
-  blob(ref: string): unknown
-  subscribe(sessionId: string, sink: (feed: BrickFeed) => void): () => void
+  readonly feeds: BrickFeeds
+  feed(sessionId: string): ReturnType<SessionFeed['snapshot']> | undefined
+  sessions(): string[]
+  subscribe(sessionId: string, sink: (feed: ReturnType<SessionFeed['snapshot']>) => void): () => void
+  /** A reader is looking at this session: read its log once, if that has not happened yet. */
+  looked(sessionId: string): void
   dispose(): void
 }
 
+/** How long bricks are allowed to wait for one push. One frame at 60 Hz is 16 ms. */
+const PUBLISH_INTERVAL_MS = 100
+
 /**
- * Install the collector on a host context.
+ * Install the collector.
  * @param ctx - the plugin's Cordis context.
  * @param options - capacity and serving options.
- * @returns the collector, so tests and hosts can read from it directly.
+ * @returns the collector, so a host or a test can read it directly.
  */
 export function installCollector(ctx: HostContextLike, options: CollectorOptions = {}): Collector {
-  const store = new BlobStore({ maxTotalBytes: options.maxStoreBytes ?? 48 * 1024 * 1024 })
-  const sessions = new Map<string, SessionState>()
+  // Sessions whose log has already been read (or found to be unreadable): one pass each, ever.
+  const backfilled = new Set<string>()
+  const backfillEnabled = options.backfill !== false
+
+  const feeds = new BrickFeeds({
+    ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
+    ...(options.capacity === undefined ? {} : { tracker: { capacity: options.capacity } }),
+  })
   let disposed = false
 
-  /** Run an observation without ever letting it reach the caller. */
+  /** Run something that sits inside the model-call path without ever letting it throw. */
   const safely = (action: () => void): void => {
     try {
       action()
     } catch (error) {
-      // Never rethrow: this code sits inside the model-call path.
       console.warn('[dsh-cache-bricks] observation failed:', error instanceof Error ? error.message : error)
     }
   }
 
-  /**
-   * Session states, capped. A long-running host sees many sessions, and each one
-   * holds a ledger and (through the shared store) raw payloads; the oldest is
-   * dropped rather than kept until the plugin is disposed.
-   */
-  const MAX_SESSIONS = options.maxSessions ?? 8
-
-  const stateFor = (sessionId: string): SessionState => {
-    const existing = sessions.get(sessionId)
-    if (existing !== undefined) {
-      // Re-insert to mark it as most recently used.
-      sessions.delete(sessionId)
-      sessions.set(sessionId, existing)
-      return existing
-    }
-    if (sessions.size >= MAX_SESSIONS) {
-      const oldest = sessions.keys().next()
-      if (oldest.done !== true) sessions.delete(oldest.value)
-    }
-    const state: SessionState = {
-      ledger: new BrickLedger(sessionId, {
-        store,
-        ...(options.maxBricks === undefined ? {} : { maxBricks: options.maxBricks }),
-      }),
-      summarizer: new RequestSummarizer(store),
-      listeners: new Set(),
-      warnedUnattributed: false,
-    }
-    sessions.set(sessionId, state)
-    return state
-  }
-
-  const PUBLISH_INTERVAL_MS = 100
+  // --- publishing, coalesced -------------------------------------------------
   let lastPublish = 0
   let trailing: ReturnType<typeof setTimeout> | undefined
 
-  const publishNow = (state: SessionState): void => {
+  const publishNow = (feed: SessionFeed): void => {
     lastPublish = Date.now()
-    // Materializing every brick is the expensive part; skip it when the tab that
-    // asked for the stream has gone.
-    if (state.listeners.size === 0) return
-    const feed = state.ledger.feed()
-    for (const listener of state.listeners) {
-      try {
-        listener(feed)
-      } catch {
-        // A dead SSE client is not the collector's problem.
-      }
-    }
+    feed.publish()
   }
 
   /**
-   * Push the current feed, coalesced to at most one send per
-   * {@link PUBLISH_INTERVAL_MS}. The trailing send matters: the last observation
-   * of an attempt must reach the browser even if it lands inside a quiet window.
+   * Push the current bricks, at most once per {@link PUBLISH_INTERVAL_MS}.
+   *
+   * A settlement is the only thing that calls this, so the coalescing matters for one case only:
+   * a turn that settles several attempts in quick succession (a retry chain) should reach the
+   * browser as one repaint rather than three.
    */
-  const publish = (state: SessionState): void => {
+  const publish = (feed: SessionFeed): void => {
+    if (feed.listeners === 0) return
     const wait = PUBLISH_INTERVAL_MS - (Date.now() - lastPublish)
     if (wait <= 0) {
-      publishNow(state)
+      publishNow(feed)
       return
     }
     if (trailing !== undefined) return
     trailing = setTimeout(() => {
       trailing = undefined
-      publishNow(state)
+      publishNow(feed)
     }, wait)
   }
 
-  /**
-   * Observations worth waking a browser for.
-   *
-   * `agent/assistant-stream` emits one frame per token-level delta, and materializing
-   * every retained brick (up to 400) plus serializing the whole feed on each of a
-   * long answer's ~1500 chunks is pure waste: nothing a brick displays changes
-   * until usage, a tool call, or the attempt ends. Text and reasoning deltas are
-   * still folded — they just do not trigger a push.
-   */
-  const publishable = (observation: Observation): boolean => {
-    if (observation.kind === 'chunk') {
-      const type = observation.chunk.type
-      return type === 'usage' || type === 'finish' || type === 'tool-call'
-    }
-    return true
-  }
+  // --- the taps --------------------------------------------------------------
 
-  const collect = (sessionId: string, observation: Observation): void => {
-    const state = stateFor(sessionId)
-    state.ledger.observe(observation)
-    // A dropped observation is a hole in the record. Say so once per session rather than
-    // every time, and never paper over it by attaching it to an unrelated attempt.
-    if (!state.warnedUnattributed && state.ledger.unattributedCount > 0) {
-      state.warnedUnattributed = true
-      console.warn(
-        `[dsh-cache-bricks] dropped ${String(state.ledger.unattributedCount)} observation(s) for session `
-        + `${sessionId}: no attempt could be identified for them (see feed.unattributed).`,
-      )
-    }
-    if (state.listeners.size === 0) return
-    if (!publishable(observation)) return
-    publish(state)
-  }
-
-  /** Snapshot the context environment at dispatch: pressure, composition, meter. */
-  const snapshotContext = (sessionId: string): void => {
-    const session = (ctx.get('sessions') as SessionsLike | undefined)?.get(sessionId)
-    if (session === undefined) return
-    const pressure = (ctx.get('sessionProjections') as ProjectionsLike | undefined)?.stateOf(session, 'contextPressure') as
-      | { contextWindow?: number; pressureTokens?: number; surfaceTokens?: number; sampledSurfaceTokens?: number }
-      | undefined
-    const breakdown = (ctx.get('sessionProjections') as ProjectionsLike | undefined)?.stateOf(session, 'contextBreakdown') as
-      | { systemTokens?: number; toolsTokens?: number; messageTokens?: number }
-      | undefined
-    const header = (session as { requestHeader?: () => unknown }).requestHeader?.()
-    const meter = (ctx.get('tokenMeter') as TokenMeterLike | undefined)?.measure(session, header)
-    const meterRef = meter === undefined ? undefined : store.put(meter)
-    const projected = pressure?.pressureTokens !== undefined && pressure.surfaceTokens !== undefined
-      && pressure.sampledSurfaceTokens !== undefined
-      ? Math.max(0, pressure.pressureTokens + pressure.surfaceTokens - pressure.sampledSurfaceTokens)
-      : undefined
-    collect(sessionId, {
-      kind: 'pressure',
-      snapshot: {
-        ...(pressure?.contextWindow === undefined ? {} : { contextWindow: pressure.contextWindow }),
-        ...(pressure?.pressureTokens === undefined ? {} : { pressureTokens: pressure.pressureTokens }),
-        ...(projected === undefined ? {} : { projectedTokens: projected }),
-        ...(pressure?.surfaceTokens === undefined ? {} : { surfaceTokens: pressure.surfaceTokens }),
-        ...(breakdown?.systemTokens === undefined ? {} : { systemTokens: breakdown.systemTokens }),
-        ...(breakdown?.toolsTokens === undefined ? {} : { toolsTokens: breakdown.toolsTokens }),
-        ...(breakdown?.messageTokens === undefined ? {} : { messageTokens: breakdown.messageTokens }),
-        ...(meter?.baseline?.kind === undefined
-          ? {}
-          : { baselineKind: meter.baseline.kind as 'none' | 'estimated' | 'usage' }),
-        ...(meter?.baseline?.tokens === undefined ? {} : { baselineTokens: meter.baseline.tokens }),
-        ...(meter?.surfaceDeltaTokens === undefined ? {} : { surfaceDeltaTokens: meter.surfaceDeltaTokens }),
-        ...(meter?.totalTokens === undefined ? {} : { totalMeterTokens: meter.totalTokens }),
-        ...(meter?.nodes === undefined ? {} : { nodeCount: meter.nodes.length }),
-        ...(meterRef === undefined ? {} : { meterRef: meterRef.hash }),
-      },
-    })
-  }
-
-  // --- The model-call tap -------------------------------------------------
-  // `prepend` so the request is captured before any listener that might wrap or
-  // short-circuit the dispatch; `next()` is returned untouched, always.
+  // `prepend` so the request is counted before any listener that might wrap or short-circuit the
+  // dispatch; `next()` is returned untouched, always: returning anything else would replace the
+  // model's stream.
   ctx.on('llm/stream', ((...args: unknown[]) => {
-    const options = args[0] as RequestLike
-    const next = args[1] as () => unknown
-    // Every read of the payload is guarded: a hostile or exotic request object
-    // must not be able to turn into a throw inside the model-call path.
+    const request = args[0] as { sessionId?: unknown } | undefined
+    const next = args[1] as (() => unknown) | undefined
+    // Reading the payload is itself guarded: a hostile or exotic request object must not turn
+    // into a throw inside the model-call path. Anything unreadable is counted as `unknown`.
     let sessionId = 'unknown'
     try {
-      if (typeof options.sessionId === 'string') sessionId = options.sessionId
+      if (typeof request?.sessionId === 'string') sessionId = request.sessionId
     } catch {
       sessionId = 'unknown'
     }
-    safely(() => {
-      snapshotContext(sessionId)
-      collect(sessionId, { kind: 'dispatch', at: Date.now(), options: stateFor(sessionId).summarizer.summarize(options) })
-    })
-    const stream = next()
-    // Reading the payload is itself guarded: this code sits inside the model-call
-    // path, so even a hostile or exotic request object must not turn into a throw
-    // here. Anything unreadable is treated as a normal request.
-    let purpose: unknown
-    try {
-      purpose = options.purpose
-    } catch {
-      purpose = undefined
-    }
-    // An auxiliary call has no Turn attempt to pair with and produces no
-    // `agent/assistant-stream` frames, so its chunks can only be observed by
-    // wrapping the stream. The wrapper yields exactly what it receives: the
-    // request and the stream the caller consumes are both unchanged.
-    if (purpose !== 'compaction' && purpose !== 'session-title') return stream
-    return observeAuxiliary(stream, sessionId)
+    safely(() => { feeds.for(sessionId).attempts.dispatched() })
+    return next?.()
   }) as (...args: never[]) => unknown, { global: true, prepend: true })
 
-  /**
-   * Pass every chunk through untouched while folding it onto the auxiliary brick.
-   * @param stream - the downstream async iterable.
-   * @param sessionId - the session the call belongs to.
-   * @returns an iterable that yields the same chunks in the same order.
-   */
-  async function* observeAuxiliary(stream: unknown, sessionId: string): AsyncGenerator<unknown> {
-    try {
-      for await (const chunk of stream as AsyncIterable<unknown>) {
-        safely(() => {
-          collect(sessionId, {
-            kind: 'chunk',
-            at: Date.now(),
-            chunk: chunkObservation(chunk as ChunkLike),
-            auxiliary: true,
-          })
-        })
-        yield chunk
-      }
-    } finally {
-      safely(() => {
-        collect(sessionId, { kind: 'attempt-end', at: Date.now(), outcome: 'committed', auxiliary: true })
-      })
-    }
-  }
-
-  // --- Live attempt frames ------------------------------------------------
+  // The identity channel. Only `start` and a `usage` chunk are read; a text or reasoning delta
+  // costs one property read and returns.
   ctx.on('agent/assistant-stream', ((...args: unknown[]) => {
-    const payload = args[0] as {
-      agent?: { session?: { id?: string } }
-      frame?: {
-        type?: string
-        attemptId?: string
-        revision?: number
-        turn?: number
-        step?: number
-        time?: number
-        chunk?: ChunkLike
-        outcome?: { kind?: string; eventType?: string; seq?: number }
-      }
-    }
+    const payload = args[0] as { agent?: { session?: { id?: string } }; frame?: AttemptFrame } | undefined
     const frame = payload?.frame
     if (frame === undefined) return
     safely(() => {
-      const sessionId = payload.agent?.session?.id ?? 'unknown'
-      const state = stateFor(sessionId)
-      if (frame.type === 'start') {
-        void state
-        collect(sessionId, {
-          kind: 'attempt-start',
-          at: Date.now(),
-          turn: frame.turn ?? 0,
-          step: frame.step ?? 0,
-          ...(frame.attemptId === undefined ? {} : { attemptId: frame.attemptId }),
-          ...(frame.revision === undefined ? {} : { revision: frame.revision }),
-        })
-        return
-      }
-      if (frame.type === 'chunk') {
-        if (frame.chunk === undefined) return
-        collect(sessionId, { kind: 'chunk', at: frame.time ?? Date.now(), chunk: chunkObservation(frame.chunk) })
-        return
-      }
-      if (frame.type === 'end') {
-        const committed = frame.outcome?.kind === 'committed'
-        collect(sessionId, {
-          kind: 'attempt-end',
-          at: Date.now(),
-          outcome: committed ? 'committed' : 'abandoned',
-          ...(committed && frame.outcome?.eventType !== undefined
-            ? { eventType: frame.outcome.eventType as 'assistant/message' | 'assistant/attempt' }
-            : {}),
-          ...(frame.outcome?.seq === undefined ? {} : { seq: frame.outcome.seq }),
-        })
-      }
+      const sessionId = payload?.agent?.session?.id ?? 'unknown'
+      feeds.for(sessionId).attempts.frame(frame)
     })
   }) as (...args: never[]) => unknown, { global: true })
 
-  // --- Durable session records -------------------------------------------
+  // The settlement channel: this is what makes a brick. `assistant/attempt` is a failed attempt
+  // (a transport error, a retry that replaced it) and settles exactly like a message does, which
+  // is why a retried step comes out as two bricks without any retry bookkeeping at all.
   ctx.on('session/event', ((...args: unknown[]) => {
     const session = args[0] as { id?: string } | undefined
-    const event = args[1] as { type?: string; seq?: number; time?: number; data?: unknown } | undefined
+    const event = args[1] as { type?: string; time?: number; data?: unknown } | undefined
     if (session?.id === undefined || event?.type === undefined) return
     safely(() => {
       const sessionId = session.id!
-      switch (event.type) {
-        case 'request/header':
-          collect(sessionId, headerObservation({ seq: event.seq, data: event.data as never }, store) ?? { kind: 'flush', at: Date.now() })
-          break
-        case 'request/context':
-          safely(() => {
-            const observation = contextObservation({ data: event.data as never })
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        case 'assistant/message':
-        case 'assistant/attempt':
-          safely(() => {
-            const observation = settlementObservation({ seq: event.seq, time: event.time, data: event.data as never }, store)
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        case 'turn/end': {
-          const turn = (event.data as { turn?: number } | undefined)?.turn
-          if (typeof turn === 'number') collect(sessionId, { kind: 'turn-end', turn })
-          break
+      const feed = feeds.for(sessionId)
+      if (event.type === 'turn/end') {
+        const turn = (event.data as { turn?: unknown } | undefined)?.turn
+        if (typeof turn === 'number') {
+          feed.attempts.turnEnded(turn)
+          publish(feed)
         }
-        case 'compaction/start':
-          safely(() => {
-            const observation = compactionObservation({ data: event.data as never })
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        case 'llm/retry':
-          safely(() => {
-            const observation = retryObservation({ data: event.data as never })
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        case 'tool/call':
-          safely(() => {
-            const observation = toolCallObservation({ seq: event.seq, time: event.time, data: event.data as never }, store)
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        case 'tool/result':
-          safely(() => {
-            const observation = toolResultObservation({ time: event.time, data: event.data as never }, store)
-            if (observation !== undefined) collect(sessionId, observation)
-          })
-          break
-        default:
-          break
+        return
       }
+      if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') return
+      const data = (event.data ?? {}) as {
+        turn?: unknown
+        step?: unknown
+        usage?: { inputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+        stream?: readonly unknown[]
+      }
+      const brick = feed.attempts.settle({
+        ...(typeof data.turn === 'number' ? { turn: data.turn } : {}),
+        ...(typeof data.step === 'number' ? { step: data.step } : {}),
+        ...(event.time === undefined ? {} : { time: event.time }),
+        ...(data.usage === undefined ? {} : {
+          usage: {
+            inputTokens: data.usage.inputTokens ?? 0,
+            ...(data.usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: data.usage.cacheReadTokens }),
+            ...(data.usage.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: data.usage.cacheWriteTokens }),
+          },
+        }),
+        ...(data.stream === undefined ? {} : { stream: data.stream }),
+      })
+      if (brick !== undefined) publish(feed)
     })
   }) as (...args: never[]) => unknown, { global: true })
 
-  // --- HTTP surface -------------------------------------------------------
-  const collector: Collector = {
-    store,
-    feed: (sessionId) => sessions.get(sessionId)?.ledger.feed(),
-    sessions: () => [...sessions.keys()],
-    blob: (ref) => store.get(ref),
-    subscribe: (sessionId, sink) => {
-      const state = stateFor(sessionId)
-      state.listeners.add(sink)
-      return () => {
-        state.listeners.delete(sink)
+  /**
+   * Fill a session's ring from its own log, once, when a browser first looks at it.
+   *
+   * Deliberately *not* done when the collector merely sees an event for a session: an active
+   * session is already producing live bricks and its past is the least interesting thing about it.
+   * The trigger is a reader asking, which is also when the cost is worth paying.
+   *
+   * @param sessionId - the session a browser asked about.
+   */
+  const ensureBackfilled = (sessionId: string): void => {
+    if (!backfillEnabled || backfilled.has(sessionId)) return
+    backfilled.add(sessionId)
+    void (async () => {
+      try {
+        const read = await readSessionLog(sessionId, {
+          ...(options.logsRoots === undefined ? {} : { roots: options.logsRoots }),
+        })
+        if (read === undefined || disposed) return
+        const feed = feeds.for(sessionId)
+        let added = 0
+        for (const settlement of read.settlements) {
+          if (feed.attempts.settleFromLog(settlement) !== undefined) added += 1
+        }
+        for (const turn of read.endedTurns) feed.attempts.turnEnded(turn)
+        if (added > 0) {
+          feed.publish()
+          console.info(
+            `[dsh-cache-bricks] read ${String(added)} settled attempt(s) for ${sessionId} `
+            + `from ${read.path} (${String(read.records)} records, ${String(read.frames)} frame(s))`,
+          )
+        }
+      } catch (error) {
+        // A log that cannot be read is not a reason to stop counting live requests.
+        console.warn('[dsh-cache-bricks] session log backfill failed:', error instanceof Error ? error.message : error)
       }
-    },
+    })()
+  }
+
+  // --- HTTP ------------------------------------------------------------------
+
+  const collector: Collector = {
+    feeds,
+    feed: (sessionId) => feeds.peek(sessionId)?.snapshot(),
+    sessions: () => feeds.sessions(),
+    subscribe: (sessionId, sink) => feeds.for(sessionId).subscribe(sink),
+    looked: (sessionId) => { ensureBackfilled(sessionId) },
     dispose: () => {
       disposed = true
-      sessions.clear()
+      feeds.dispose()
       if (trailing !== undefined) {
         clearTimeout(trailing)
         trailing = undefined
@@ -459,16 +251,16 @@ export function installCollector(ctx: HostContextLike, options: CollectorOptions
   }
 
   if (options.serve !== false) {
-    const router = createCacheBricksRouter({
-      feed: (sessionId) => collector.feed(sessionId),
+    const router: BricksRouter = createBrickRouter({
+      bricks: (sessionId) => collector.feed(sessionId),
       sessions: () => collector.sessions(),
-      blob: (ref) => collector.blob(ref),
       subscribe: (sessionId, sink) => collector.subscribe(sessionId, sink),
+      // A browser is looking at this session: this is the moment its recorded past is worth a read.
+      looked: (sessionId) => { collector.looked(sessionId) },
     }, {
       ...(options.basePath === undefined ? {} : { basePath: options.basePath }),
-      // Prefer the harness's own request policy: it applies the same host, origin
-      // and browser-authentication checks as /api, which matters because /blob
-      // serves whole requests, tool arguments and streams.
+      // Prefer the harness's own request policy: the board is as reachable as the rest of the
+      // GUI and no more.
       guard: (request) => {
         const connection = ctx.get('connection') as
           | { requestRejection?: (request: unknown) => number | undefined }
@@ -485,3 +277,6 @@ export function installCollector(ctx: HostContextLike, options: CollectorOptions
 
   return collector
 }
+
+/** The tracker type, re-exported for a host that wants to read a feed directly. */
+export type { AttemptTracker }

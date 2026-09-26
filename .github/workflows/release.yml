@@ -2,8 +2,10 @@ name: GitHub release
 
 on:
   push:
+    # Every release tag, not the one that happened to be current when this file was written:
+    # v0.1.3 was published by hand because this pattern still said 'v0.1.2'.
     tags:
-      - 'v0.1.2'
+      - 'v*'
 
 permissions:
   contents: write

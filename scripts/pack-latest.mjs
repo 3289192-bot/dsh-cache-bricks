@@ -1,10 +1,21 @@
-// Produce the versionless release asset name `dsh-cache-bricks.tgz` from the
-// versioned `pnpm pack` output, so a download link stays stable across versions.
-import { copyFileSync, readFileSync } from 'node:fs'
+/**
+ * Pack the release tarball, and keep a copy under the name the GitHub release uses.
+ *
+ * Usage: pnpm run pack:latest
+ */
+import { copyFileSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-const src = `${pkg.name}-${pkg.version}.tgz`
-const dst = `${pkg.name}.tgz`
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const wanted = `dsh-cache-bricks-${String(pkg.version)}.tgz`
 
-copyFileSync(src, dst)
-console.log(`packed ${src} and ${dst}`)
+const found = readdirSync(root).filter((name) => name === wanted)
+if (found.length === 0) {
+  console.error(`no ${wanted} in the package root — run \`pnpm pack\` first`)
+  process.exit(1)
+}
+const bytes = statSync(join(root, wanted)).size
+copyFileSync(join(root, wanted), join(root, 'dsh-cache-bricks.tgz'))
+console.log(`packed ${wanted} and dsh-cache-bricks.tgz (${String(bytes)} bytes, version ${String(pkg.version)})`)

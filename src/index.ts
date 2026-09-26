@@ -1,18 +1,16 @@
 /**
  * Node-half entry.
  *
- * The cache badge is a browser-facing plugin, but its data cannot be gathered in
- * the browser: the outgoing request, the attempt identity, the retry records and
- * the token-meter snapshot only exist on the host. This half therefore installs a
- * **read-only** collector (see `./host/collect`) and serves what it gathered over
- * its own HTTP namespace.
+ * A browser cannot see a model call: the request, the usage the provider billed and the attempt
+ * identity only exist on the host. This half watches them and turns each settled request into a
+ * brick; the other half draws it. Nothing is stored — see `shared/cache-brick.ts` for what a
+ * brick is, and for the list of things this version deliberately does not carry.
  *
- * It adds no tool, no prompt section and no request rewrite: the plugin's only
- * interaction with the model-call path is an `llm/stream` observer that returns
- * `next()` untouched. The two server-side facts that make this safe are the
- * waterfall contract (returning anything else would replace the model's stream)
- * and the deep-frozen loop request (writing to it throws), both verified against
- * the installed runtime.
+ * It adds no tool, no prompt section and no request rewrite: the plugin's only interaction with
+ * the model-call path is an `llm/stream` observer that returns `next()` untouched. The two
+ * server-side facts that make this safe are the waterfall contract (returning anything else
+ * would replace the model's stream) and the deep-frozen loop request (writing to it throws),
+ * both verified against the installed runtime.
  */
 import { installCollector, type CollectorOptions } from './host/collect'
 import type { HostContextLike } from './host/collect'

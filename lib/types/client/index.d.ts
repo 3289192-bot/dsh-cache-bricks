@@ -1,22 +1,16 @@
 import type { Context } from '@deepseek-ai/cordis';
-import { type LoadReport } from './navigation';
-/** How one load ended, in one short sentence for the panel. */
-export declare function loadText(report: LoadReport): string;
 /**
- * Services required by the cache-bricks browser half.
- *
- * Only `slots` is a hard dependency (always present on the web surface). The
- * conversation-node registry — where a node Definition is registered — is
- * core-owned and its service key has changed across core versions (0.1.7
- * exposes `ctx.uiConversation.events`; legacy `ctx.conversationEvents` still
- * exists on other cores). It is resolved structurally with `ctx.get` instead
- * of being injected or read as a property: a loader entry is a sibling of the
- * core entry that provides the service, so property access without `inject`
- * throws `cannot get property "<name>" without inject` and would fail apply —
- * not degrade. `ctx.get` reads the global service store and returns
- * `undefined` when absent, so a missing or renamed registry disables only the
- * board, never pending or boot failure.
+ * The service this half needs. Declared here rather than at module scope so a composition
+ * without a slot registry fails to activate this half only — the host half keeps counting
+ * requests, and the board simply never appears.
  */
 export declare const inject: string[];
-/** Register the per-Turn reading and the brick board that paints it. */
+/**
+ * Register the board's seat.
+ *
+ * `conversation.composer.dock` is the session-scoped seat that carries `sessionId`; the board
+ * anchors itself to the transcript's own scrollport from there.
+ *
+ * @param ctx - the plugin context.
+ */
 export declare function apply(ctx: Context): void;

@@ -22,6 +22,12 @@ function purityGate(): NonNullable<UserConfig['plugins']>[number] {
   return {
     name: 'dsh-client-bundle-purity',
     resolveId(source: string) {
+      // The host half reads files; the browser half must never reach for a Node builtin.
+      if (source.startsWith('node:')) {
+        throw new Error(
+          `client bundle purity: "${source}" is a Node builtin — the board draws bricks and nothing else`,
+        )
+      }
       if (!source.startsWith('@deepseek-ai/')) return null
       if (EXTERNALS.includes(source)) return null
       throw new Error(
