@@ -665,6 +665,28 @@ export interface BoardWindow {
   /** The Turn columns inside the window, oldest first. */
   readonly columns: readonly BoardColumn[]
   /**
+   * Absolute index of the first column inside the window — an index into the **full**
+   * column list, not into {@link columns}.
+   *
+   * This pair is what makes a paint cost the viewport instead of the session: a board
+   * holding fifty thousand Turns walks the same three hundred cells it draws, because
+   * the arithmetic that chose them is here, in one tested function, rather than in a
+   * loop that re-derives `windowCell` for every brick in the session and throws most
+   * of the answers away.
+   */
+  readonly columnStart: number
+  /** Absolute index one past the last column inside the window. */
+  readonly columnEnd: number
+  /**
+   * The first row inside the window, and one past the last, in each column's own row
+   * numbering (`0` is the brick resting on the floor).
+   *
+   * A column shorter than `rowEnd` simply has nothing at those rows: the caller clamps
+   * against `column.bricks.length`, so one range serves columns of every height.
+   */
+  readonly rowStart: number
+  readonly rowEnd: number
+  /**
    * Columns reserved to the right of the newest Turn: 1 once the newest Turn has
    * ended, so the next task drops into the freed column. Part of the content, so it
    * pans with it.
@@ -708,34 +730,49 @@ export function tallestColumn(columns: readonly BoardColumn[]): number {
  * and every column keeps the cell placement 1.7.1 gave it, shifted left by exactly
  * `back` cells.
  *
+ * The window is **computed, not scanned**. Everything the loop below used to decide is a
+ * comparison against one cell coordinate, so the visible columns are one subtraction away
+ * and the two counts follow from the same number. That is what lets a session of fifty
+ * thousand Turns cost the same as a session of fifty: the cost of the window is the size of
+ * the window.
+ *
  * @param columns - every known Turn column, oldest first.
  * @param capacity - columns the window can hold.
  * @param back - columns hidden to the right of the window.
- * @returns the columns inside the window, the lead, and how many are hidden on each side.
+ * @returns the columns inside the window, the lead, how many are hidden on each side, and
+ *   the window's own half-open index range into `columns`.
  */
 export function windowColumns(
   columns: readonly BoardColumn[],
   capacity: number,
   back: number,
-): { columns: readonly BoardColumn[]; lead: number; older: number; newer: number } {
+): {
+  columns: readonly BoardColumn[]
+  lead: number
+  older: number
+  newer: number
+  columnStart: number
+  columnEnd: number
+} {
   const lead = leadOf(columns)
   const newestIndex = columns.length - 1
-  const kept: BoardColumn[] = []
-  let older = 0
-  let newer = 0
-  for (let index = 0; index < columns.length; index += 1) {
-    const distance = newestIndex - index + lead - back
-    if (distance < 0) {
-      newer += 1
-      continue
-    }
-    if (distance > capacity - 1) {
-      older += 1
-      continue
-    }
-    kept.push(columns[index]!)
+  // The cell the newest column would occupy: `back` cells left of the live corner once the
+  // lead cell is accounted for. One coordinate decides the whole window.
+  const newestCell = newestIndex + lead - back
+  // A column is inside when `0 <= newestCell - index <= capacity - 1`.
+  const firstRaw = newestCell - (capacity - 1)
+  const columnStart = Math.min(columns.length, Math.max(0, firstRaw))
+  const columnEnd = Math.max(columnStart, Math.min(columns.length, Math.max(0, newestCell + 1)))
+  return {
+    columns: columnStart === columnEnd ? [] : columns.slice(columnStart, columnEnd),
+    lead,
+    // `older` is every column left of the window, `newer` every column right of it. Both are
+    // distances from `newestCell`, so neither needs the columns themselves.
+    older: Math.min(columns.length, Math.max(0, firstRaw)),
+    newer: Math.min(columns.length, Math.max(0, newestIndex - newestCell)),
+    columnStart,
+    columnEnd,
   }
-  return { columns: kept, lead, older, newer }
 }
 
 /**
@@ -746,6 +783,7 @@ export function windowColumns(
  * @param capacity - columns the window can hold.
  * @param limit - rows a column may fill inside the window.
  * @param lead - the reserved lead cell.
+ * @param tallest - the tallest column, when the caller already measured it.
  * @returns the largest `back`/`up` the content can honour.
  */
 export function scrollLimit(
@@ -753,10 +791,11 @@ export function scrollLimit(
   capacity: number,
   limit: number,
   lead: number,
+  tallest: number = tallestColumn(columns),
 ): BoardScroll {
   return {
     back: Math.max(0, columns.length + lead - capacity),
-    up: Math.max(0, tallestColumn(columns) - limit),
+    up: Math.max(0, tallest - limit),
   }
 }
 
@@ -833,6 +872,8 @@ export function windowCell(
  * @param metrics - the window's brick geometry.
  * @param scroll - the requested pan, or undefined to follow the live edge.
  * @param laneShown - whether the auxiliary lane takes the window's top row.
+ * @param tallest - the tallest column, when the caller has already measured it (the view
+ *   caches it per content array, so a repaint does not rescan the session).
  * @returns the window, the pan actually applied, and both ends of the rail.
  */
 export function boardWindow(
@@ -840,23 +881,82 @@ export function boardWindow(
   metrics: BoardMetrics,
   scroll: BoardScroll | undefined,
   laneShown: boolean,
+  tallest: number = tallestColumn(columns),
 ): BoardWindow {
   const lead = leadOf(columns)
   const limit = columnRowLimit(metrics, laneShown)
-  const limitScroll = scrollLimit(columns, metrics.columns, limit, lead)
+  const limitScroll = scrollLimit(columns, metrics.columns, limit, lead, tallest)
   const applied = clampScroll(scroll ?? liveScroll(columns, limit), limitScroll)
-  const { columns: visible, older, newer } = windowColumns(columns, metrics.columns, applied.back)
+  const { columns: visible, older, newer, columnStart, columnEnd } = windowColumns(columns, metrics.columns, applied.back)
   return {
     columns: visible,
+    columnStart,
+    columnEnd,
+    rowStart: applied.up,
+    rowEnd: applied.up + limit,
     lead,
     lane: auxLaneRow(metrics, laneShown),
     limit,
     scroll: applied,
     limitScroll,
-    tallest: tallestColumn(columns),
+    tallest,
     older,
     newer,
   }
+}
+
+/**
+ * The newest Turn on the board, or undefined on an empty one.
+ * @param columns - every known Turn column, oldest first.
+ * @returns the newest Turn's number.
+ */
+export function newestTurnOf(columns: readonly BoardColumn[]): number | undefined {
+  return columns.length === 0 ? undefined : columns[columns.length - 1]!.turn
+}
+
+/**
+ * How many columns are newer than `turn` — a binary search, because history has no length limit.
+ * @param columns - every known Turn column, oldest first.
+ * @param turn - the Turn to count from.
+ * @returns columns whose Turn is greater than `turn`.
+ */
+export function countNewerThan(columns: readonly BoardColumn[], turn: number): number {
+  let low = 0
+  let high = columns.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (columns[mid]!.turn <= turn) low = mid + 1
+    else high = mid
+  }
+  return columns.length - low
+}
+
+/**
+ * The pan a board keeps when its content changed underneath it.
+ *
+ * A reader who has panned back must not be slid further back by the session moving: when new
+ * Turns **append** at the live end, the window holds the same columns by adding the appended
+ * count to `back`. The count is of columns *newer* than the newest one seen before, never of
+ * columns added — because history also grows at the **older** end, one page at a time
+ * (`loadOlder`), and a prepend must leave the pan exactly where it was. Counting the delta of
+ * `columns.length` cannot tell the two apart, and adding it turned every landed page into a
+ * jump into the past.
+ *
+ * @param scroll - the pan in force, or undefined while the board follows the live end.
+ * @param columns - the content as it is now.
+ * @param previousNewestTurn - the newest Turn at the previous paint.
+ * @returns the pan to paint with.
+ */
+export function heldScroll(
+  scroll: BoardScroll | undefined,
+  columns: readonly BoardColumn[],
+  previousNewestTurn: number | undefined,
+): BoardScroll | undefined {
+  const newest = newestTurnOf(columns)
+  if (scroll === undefined || scroll.back === 0) return scroll
+  if (newest === undefined || previousNewestTurn === undefined || newest <= previousNewestTurn) return scroll
+  const appended = countNewerThan(columns, previousNewestTurn)
+  return appended === 0 ? scroll : { back: scroll.back + appended, up: scroll.up }
 }
 
 /**

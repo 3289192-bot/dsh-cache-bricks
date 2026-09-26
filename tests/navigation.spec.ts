@@ -15,8 +15,10 @@ import {
   covers,
   durableEventsOf,
   ensureBrickTargetLoaded,
+  HistoryPager,
   loadRequestForTurn,
   loadRequestOf,
+  onWindowChange,
   readTranscript,
   resolveHistoricalStep,
   sessionFaceOf,
@@ -335,5 +337,162 @@ describe('resolving a folded step against the durable log', () => {
   it('says nothing at all without a session face, instead of guessing from the DOM', () => {
     expect(resolveHistoricalStep(undefined, { kind: 'historical-step', turn: 4, step: 1, loadSeq: 102 }))
       .toBeUndefined()
+  })
+})
+
+
+/**
+ * Paging older history in.
+ *
+ * The board asks on every paint while the reader sits near the left edge, and the official
+ * `loadOlder()` is a silent no-op when it cannot page — it never rejects and never reports what
+ * it did. So everything that keeps this from becoming a request loop is decided here: when to
+ * ask, and what counts as evidence that asking worked (the window moved).
+ */
+describe('HistoryPager: one page at a time, and never the same page twice', () => {
+  /**
+   * A paging session.
+   *
+   * `loadOlder` behaves the way the runtime's does: it prepends a page into the same window and
+   * bumps the revision — that is the only evidence a pager ever gets that asking worked. Set
+   * `silent` to model the other case the guard exists for: a page that resolves and changes
+   * nothing.
+   */
+  function pagingSession(options: { hasMore?: boolean; loadingOlder?: boolean; silent?: boolean } = {}) {
+    let entries = 3
+    let revision = 1
+    let oldest = 100
+    let hasMore = options.hasMore ?? true
+    const session = {
+      asked: 0,
+      /** Prepend a page the way the runtime does: entries at the older end, revision bumped. */
+      prepend(count = 3, more = true): void {
+        entries += count
+        oldest -= count * 10
+        revision += 1
+        hasMore = more
+      },
+      loadOlder: async (): Promise<void> => {
+        session.asked += 1
+        if (options.silent !== true) session.prepend()
+      },
+      getSnapshot: () => ({ hasMore, loadingOlder: options.loadingOlder === true }),
+      eventSource: {
+        getSnapshot: (): WindowSnapshot => ({
+          hasMore,
+          revision,
+          entries: Array.from({ length: entries }, (_, index) => ({
+            type: 'event' as const,
+            event: { type: 'step/start', seq: oldest + index, time: oldest + index },
+          })),
+        }),
+      },
+    }
+    return session
+  }
+
+  it('keeps paging while the reader stays at the edge, one page per ask', async () => {
+    const session = pagingSession()
+    const pager = new HistoryPager(session)
+    // Each landed page is a new window, so the next ask is a real page rather than a repeat.
+    expect(await pager.need()).toBe('loaded')
+    expect(await pager.need()).toBe('loaded')
+    expect(session.asked).toBe(2)
+    expect(pager.loadedPages).toBe(2)
+    // And it stops the moment the session says history is exhausted.
+    session.prepend(3, false)
+    expect(await pager.need()).toBe('no-more')
+    expect(session.asked).toBe(2)
+  })
+
+  it('never asks the same window twice, which is what stops it being a loop', async () => {
+    // A page that resolves without moving the window is the one case where asking again on the
+    // next frame would spin: the board asks every frame it is near the edge.
+    const session = pagingSession({ silent: true })
+    const pager = new HistoryPager(session)
+    expect(await pager.need()).toBe('stalled')
+    expect(await pager.need()).toBe('stalled')
+    expect(await pager.need()).toBe('stalled')
+    expect(session.asked).toBe(1)
+    // A window that moves later (a jump, the conversation's own loader) may be asked from again.
+    session.prepend()
+    expect(await pager.need()).toBe('stalled')
+    expect(session.asked).toBe(2)
+  })
+
+  it('stops asking once the session says there is nothing older', async () => {
+    const session = pagingSession({ hasMore: false })
+    const pager = new HistoryPager(session)
+    expect(await pager.need()).toBe('no-more')
+    expect(await pager.need()).toBe('no-more')
+    expect(session.asked).toBe(0)
+  })
+
+  it('never overlaps a page: not its own, and not one the session is already running', async () => {
+    const session = pagingSession()
+    let release = (): void => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const real = session.loadOlder
+    session.loadOlder = async (): Promise<void> => { await gate; await real() }
+    const pager = new HistoryPager(session)
+    const inFlight = pager.need()
+    // Two frames of the same drag must not become two pages.
+    expect(await pager.need()).toBe('busy')
+    release()
+    expect(await inFlight).toBe('loaded')
+    expect(session.asked).toBe(1)
+    // A page the session is running on its own account is not one to lean on either.
+    expect(await new HistoryPager(pagingSession({ loadingOlder: true })).need()).toBe('busy')
+  })
+
+  it('reports a core that cannot page instead of pretending', async () => {
+    const pager = new HistoryPager({ loadThrough: async () => {}, getSnapshot: () => ({ hasMore: true }) })
+    expect(await pager.need()).toBe('unavailable')
+    expect(await new HistoryPager(undefined).need()).toBe('unavailable')
+  })
+
+  it('survives a loader that rejects, because a page is not worth a broken board', async () => {
+    const session = pagingSession()
+    session.loadOlder = async (): Promise<void> => { session.asked += 1; throw new Error('transport') }
+    const pager = new HistoryPager(session)
+    expect(await pager.need()).toBe('stalled')
+    expect(session.asked).toBe(1)
+  })
+
+  it('forgets what it asked when it is aimed at another session', async () => {
+    const first = pagingSession()
+    const second = pagingSession()
+    const pager = new HistoryPager(first)
+    expect(await pager.need()).toBe('loaded')
+    pager.aim(second)
+    expect(await pager.need()).toBe('loaded')
+    expect(second.asked).toBe(1)
+    expect(first.asked).toBe(1)
+  })
+})
+
+describe('onWindowChange: the two official signals, either or both', () => {
+  it('subscribes to the window and the session, and disposes both', () => {
+    let windowStops = 0
+    let sessionStops = 0
+    let fired = 0
+    const session: SessionFace = {
+      loadThrough: async () => {},
+      subscribe: () => () => { sessionStops += 1 },
+      eventSource: {
+        getSnapshot: () => window([]),
+        subscribe: () => () => { windowStops += 1 },
+      },
+    }
+    const stop = onWindowChange(session, () => { fired += 1 })
+    stop()
+    expect([windowStops, sessionStops]).toEqual([1, 1])
+    expect(fired).toBe(0)
+  })
+
+  it('is a no-op on a core that publishes neither, instead of throwing', () => {
+    const bare: SessionFace = { loadThrough: async () => {}, eventSource: { getSnapshot: () => window([]) } }
+    expect(() => onWindowChange(bare, () => {})()).not.toThrow()
+    expect(() => onWindowChange(undefined, () => {})()).not.toThrow()
   })
 })

@@ -24,8 +24,11 @@ import {
   cellPlacement,
   clampScroll,
   columnRowLimit,
+  countNewerThan,
+  heldScroll,
   leadOf,
   liveScroll,
+  newestTurnOf,
   pitchX,
   pitchY,
   railGeometry,
@@ -265,6 +268,75 @@ describe('rail geometry', () => {
   })
 })
 
+/**
+ * The window as an **index range**, which is what lets a paint cost the viewport instead of
+ * the session. The range has to agree with `windowCell` for every brick — that is the whole
+ * contract — so it is asserted against the cell arithmetic it replaces, over a matrix of
+ * shapes, rather than against a second copy of the same formula.
+ */
+describe('the window states its own index range', () => {
+  it('names exactly the columns windowCell calls visible', () => {
+    for (const length of [1, 2, 7, 40]) {
+      const columns = Array.from({ length }, (_, index) => column(index + 1, 3, index !== length - 1))
+      for (const capacity of [1, 2, 4, 9]) {
+        for (let back = 0; back <= length + 1; back += 1) {
+          const window = boardWindow(columns, metrics(capacity, 6), { back, up: 0 }, false)
+          const byCell = columns.filter((_, index) => windowCell(
+            length - 1 - index,
+            0,
+            window.lead,
+            window.scroll,
+            capacity,
+            window.limit,
+          ) !== undefined)
+          expect(window.columns).toEqual(byCell)
+          expect(window.columnStart).toBe(byCell.length === 0 ? window.columnStart : columns.indexOf(byCell[0]!))
+          expect(window.columnEnd - window.columnStart).toBe(byCell.length)
+        }
+      }
+    }
+  })
+
+  it('names exactly the rows the pan leaves inside, lane included', () => {
+    const columns = [column(1, 20), column(2, 4, false)]
+    const live = boardWindow(columns, metrics(4, 6), undefined, false)
+    expect([live.rowStart, live.rowEnd]).toEqual([0, 6])
+    const raised = boardWindow(columns, metrics(4, 6), { back: 0, up: 14 }, false)
+    expect([raised.rowStart, raised.rowEnd]).toEqual([14, 20])
+    // One row less per column while the auxiliary lane owns the window's top row.
+    const laned = boardWindow(columns, metrics(4, 6), undefined, true)
+    expect([laned.rowStart, laned.rowEnd]).toEqual([0, 5])
+    // A column shorter than the range simply has nothing there — the caller clamps.
+    expect(laned.rowEnd).toBeGreaterThan(columns[1]!.bricks.length)
+  })
+
+  it('costs the window, not the session', () => {
+    const huge = Array.from({ length: 50_000 }, (_, index) => column(index + 1, 3))
+    const window = boardWindow(huge, metrics(10, 40), { back: 25_000, up: 0 }, false)
+    // Ten columns on screen out of fifty thousand: the window is the viewport, and the
+    // columns it names are the ones `windowCell` would have picked out of all of them.
+    expect(window.columns).toHaveLength(10)
+    expect(window.columnEnd - window.columnStart).toBe(10)
+    // Twenty-five thousand cells left behind, the reserved lead cell among the ones to the
+    // right, and the ten the pan actually bought.
+    expect(window.older).toBe(24_991)
+    expect(window.newer).toBe(24_999)
+    expect(huge[window.columnStart]!.turn).toBe(24_992)
+    expect(huge[window.columnEnd - 1]!.turn).toBe(25_001)
+  })
+
+  it('reports an empty range as an empty range, not as the whole board', () => {
+    const columns = [column(1, 2)]
+    const none = windowColumns(columns, 0, 0)
+    expect(none.columns).toEqual([])
+    expect(none.columnStart).toBe(none.columnEnd)
+    expect(none.older).toBe(1)
+    const past = boardWindow(columns, metrics(4, 6), { back: 99, up: 0 }, false)
+    expect(past.columnEnd).toBeLessThanOrEqual(columns.length)
+    expect(past.columnEnd - past.columnStart).toBe(past.columns.length)
+  })
+})
+
 describe('the rails describe the same board the window shows', () => {
   it('agrees on how much is hidden on each side', () => {
     const columns = Array.from({ length: 9 }, (_, index) => column(index + 1, 3, index !== 8))
@@ -279,5 +351,57 @@ describe('the rails describe the same board the window shows', () => {
     expect(h.offset).toBe(Math.round((200 - h.thumb) * (1 - 3 / 5)))
     expect(pitchX(metrics(capacity, 6))).toBe(BRICK_W + GAP)
     expect(pitchY(metrics(capacity, 6))).toBe(BRICK_H + GAP)
+  })
+})
+
+
+/**
+ * The pan a board keeps while its content changes.
+ *
+ * History grows at *both* ends, and the two must have opposite effects on a reader who has
+ * panned back: a new Turn at the live end must not slide the window (hold it), and a page of
+ * older history at the far end must not move it either (leave it alone). The second half was
+ * 0.1.3's bug — a landed page looked like N new columns and pushed the reader N cells into the
+ * past — so the assertion here is the invariant itself: the same Turns stay on screen.
+ */
+describe('holding the pan while the content changes', () => {
+  const columns = Array.from({ length: 8 }, (_, index) => column(index + 1, 2, index !== 7))
+  const panned = { back: 2, up: 0 }
+
+  it('holds the same Turns on screen when a Turn appends', () => {
+    const before = windowColumns(columns, 4, panned.back).columns.map((entry) => entry.turn)
+    const grown = [...columns, column(9, 1, false)]
+    const after = heldScroll(panned, grown, newestTurnOf(columns))!
+    expect(after.back).toBe(3)
+    expect(windowColumns(grown, 4, after.back).columns.map((entry) => entry.turn)).toEqual(before)
+  })
+
+  it('leaves the pan exactly where it was when older history is prepended', () => {
+    const before = windowColumns(columns, 4, panned.back).columns.map((entry) => entry.turn)
+    const older = [column(-2, 1), column(-1, 1), ...columns]
+    const after = heldScroll(panned, older, newestTurnOf(columns))!
+    // The page is not an append: the reader's window does not move by a single cell.
+    expect(after).toBe(panned)
+    expect(windowColumns(older, 4, after.back).columns.map((entry) => entry.turn)).toEqual(before)
+  })
+
+  it('counts only the appended Turns when both ends grow at once', () => {
+    const older = [column(-3, 1), column(-2, 1), ...columns, column(9, 1), column(10, 1, false)]
+    const after = heldScroll(panned, older, newestTurnOf(columns))!
+    // Two Turns are newer than the one seen last paint; the two prepended ones are not counted.
+    expect(after.back).toBe(4)
+    expect(countNewerThan(older, 8)).toBe(2)
+    expect(countNewerThan(older, 100)).toBe(0)
+    expect(countNewerThan([], 1)).toBe(0)
+  })
+
+  it('does not touch a board that is following the live end', () => {
+    expect(heldScroll(undefined, columns, 8)).toBeUndefined()
+    expect(heldScroll(LIVE_SCROLL, [...columns, column(9, 1, false)], 8)).toEqual(LIVE_SCROLL)
+  })
+
+  it('says nothing about the newest Turn when there is nothing to say', () => {
+    expect(newestTurnOf([])).toBeUndefined()
+    expect(newestTurnOf(columns)).toBe(8)
   })
 })

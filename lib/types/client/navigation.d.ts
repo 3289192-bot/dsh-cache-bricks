@@ -47,6 +47,13 @@ export interface WindowEntry {
 export interface WindowSnapshot {
     readonly entries?: readonly WindowEntry[];
     readonly hasMore?: boolean;
+    /**
+     * Counts every accepted mutation of the window — a prepend, an append, a page.
+     *
+     * It is the cheap answer to "did the window move?", which is what a pager has to know
+     * without rebuilding the event list on every scroll frame.
+     */
+    readonly revision?: number;
 }
 /** The session lifecycle fields a jump cares about. */
 export interface SessionSnapshotLike {
@@ -57,9 +64,20 @@ export interface SessionSnapshotLike {
 export interface SessionFace {
     /** Page history backwards until the window covers `seq`. */
     loadThrough(seq: number): Promise<void>;
+    /**
+     * Prepend one page of older history: at least 50 messages and two Turn starts, at most 500
+     * messages. Official, not re-implemented — see `docs/runtime-contract.md`.
+     *
+     * Absent on a core that does not publish it, which is why it is optional and every caller
+     * treats "no `loadOlder`" as "this board cannot page", not as an error.
+     */
+    loadOlder?(): Promise<void>;
     getSnapshot?(): SessionSnapshotLike;
+    /** Lifecycle notifications: the oldest thing this plugin needs is "a page landed". */
+    subscribe?(listener: () => void): () => void;
     eventSource?: {
         getSnapshot(): WindowSnapshot;
+        subscribe?(listener: () => void): () => void;
     };
 }
 /** One durable event with its log position. */
@@ -177,6 +195,72 @@ export declare function loadRequestForTurn(seq: number | undefined): LoadRequest
  * @returns what happened, in a form the UI can repeat verbatim.
  */
 export declare function ensureBrickTargetLoaded(face: SessionFace | undefined, request: LoadRequest, options?: LoadOptions): Promise<LoadReport>;
+/** How one paging request ended. */
+export type OlderStatus = 
+/** A page was requested and the window grew. */
+'loaded'
+/** The session says there is nothing older to load. */
+ | 'no-more'
+/** A page is already in flight (this pager's own, or the session's). */
+ | 'busy'
+/** This core publishes no `loadOlder` for this session. */
+ | 'unavailable'
+/**
+ * Asked from exactly this window, and the window did not move.
+ *
+ * The honest answer to "the reader is at the left edge and nothing is coming": a pager that
+ * asked again on every frame would be a request loop with no exit, so the same window is
+ * never asked twice.
+ */
+ | 'stalled';
+/**
+ * Pages older history in, one page at a time, without a loop.
+ *
+ * The board asks whenever the reader is near the left edge — which is *every frame* while they
+ * sit there — so the guard is the whole design:
+ *
+ * - nothing is asked when the session says `hasMore === false`;
+ * - nothing is asked while a page is in flight (the official `loadOlder` silently drops a
+ *   second call, so a caller that did not track this could not tell a dropped page from an
+ *   empty one);
+ * - nothing is asked twice from the same window state. `loadOlder` never rejects and never
+ *   reports what it did, so the *only* evidence that it worked is that the window moved —
+ *   its revision, its length, or its oldest seq.
+ */
+export declare class HistoryPager {
+    private face;
+    private inFlight;
+    private askedFor;
+    private pages;
+    constructor(face: SessionFace | undefined);
+    /** Point the pager at the session it pages; a different face forgets what was asked. */
+    aim(face: SessionFace | undefined): void;
+    /** Pages asked for so far, for the board's own diagnostics. */
+    get loadedPages(): number;
+    /** The window state a page was last asked from, if any. */
+    get asked(): string | undefined;
+    /**
+     * Ask for one more page, if asking means anything right now.
+     *
+     * @returns what happened, for a caller that wants to say so.
+     */
+    need(): Promise<OlderStatus>;
+}
+/** A cheap identity of the window's current extent — no event list is built to read it. */
+export declare function windowStateOf(face: SessionFace): string;
+/**
+ * Watch a session for the moments that invalidate what the board has read.
+ *
+ * Two official signals, both optional, both useful: the event window publishes synchronously on
+ * every accepted mutation (`change.kind === 'prepend'` after a page), and the session snapshot
+ * fires around the page itself. A core that publishes neither still works — the board re-reads
+ * on every render, and a page landing re-renders the conversation it belongs to.
+ *
+ * @param face - the session face, when there is one.
+ * @param listener - called whenever the window or the session may have moved.
+ * @returns a disposer; safe to call when nothing was subscribed.
+ */
+export declare function onWindowChange(face: SessionFace | undefined, listener: () => void): () => void;
 /**
  * The settlement may be halfway through a long turn. Page to its real start, not just the
  * settlement, so reading a loaded step does not turn into an empty preview. No DOM writes.

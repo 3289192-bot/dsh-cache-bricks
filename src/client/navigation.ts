@@ -49,6 +49,13 @@ export interface WindowEntry {
 export interface WindowSnapshot {
   readonly entries?: readonly WindowEntry[]
   readonly hasMore?: boolean
+  /**
+   * Counts every accepted mutation of the window — a prepend, an append, a page.
+   *
+   * It is the cheap answer to "did the window move?", which is what a pager has to know
+   * without rebuilding the event list on every scroll frame.
+   */
+  readonly revision?: number
 }
 
 /** The session lifecycle fields a jump cares about. */
@@ -61,8 +68,21 @@ export interface SessionSnapshotLike {
 export interface SessionFace {
   /** Page history backwards until the window covers `seq`. */
   loadThrough(seq: number): Promise<void>
+  /**
+   * Prepend one page of older history: at least 50 messages and two Turn starts, at most 500
+   * messages. Official, not re-implemented — see `docs/runtime-contract.md`.
+   *
+   * Absent on a core that does not publish it, which is why it is optional and every caller
+   * treats "no `loadOlder`" as "this board cannot page", not as an error.
+   */
+  loadOlder?(): Promise<void>
   getSnapshot?(): SessionSnapshotLike
-  eventSource?: { getSnapshot(): WindowSnapshot }
+  /** Lifecycle notifications: the oldest thing this plugin needs is "a page landed". */
+  subscribe?(listener: () => void): () => void
+  eventSource?: {
+    getSnapshot(): WindowSnapshot
+    subscribe?(listener: () => void): () => void
+  }
 }
 
 /** One durable event with its log position. */
@@ -265,6 +285,133 @@ export async function ensureBrickTargetLoaded(
     await wait(poll)
   }
   return covers(face, seq) ? { status: 'loaded', seq } : { status: 'timeout', seq }
+}
+
+/** How one paging request ended. */
+export type OlderStatus =
+  /** A page was requested and the window grew. */
+  | 'loaded'
+  /** The session says there is nothing older to load. */
+  | 'no-more'
+  /** A page is already in flight (this pager's own, or the session's). */
+  | 'busy'
+  /** This core publishes no `loadOlder` for this session. */
+  | 'unavailable'
+  /**
+   * Asked from exactly this window, and the window did not move.
+   *
+   * The honest answer to "the reader is at the left edge and nothing is coming": a pager that
+   * asked again on every frame would be a request loop with no exit, so the same window is
+   * never asked twice.
+   */
+  | 'stalled'
+
+/**
+ * Pages older history in, one page at a time, without a loop.
+ *
+ * The board asks whenever the reader is near the left edge — which is *every frame* while they
+ * sit there — so the guard is the whole design:
+ *
+ * - nothing is asked when the session says `hasMore === false`;
+ * - nothing is asked while a page is in flight (the official `loadOlder` silently drops a
+ *   second call, so a caller that did not track this could not tell a dropped page from an
+ *   empty one);
+ * - nothing is asked twice from the same window state. `loadOlder` never rejects and never
+ *   reports what it did, so the *only* evidence that it worked is that the window moved —
+ *   its revision, its length, or its oldest seq.
+ */
+export class HistoryPager {
+  private face: SessionFace | undefined
+  private inFlight = false
+  private askedFor: string | undefined
+  private pages = 0
+
+  constructor(face: SessionFace | undefined) {
+    this.face = face
+  }
+
+  /** Point the pager at the session it pages; a different face forgets what was asked. */
+  aim(face: SessionFace | undefined): void {
+    if (face === this.face) return
+    this.face = face
+    this.askedFor = undefined
+  }
+
+  /** Pages asked for so far, for the board's own diagnostics. */
+  get loadedPages(): number {
+    return this.pages
+  }
+
+  /** The window state a page was last asked from, if any. */
+  get asked(): string | undefined {
+    return this.askedFor
+  }
+
+  /**
+   * Ask for one more page, if asking means anything right now.
+   *
+   * @returns what happened, for a caller that wants to say so.
+   */
+  async need(): Promise<OlderStatus> {
+    const face = this.face
+    if (face?.loadOlder === undefined) return 'unavailable'
+    const snapshot = face.getSnapshot?.()
+    if (snapshot?.hasMore !== true) return 'no-more'
+    if (snapshot.loadingOlder === true || this.inFlight) return 'busy'
+    const key = windowStateOf(face)
+    if (key === this.askedFor) return 'stalled'
+    this.askedFor = key
+    this.inFlight = true
+    try {
+      await face.loadOlder()
+      this.pages += 1
+    } catch {
+      // `loadOlder` resolves on every path in 0.1.7-rc.2 and swallows its own failures; a core
+      // that rejects instead is not a reason to stop drawing bricks.
+    } finally {
+      this.inFlight = false
+    }
+    return windowStateOf(face) === key ? 'stalled' : 'loaded'
+  }
+}
+
+/** A cheap identity of the window's current extent — no event list is built to read it. */
+export function windowStateOf(face: SessionFace): string {
+  const window = face.eventSource?.getSnapshot()
+  const snapshot = face.getSnapshot?.()
+  const oldest = window?.entries?.[0]?.event?.seq
+  return [
+    String(window?.revision ?? '?'),
+    String(window?.entries?.length ?? '?'),
+    String(oldest ?? '?'),
+    String(window?.hasMore ?? snapshot?.hasMore ?? '?'),
+  ].join('|')
+}
+
+/**
+ * Watch a session for the moments that invalidate what the board has read.
+ *
+ * Two official signals, both optional, both useful: the event window publishes synchronously on
+ * every accepted mutation (`change.kind === 'prepend'` after a page), and the session snapshot
+ * fires around the page itself. A core that publishes neither still works — the board re-reads
+ * on every render, and a page landing re-renders the conversation it belongs to.
+ *
+ * @param face - the session face, when there is one.
+ * @param listener - called whenever the window or the session may have moved.
+ * @returns a disposer; safe to call when nothing was subscribed.
+ */
+export function onWindowChange(face: SessionFace | undefined, listener: () => void): () => void {
+  if (face === undefined) return () => {}
+  const stops: Array<() => void> = []
+  try {
+    const offWindow = face.eventSource?.subscribe?.(listener)
+    if (typeof offWindow === 'function') stops.push(offWindow)
+    const offSession = face.subscribe?.(listener)
+    if (typeof offSession === 'function') stops.push(offSession)
+  } catch {
+    // A core whose subscribe throws is a core this plugin reads by polling instead.
+  }
+  return () => { for (const stop of stops) stop() }
 }
 
 /**

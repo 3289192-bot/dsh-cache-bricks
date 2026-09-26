@@ -11,6 +11,106 @@
 > (1.7.2-a, `historical-step`), and history had no type because the log was read by a poorer reader
 > than the live path (1.7.2-c, `src/core/replay.ts`).
 
+## 0.1.4 — history as a scene
+
+One change of shape on top of 0.1.3, and one defect it closes.
+
+**The defect, measured first.** 0.1.3 read the session's whole durable window and replayed all of
+it into a ledger capped at 400 bricks. While a window was one session's tail that cap never bit.
+It bites as soon as history is paged in: a 100-Turn window replayed as 600 attempts comes back as
+the **newest 400**, and the rest are filled from the client fold, which by construction has no
+reasoning or tool channels and says so (`kind: 'output', estimated: true, origin: 'fold'`). So the
+bricks furthest from the live edge — the ones a reader has deliberately walked to — were the ones
+that lost their type. `tests/history-scene.spec.ts` pins the case directly: 600 attempts replayed
+whole yield 400 bricks starting at Turn 34, while the scene showing Turn 1 yields all six of its
+own, still typed.
+
+**The change.** The board knows its viewport; the log knows where each step's events are; nothing
+else needs to be read:
+
+- `client/history-scene.ts` (new) — a step-span index over the loaded window (`step/start` …
+  `step/end`, with a running step closed at the end of the window), a slice that carries the
+  demanded steps plus the two facts a bracket cannot hold (the sticky `request/header` and
+  `request/context` in force, and each demanded Turn's `turn/end`), and a three-scene
+  least-recently-used cache in front of `replaySession`, whose budget is sized from the slice
+  (`attempts + 8`). `scenePlanOf` turns a viewport into that demand with one screen of overscan on
+  each axis; `prefetchDue` says when the reader is within a screen of the start of what is loaded.
+- `client/navigation.ts` — `SessionFace` gains the official `loadOlder()` and the two optional
+  window subscriptions; `HistoryPager` is the guard around them.
+- `client/tetris.ts` — `windowColumns` computes its range instead of scanning for it, `BoardWindow`
+  states its own `columnStart`/`columnEnd`/`rowStart`/`rowEnd`, and `heldScroll` holds a panned
+  window against appends while leaving prepends alone.
+- `client/tetris-view.ts` — paints only the window's range, reports the scene, asks for a page
+  when due, and measures the tallest column once per content array.
+- `client/index.tsx` — one `HistoryScene` per session, subscribed as an external store, with the
+  pager and the window subscription wired to it.
+
+**The bug this release also fixes.** The pan was held still by counting *added* columns, which
+cannot tell an append from a prepend — so every landed page looked like N new Turns and pushed a
+panned reader N cells into the past. The fixture that proves it was checked against the old
+arithmetic, not only the new one:
+
+```
+  0.1.3 arithmetic:  FAIL  a landed page adds history without shoving the reader into it
+                           limit 13 → 17 · 20,21,…,29 → 17,18,…,26
+  0.1.4:             PASS  a landed page adds history without shoving the reader into it
+```
+
+The scene fixtures were mutation-checked the same way: with `onScene` never called, *"the fold
+alone gives the board its older Turns, and the scene types them"* and *"the paged Turns are typed
+from the log, not estimated by the fold"* both fail, so neither is a check that would pass on a
+board that does nothing.
+
+Verification on this release:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **413 unit tests passing, 2 skipped**, 24 files (0.1.3's 371 plus 42: the index,
+  the slice, slice ≡ whole-window equality field by field, the retry shape inside a bracket, the
+  scene cache and its LRU, the demand quantum, the plan, the prefetch margin, the pager's five
+  answers, the window range, and the pan rule);
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `pnpm run test:scroll` — **56/56** in Chromium with React 18 (0.1.3's 47 plus 9): the fold
+  behind the scene, replayed provenance on the bricks it types, a page landing and the board
+  growing by it, paging stopping on its own at history exhaustion, a pan that survives a landed
+  page, and a six-thousand-brick session painting ≤ 400 slabs at either end of its history;
+- `node scripts/check-contract-drift.mjs` — no contract member dropped against the installed
+  0.1.7-rc.2 cores.
+
+### Measured on the running instance
+
+The instance was moved from the 0.1.3 tarball to the 0.1.4 tarball with the official command
+(`dsh plugin --profile web add file:…/dsh-cache-bricks-0.1.4.tgz`, `DSH_HOME=<path-to-DSH-home>`),
+and **the host half did not change**: `lib/index.js` is byte-identical between the two releases
+(`e164496c5884051a`), only `lib/client.js` differs. The served bundle is content-hash versioned
+(`plugins/??…dsh-cache-bricks/client.js&rev=…`), so a page refresh picks the new client up and the
+running server needs no restart.
+
+- `scripts/live-verify.mjs` (host route, real traffic): all checks passed — the collector is
+  capturing real calls (3,485 blobs / 14.1 MB, 99.0% of messages shared rather than re-stored);
+- `scripts/live-scene-verify.mjs` (new; drives the served GUI in Chromium):
+  - the served bundle is this build (`reconstructed from the session log` is in it);
+  - on `session-c8330ba4…` — a session the collector had only **18** bricks of — the board showed
+    **23 bricks replayed from the log**, i.e. attempts this process never captured, typed exactly,
+    with a horizontal pan limit of 8 and no plugin-attributable console or network error;
+  - walking the horizontal rail to the left edge landed on older Turns;
+- `scripts/ui-verify.mjs --rails`: 30 of 31 checks passed, with **the same single failure the
+  instance had before the upgrade** — *"raising the vertical thumb reaches rows the live window
+  had hidden"*, which reads a board whose running Turn (198 steps) is taller than the board, so the
+  live anchor already sits at the top of the column and there is nothing above to reveal. Identical
+  label and shape on 0.1.3 → not a regression;
+- **not exercised live: a page actually landing.** Every session on this instance has
+  `hasMore === false` (the largest loaded window is ~2,000 events), and the network trace shows one
+  `POST /api/session/page` at session open and none afterwards. Paging is therefore proven by the
+  pager's unit tests and by the browser fixtures that prepend into a mocked session — not by this
+  instance, and this record does not claim otherwise.
+
+**What is *not* claimed.** The scene replay reads the *loaded* window, so a Turn the session has
+not loaded yet is still only a folded reading until `loadOlder` brings its events in — the board
+now asks for them, and the ask has an exit, but the paging is bounded by the runtime's 500-message
+page and by `hasMore`. The inspector's own hydration is unchanged in this release: a brick on
+screen is exact, its raw payload still comes from the collector's blob endpoint when that process
+captured it.
+
 ## 0.1.3 — a landing you can see
 
 One fix on top of 0.1.2, developed against the local instance and ported here. The brick contract,

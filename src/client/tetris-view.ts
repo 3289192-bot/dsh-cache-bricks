@@ -52,8 +52,11 @@ import {
   cellPlacement,
   clampScroll,
   fitBoard,
+  heldScroll,
   liveScroll,
+  newestTurnOf,
   railGeometry,
+  tallestColumn,
   windowCell,
   type BoardColumn,
   type BoardFace,
@@ -63,6 +66,7 @@ import {
   type Brick,
   type RailGeometry,
 } from './tetris'
+import { prefetchDue, scenePlanOf, type SceneDemand } from './history-scene'
 import type { LoadReport, LoadRequest } from './navigation'
 import { revealBrick, rowVisible, type RevealElement, type RevealOutcome } from './reveal'
 import type { BrickTarget, HistoricalStepTarget } from './target'
@@ -521,6 +525,24 @@ export interface CacheTetrisBoardOptions {
    * `resolveHistoricalStep`.
    */
   readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined
+  /**
+   * Called when the *scene* changes: which Turns and steps the window is showing, with one
+   * screen of overscan on both axes.
+   *
+   * The board is the only thing that knows what a reader is looking at, and the data layer is
+   * the only thing that can materialize exact records for it. This is the one wire between
+   * them, and it fires only when the answer changes — not on every paint.
+   */
+  readonly onScene?: (demand: SceneDemand) => void
+  /**
+   * Called while the reader is near the left edge of the history it holds, one screen before
+   * the edge rather than at it.
+   *
+   * Fired on every paint that is inside the prefetch margin: the caller is expected to know
+   * whether asking means anything (`face.getSnapshot()?.hasMore`, a page already in flight)
+   * and to be idempotent about it — see `HistoryPager`.
+   */
+  readonly onNeedOlder?: () => void
 }
 
 export class CacheTetrisBoard {
@@ -574,8 +596,19 @@ export class CacheTetrisBoard {
    * and landing back on the live corner clears it again.
    */
   private scroll: BoardScroll | undefined
-  /** Turn columns at the last paint, so a new Turn does not yank a panned window. */
-  private lastColumns = 0
+  /**
+   * The newest Turn seen last paint.
+   *
+   * The pan is held still against **appends**, and an append is exactly "a Turn newer than this
+   * one appeared". Prepends — `loadOlder` paging history in at the older end — must leave the
+   * pan alone, and counting columns cannot tell the two apart: a page landing used to look like
+   * new Turns arriving and pushed the reader further into the past on every page.
+   */
+  private lastNewestTurn: number | undefined
+  /** The last scene demand sent, so a paint inside the same scene sends nothing. */
+  private sceneKey: string | undefined
+  /** Tallest column, remembered per content array: a repaint must not rescan the session. */
+  private tallestCache: { columns: readonly BoardColumn[]; tallest: number } | undefined
   /** The window of the last paint: what the rails describe and what a drag moves. */
   private view: BoardWindow | undefined
   /** The pointer drag in flight on a rail, if any. */
@@ -1379,14 +1412,17 @@ export class CacheTetrisBoard {
   private syncBricks(metrics: BoardMetrics): void {
     const { host } = this.ensureHost()
     this.metrics = metrics
-    // New Turns arrived while the reader was in history: hold the same columns on screen
-    // instead of sliding the window out from under them. A following board (no pan of its
-    // own) wants exactly the opposite — the stack shifts left and the new Turn drops in.
-    if (this.scroll !== undefined && this.scroll.back > 0 && this.columns.length > this.lastColumns) {
-      this.scroll = { back: this.scroll.back + (this.columns.length - this.lastColumns), up: this.scroll.up }
-    }
-    this.lastColumns = this.columns.length
-    const view = boardWindow(this.columns, metrics, this.scroll, this.aux.length > 0)
+    // Keep the columns a reader is looking at where they are while the *live* end moves: a new
+    // Turn must not slide the window out from under them. A following board (no pan of its own)
+    // wants exactly the opposite — the stack shifts left and the new Turn drops in.
+    //
+    // The count is of columns **newer** than the newest one seen last paint, not of columns
+    // added: history is loaded at the *older* end (`loadOlder` prepends), and a prepend must
+    // leave the pan alone. Adding the delta of `columns.length` used to push the reader further
+    // into the past every time a page landed.
+    this.scroll = heldScroll(this.scroll, this.columns, this.lastNewestTurn)
+    this.lastNewestTurn = newestTurnOf(this.columns)
+    const view = boardWindow(this.columns, metrics, this.scroll, this.aux.length > 0, this.tallestOf(this.columns))
     this.view = view
     // Landing back on the live corner resumes following, so the next brick arrives in view.
     if (this.scroll !== undefined && view.scroll.back === 0
@@ -1400,11 +1436,17 @@ export class CacheTetrisBoard {
     // The cache side is canonical and always kept current; the type side is only
     // kept current while it is the one showing.
     const faces = this.face === 'type' && this.typeLayer !== undefined ? FACES : (['cache'] as const)
-    for (let index = 0; index < this.columns.length; index += 1) {
+    // Only the cells inside the window are visited. The window states its own index range
+    // (`BoardWindow.columnStart`/`rowStart`), so a paint costs the viewport — a thousand-column
+    // session and a fifty-thousand-column one draw the same number of bricks per frame.
+    for (let index = view.columnStart; index < view.columnEnd; index += 1) {
       const column = this.columns[index]!
-      for (let row = 0; row < column.bricks.length; row += 1) {
+      const lastRow = Math.min(column.bricks.length, view.rowEnd)
+      for (let row = view.rowStart; row < lastRow; row += 1) {
         // A brick outside the window is not drawn at all: the board is a window, and a
-        // brick the pan moved out is neither visible nor focusable nor announced.
+        // brick the pan moved out is neither visible nor focusable nor announced. The range
+        // already guarantees this; the check is kept because it is the single definition of
+        // "inside", and the range is asserted against it in the unit tests.
         const cell = windowCell(newestIndex - index, row, view.lead, view.scroll, metrics.columns, view.limit)
         if (cell === undefined) continue
         const brick = column.bricks[row]!
@@ -1478,6 +1520,7 @@ export class CacheTetrisBoard {
     this.syncRails(metrics, view)
     this.syncFades(metrics, view)
     this.syncLiveChip(view, metrics.columns * pitchX(metrics) - metrics.gap)
+    this.syncScene(view, metrics)
     this.applyInteractivity()
     this.applyTitles()
     this.scheduleSettle()
@@ -1487,6 +1530,41 @@ export class CacheTetrisBoard {
       this.revealKey = undefined
       this.slabs[this.face].get(reveal)?.element.focus()
     }
+  }
+
+  /**
+   * Tell the data layer what this window is showing, and ask for more history when the reader
+   * nears the end of what it holds.
+   *
+   * The board is the only part of the plugin that knows the viewport, and the data layer is the
+   * only part that can materialize exact records: this is the single wire between them. It
+   * fires on a **change**, not on a paint — the demand it sends is the screen plus one screen of
+   * overscan on each axis, so panning inside a scene costs nothing and the next scene is already
+   * warm by the time the reader gets there.
+   *
+   * @param view - the window this paint is showing.
+   * @param metrics - board geometry.
+   */
+  private syncScene(view: BoardWindow, metrics: BoardMetrics): void {
+    const { onScene, onNeedOlder } = this.options
+    if (onScene !== undefined) {
+      // The board knows the viewport; the data layer knows steps. The translation is pure and
+      // unit-tested (`scenePlanOf`), and it is sent only when it produces a different scene.
+      const plan = scenePlanOf(this.columns, view, metrics)
+      if (plan.key !== this.sceneKey) {
+        this.sceneKey = plan.key
+        onScene(plan.demand)
+      }
+    }
+    if (onNeedOlder !== undefined && prefetchDue(view, metrics)) onNeedOlder()
+  }
+
+  /** The tallest column, measured once per content array rather than once per paint. */
+  private tallestOf(columns: readonly BoardColumn[]): number {
+    if (this.tallestCache?.columns !== columns) {
+      this.tallestCache = { columns, tallest: tallestColumn(columns) }
+    }
+    return this.tallestCache.tallest
   }
 
   /** Move the window, clamped to what the content allows right now. */

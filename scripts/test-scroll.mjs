@@ -631,6 +631,334 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
     && palette['60.0%'] === 'rgb(220, 38, 38)',
     JSON.stringify(palette))
 
+  // ══ 0.1.4: history as a scene, and a paint the size of the window ══════════════════
+  //
+  // The two halves of this release are invisible to a board whose feed already covers every
+  // Turn, which is what every check above uses. So this section builds the shape the plugin
+  // actually meets in a long session:
+  //
+  //   the fold   — cold geometry: one reading per step, no type, no target (`readingsOf`);
+  //   the window — the durable events the session holds, enough to rebuild exact bricks;
+  //   the scene  — the slice of that window the board is *showing*, replayed into bricks.
+  //
+  // Nothing here is measured through plugin internals: the bricks are read off the DOM, and the
+  // only fixture-side counters are the ones a session would keep anyway (`loadOlder` calls).
+
+  /** Install the paging world: a fold, a window with step brackets, and a session that pages. */
+  await page.evaluate(() => {
+    const fixture = window.__fixture
+    const jsx = window.__testExternals['react/jsx-runtime'].jsx
+
+    /** One fold node per Turn: a reading per step, which is all the fold ever has. */
+    const foldNode = (turn) => ({
+      turn,
+      ended: true,
+      steps: [1, 2].map((step) => ({
+        step,
+        seq: turn * 100 + step,
+        provider: 'fixture',
+        stepStartTime: 1_000,
+        firstTokenTime: 1_100,
+        usageTime: 1_500,
+        usage: { inputTokens: 40, cacheReadTokens: 960, cacheWriteTokens: 0, outputTokens: 20 },
+      })),
+    })
+
+    /** The durable events of one Turn: a bracket per step, with a tool call inside it. */
+    const turnEvents = (turn) => {
+      const made = []
+      for (const step of [1, 2]) {
+        made.push(['step/start', { turn, step }])
+        made.push(['assistant/message', {
+          turn,
+          step,
+          message: { role: 'assistant' },
+          stream: [
+            { type: 'tool-call-chunks', time0: 1_100, index: 0, dt: [5], id: `call-${turn}-${step}`, name: 'bash', args: ['{"cmd":"ls"}'] },
+            { type: 'chunk', time: 1_300, chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+            { type: 'chunk', time: 1_300, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } },
+          ],
+          usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 900, cacheWriteTokens: 0 },
+        }])
+        made.push(['tool/call', { turn, step, callId: `call-${turn}-${step}`, name: 'bash', arguments: '{"cmd":"ls"}' }])
+        made.push(['tool/result', { turn, step, message: { role: 'tool' } }])
+        made.push(['step/end', { turn, step }])
+      }
+      made.push(['turn/end', { turn, reason: { kind: 'completed' } }])
+      return made
+    }
+
+    const page = {
+      /** Durable events, oldest first, exactly as the window publishes them. */
+      entries: [],
+      seq: 3,
+      revision: 1,
+      hasMore: false,
+      /** Turns the fold has rendered, oldest first. */
+      fold: [],
+      /** Turns whose events the window holds. */
+      held: [],
+      /** What the next page would give: older Turns, newest of them first. */
+      pending: [],
+      loads: 0,
+      listeners: [],
+      append(types) {
+        for (const [type, data] of types) {
+          page.entries.push({ type: 'event', event: { seq: page.seq, type, time: page.seq * 100, data } })
+          page.seq += 1
+        }
+        page.revision += 1
+      },
+      /** Prepends count down from zero, so a second page never reuses the first page's seqs. */
+      front: 0,
+      addTurn(turn, at) {
+        const made = turnEvents(turn)
+        if (at === 'start') {
+          page.front -= made.length
+          page.entries.unshift(...made.map(([type, data], index) => ({
+            type: 'event',
+            event: { seq: page.front + index, type, time: 0, data },
+          })))
+        } else page.append(made)
+        page.revision += 1
+      },
+      /** The fold's snapshot: only the Turns the conversation has rendered. */
+      nodes() {
+        return new Map(page.fold.map((turn) => [`fold-${turn}`, { kind: 'cache-bricks', data: foldNode(turn) }]))
+      },
+      /** One page, the way the runtime lands it: older Turns at the older end, one prepend. */
+      land(count) {
+        const older = page.pending.splice(0, count)
+        for (const turn of older.slice().reverse()) page.addTurn(turn, 'start')
+        page.fold = [...older, ...page.fold]
+        page.hasMore = page.pending.length > 0
+        page.revision += 1
+        for (const listener of page.listeners) listener()
+      },
+    }
+    window.__page = page
+
+    // The session face gains the two things 0.1.4 reads: a pager and a subscription.
+    const face = fixture.faces.S
+    face.loadOlder = async () => { page.loads += 1; page.land(2) }
+    face.getSnapshot = () => ({ hasMore: page.hasMore, loadingOlder: false })
+    face.subscribe = (listener) => { page.listeners.push(listener); return () => {} }
+    fixture.snapshots.S = {
+      get entries() { return page.entries },
+      get hasMore() { return page.hasMore },
+      get revision() { return page.revision },
+    }
+
+    // The collector's own process: it sees the newest Turn only, as it does on a resumed session.
+    const liveBrick = (turn) => ({
+      observedBy: 'host',
+      identity: { id: `S:${turn}:1:0`, sessionId: 'S', turn, step: 1, attemptOrdinal: 0 },
+      settlement: 'message', settlementSeq: turn * 100 + 1,
+      route: { provider: 'fixture', model: 'fixture' },
+      usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+      metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+      request: {}, tools: [], raw: {},
+    })
+
+    // Start: the window holds Turns 7..8 (the loaded tail) and the fold has rendered both.
+    // Turns 5..6 and 3..4 are the two pages below it, and are not in the window until they land.
+    for (const turn of [7, 8]) page.addTurn(turn)
+    page.fold = [7, 8]
+    fixture.records.S = [liveBrick(8)]
+    window.__pushFeed({ sessionId: 'S', bricks: [liveBrick(8)], endedTurns: [1, 2, 3, 4, 5, 6, 7], store: { blobs: 0, bytes: 0 } })
+
+    /** Render the board with a fold behind it, which is what a real seat always has. */
+    fixture.renderFold = () => {
+      const useChat = (selector) => selector({ nodes: page.nodes() })
+      fixture.root.render(jsx(fixture.Component, { sessionId: 'S', useChat }))
+    }
+  })
+  await page.evaluate(() => window.__fixture.renderFold())
+  await page.waitForTimeout(500)
+
+  /** Read the bricks that are on the board, with what each one says about where it came from. */
+  const readTypes = () => page.evaluate(() => [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')]
+    .map((element) => ({
+      key: element.dataset.cacheBricksBrick,
+      turn: Number(element.dataset.cacheBricksBrick.split(':')[1]),
+      label: element.getAttribute('aria-label') ?? '',
+      reading: (element.textContent ?? '').trim(),
+    })))
+
+  const typedTurnOne = await readTypes()
+  const REPLAYED = 'reconstructed from the session log'
+  check('the fold alone gives the board its older Turns, and the scene types them',
+    typedTurnOne.filter((brick) => brick.turn === 7).length === 2
+    && typedTurnOne.filter((brick) => brick.turn === 7).every((brick) => brick.label.includes(REPLAYED))
+    // Turn 8's first attempt is the collector's own capture, and it stays the live brick: a
+    // replaying board must not overwrite what the process actually saw.
+    && typedTurnOne.some((brick) => brick.key === 'S:8:1:0' && !brick.label.includes(REPLAYED)),
+    JSON.stringify(typedTurnOne.map((brick) => [brick.key, brick.label.includes(REPLAYED)])))
+
+  // The scene is a slice, not a scan: the bricks it holds are exactly the steps of the Turns on
+  // screen (two each here), so a Turn the window cannot type would be visibly missing.
+  check('every step of a replayed Turn reaches the board',
+    typedTurnOne.filter((brick) => brick.turn === 7).length === 2
+    && typedTurnOne.filter((brick) => brick.turn === 7).every((brick) => /^\d{1,2}\.\d%$/u.test(brick.reading)),
+    JSON.stringify(typedTurnOne.filter((brick) => brick.turn === 7).map((brick) => brick.reading)))
+
+  // ── the reader reaches the left edge, and a page arrives ────────────────────────────
+  await page.evaluate(() => { window.__page.pending = [6, 5]; window.__page.hasMore = true })
+  await page.evaluate(() => window.__fixture.renderFold())
+  await page.waitForTimeout(600)
+  const pagedTypes = await readTypes()
+  check('reaching the left edge asks for a page, and the page becomes board',
+    (await page.evaluate(() => window.__page.loads)) === 1
+    && pagedTypes.some((brick) => brick.turn === 5) && pagedTypes.some((brick) => brick.turn === 6),
+    `loads ${await page.evaluate(() => window.__page.loads)} · turns ${[...new Set(pagedTypes.map((brick) => brick.turn))].join(',')}`)
+  check('the paged Turns are typed from the log, not estimated by the fold',
+    pagedTypes.filter((brick) => brick.turn === 5).length === 2
+    && pagedTypes.filter((brick) => brick.turn === 5).every((brick) => brick.label.includes(REPLAYED)),
+    JSON.stringify(pagedTypes.filter((brick) => brick.turn === 5).map((brick) => [brick.key, brick.label.includes(REPLAYED)])))
+
+  // One more page is still due (the board shows everything it holds), and the pager stops when
+  // the session says history is exhausted — the difference between paging and a request loop.
+  await page.evaluate(() => { window.__page.hasMore = true; window.__page.pending = [4, 3] })
+  await page.evaluate(() => window.__fixture.renderFold())
+  await page.waitForTimeout(600)
+  const exhausted = await page.evaluate(() => ({ loads: window.__page.loads, hasMore: window.__page.hasMore }))
+  check('paging stops by itself when the session runs out of history',
+    exhausted.hasMore === false && exhausted.loads === 2, JSON.stringify(exhausted))
+
+  // ── the pan does not move when the content grows at either end ──────────────────────
+  //
+  // A session long enough to pan in: twenty Turns of live bricks, and the fold holding the same
+  // twenty, which is what a resumed session looks like. The pager stays quiet — the reader is
+  // nowhere near the left edge — so the page that lands below is one this test lands by hand.
+  await page.evaluate(() => {
+    const live = (turn, step) => ({
+      observedBy: 'host',
+      identity: { id: `S:${turn}:${step}:0`, sessionId: 'S', turn, step, attemptOrdinal: 0 },
+      settlement: 'message', settlementSeq: turn * 100 + step,
+      route: { provider: 'fixture', model: 'fixture' },
+      usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+      metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+      request: {}, tools: [], raw: {},
+    })
+    const bricks = []
+    for (let turn = 11; turn <= 30; turn += 1) {
+      bricks.push(live(turn, 1))
+      bricks.push(live(turn, 2))
+    }
+    window.__fixture.records.S = bricks
+    window.__pushFeed({ sessionId: 'S', bricks, endedTurns: Array.from({ length: 19 }, (_, index) => index + 11), store: { blobs: 0, bytes: 0 } })
+    // The fold covers the same Turns, so the board's geometry is the fold's and the types are
+    // the scene's — the split this release is about.
+    window.__page.fold = Array.from({ length: 20 }, (_, index) => index + 11)
+    window.__page.entries = []
+    window.__page.seq = 3
+    for (const turn of window.__page.fold) window.__page.addTurn(turn)
+    window.__page.hasMore = true
+    // One page ready below the loaded history: five Turns, so a landed page is unmistakable
+    // against a one-cell rounding error.
+    window.__page.pending = [10, 9, 8, 7, 6]
+    window.__fixture.renderFold()
+  })
+  await page.waitForTimeout(600)
+
+  /** Drag the horizontal thumb by whole cells, the way the rail checks above do. */
+  const panBack = async (cells) => {
+    const track = await page.locator('[data-cache-bricks-rail="x"]').boundingBox()
+    const handle = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+    const furthest = Number(await page.locator('[data-cache-bricks-rail="x"]').getAttribute('aria-valuemax'))
+    const travel = track.width - handle.width
+    await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(handle.x + handle.width / 2 - (travel * cells) / Math.max(1, furthest), handle.y + handle.height / 2, { steps: 10 })
+    await page.mouse.up()
+    await page.waitForTimeout(350)
+  }
+
+  const beforePan = await readBoard()
+  await panBack(2)
+  const pannedBoard = await readBoard()
+  const pannedTurns = pannedBoard.turns
+  check('the reader can pan back into the folded Turns',
+    pannedTurns.length > 0 && pannedTurns[0] < beforePan.turns[0],
+    `${beforePan.turns.join(',')} → ${pannedTurns.join(',')}`)
+
+  // An append at the live end (a new Turn) and a prepend at the older end (a page landing), in
+  // that order: neither may move the reader, and the prepend is the one 0.1.3 got wrong.
+  await page.evaluate(() => {
+    const page = window.__page
+    page.fold = [...page.fold, 31]
+    page.append([['step/start', { turn: 31, step: 1 }]])
+    window.__pushFeed({
+      sessionId: 'S',
+      bricks: [...window.__fixture.records.S, {
+        observedBy: 'host',
+        identity: { id: 'S:31:1:0', sessionId: 'S', turn: 31, step: 1, attemptOrdinal: 0 },
+        settlement: 'message', settlementSeq: 3_101,
+        route: { provider: 'fixture', model: 'fixture' },
+        usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+        metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+        request: {}, tools: [], raw: {},
+      }],
+      endedTurns: [],
+      store: { blobs: 0, bytes: 0 },
+    })
+    // Now the page: five older Turns at the far end of everything the board holds.
+    page.land(5)
+  })
+  await page.evaluate(() => window.__fixture.renderFold())
+  await page.waitForTimeout(600)
+  const afterGrowth = await readBoard()
+  // The page really landed (five more cells of history to pan into), and the reader did not move.
+  check('a landed page adds history without shoving the reader into it',
+    afterGrowth.rails.x.valueMax > pannedBoard.rails.x.valueMax
+    && afterGrowth.turns.join(',') === pannedTurns.join(','),
+    `limit ${String(pannedBoard.rails.x.valueMax)} → ${String(afterGrowth.rails.x.valueMax)} · ${pannedTurns.join(',')} → ${afterGrowth.turns.join(',')}`)
+
+  // ── a paint costs the viewport, not the session ─────────────────────────────────────
+  await page.evaluate(() => {
+    const bricks = []
+    for (let turn = 1; turn <= 2_000; turn += 1) {
+      for (let step = 1; step <= 3; step += 1) {
+        bricks.push({
+          observedBy: 'host',
+          identity: { id: `S:${turn}:${step}:0`, sessionId: 'S', turn, step, attemptOrdinal: 0 },
+          settlement: 'message', settlementSeq: turn * 100 + step,
+          route: { provider: 'fixture', model: 'fixture' },
+          usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+          metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+          request: {}, tools: [], raw: {},
+        })
+      }
+    }
+    window.__fixture.records.S = bricks
+    window.__pushFeed({ sessionId: 'S', bricks, endedTurns: Array.from({ length: 1_999 }, (_, index) => index + 1), store: { blobs: 0, bytes: 0 } })
+  })
+  await page.waitForTimeout(500)
+  const huge = await page.evaluate(() => ({
+    slabs: document.querySelectorAll('[data-cache-bricks-brick]').length,
+    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')]
+      .map((element) => Number(element.dataset.cacheBricksBrick.split(':')[1])).filter((turn) => turn > 0))].length,
+  }))
+  // Six thousand bricks of history; the board may only hold the cells it can show.
+  check('a six-thousand-brick session paints a window, not a session',
+    huge.slabs <= 10 * 40 * 2 && huge.turns <= 10,
+    JSON.stringify(huge))
+  // And a jump to the far end of that history keeps it that way: the range is arithmetic, so
+  // the cost of the oldest Turn is the cost of the newest.
+  await page.locator('[data-cache-bricks-rail="x"]').focus()
+  await page.keyboard.press('Home')
+  await page.waitForTimeout(700)
+  const atTheStart = await page.evaluate(() => ({
+    slabs: document.querySelectorAll('[data-cache-bricks-brick]').length,
+    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')]
+      .map((element) => Number(element.dataset.cacheBricksBrick.split(':')[1])).filter((turn) => turn > 0))].sort((a, b) => a - b),
+  }))
+  check('the oldest Turn of two thousand costs the same paint as the newest',
+    atTheStart.slabs <= 10 * 40 * 2 && atTheStart.turns[0] === 1 && atTheStart.turns.length <= 10,
+    JSON.stringify([atTheStart.turns[0], atTheStart.turns.length, atTheStart.slabs]))
+  await backToLive()
+  await shot('08-scene-and-scale')
+
   check('no unhandled browser error', pageErrors.length === 0, pageErrors.join(' | '))
 
   // An optional public screenshot uses synthetic records, never a person's conversation.

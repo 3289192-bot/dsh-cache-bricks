@@ -29,6 +29,7 @@
  * brick ever sits under one.
  */
 import { type BoardColumn, type Brick } from './tetris';
+import { type SceneDemand } from './history-scene';
 import type { LoadReport, LoadRequest } from './navigation';
 import { type RevealOutcome } from './reveal';
 import type { BrickTarget, HistoricalStepTarget } from './target';
@@ -59,6 +60,24 @@ export interface CacheTetrisBoardOptions {
      * `resolveHistoricalStep`.
      */
     readonly resolve?: (target: HistoricalStepTarget) => BrickTarget | undefined;
+    /**
+     * Called when the *scene* changes: which Turns and steps the window is showing, with one
+     * screen of overscan on both axes.
+     *
+     * The board is the only thing that knows what a reader is looking at, and the data layer is
+     * the only thing that can materialize exact records for it. This is the one wire between
+     * them, and it fires only when the answer changes — not on every paint.
+     */
+    readonly onScene?: (demand: SceneDemand) => void;
+    /**
+     * Called while the reader is near the left edge of the history it holds, one screen before
+     * the edge rather than at it.
+     *
+     * Fired on every paint that is inside the prefetch margin: the caller is expected to know
+     * whether asking means anything (`face.getSnapshot()?.hasMore`, a page already in flight)
+     * and to be idempotent about it — see `HistoryPager`.
+     */
+    readonly onNeedOlder?: () => void;
 }
 export declare class CacheTetrisBoard {
     private readonly options;
@@ -111,8 +130,19 @@ export declare class CacheTetrisBoard {
      * and landing back on the live corner clears it again.
      */
     private scroll;
-    /** Turn columns at the last paint, so a new Turn does not yank a panned window. */
-    private lastColumns;
+    /**
+     * The newest Turn seen last paint.
+     *
+     * The pan is held still against **appends**, and an append is exactly "a Turn newer than this
+     * one appeared". Prepends — `loadOlder` paging history in at the older end — must leave the
+     * pan alone, and counting columns cannot tell the two apart: a page landing used to look like
+     * new Turns arriving and pushed the reader further into the past on every page.
+     */
+    private lastNewestTurn;
+    /** The last scene demand sent, so a paint inside the same scene sends nothing. */
+    private sceneKey;
+    /** Tallest column, remembered per content array: a repaint must not rescan the session. */
+    private tallestCache;
     /** The window of the last paint: what the rails describe and what a drag moves. */
     private view;
     /** The pointer drag in flight on a rail, if any. */
@@ -294,6 +324,22 @@ export declare class CacheTetrisBoard {
     private panTo;
     /** Reconcile brick elements with the window, animating the changes. */
     private syncBricks;
+    /**
+     * Tell the data layer what this window is showing, and ask for more history when the reader
+     * nears the end of what it holds.
+     *
+     * The board is the only part of the plugin that knows the viewport, and the data layer is the
+     * only part that can materialize exact records: this is the single wire between them. It
+     * fires on a **change**, not on a paint — the demand it sends is the screen plus one screen of
+     * overscan on each axis, so panning inside a scene costs nothing and the next scene is already
+     * warm by the time the reader gets there.
+     *
+     * @param view - the window this paint is showing.
+     * @param metrics - board geometry.
+     */
+    private syncScene;
+    /** The tallest column, measured once per content array rather than once per paint. */
+    private tallestOf;
     /** Move the window, clamped to what the content allows right now. */
     private setScroll;
     /**

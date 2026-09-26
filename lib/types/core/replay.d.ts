@@ -64,7 +64,12 @@ export interface ReplayReport {
 export interface ReplayOptions {
     /** Share a store with the live collector, so identical streams dedupe across both. */
     readonly store?: BlobStore;
-    /** Cap on replayed bricks, oldest dropped first. */
+    /**
+     * Cap on replayed bricks, oldest dropped first.
+     *
+     * A scene replay passes its own slice's attempt count so the cap cannot decide what a reader
+     * sees; it is left optional for a caller replaying something unbounded on purpose.
+     */
     readonly maxBricks?: number;
 }
 /**

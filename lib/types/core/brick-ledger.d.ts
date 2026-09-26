@@ -258,7 +258,16 @@ export type Observation = {
 };
 /** Limits that keep a long session's ledger bounded. */
 export interface LedgerOptions {
-    /** Bricks kept per session, newest last. */
+    /**
+     * Bricks kept per session, newest last — the **live** ledger's forensic retention.
+     *
+     * It is not a board capacity, and since 0.1.4 nothing sizes it as one: a scene replay passes
+     * its own slice's attempt count (`history-scene.ts`), because a slice cannot outgrow the
+     * screen. On the live tap the number means "how many real request captures this process keeps
+     * in full", which is why it stays fixed rather than following a viewport — the captures cannot
+     * be recovered once dropped, and the bytes that actually weigh (the raw payloads) are budgeted
+     * separately by `BlobStore`.
+     */
     readonly maxBricks?: number;
     /** Blob store used for raw payloads. */
     readonly store?: BlobStore;

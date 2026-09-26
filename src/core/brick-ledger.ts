@@ -280,7 +280,16 @@ interface AttemptDraft {
 
 /** Limits that keep a long session's ledger bounded. */
 export interface LedgerOptions {
-  /** Bricks kept per session, newest last. */
+  /**
+   * Bricks kept per session, newest last — the **live** ledger's forensic retention.
+   *
+   * It is not a board capacity, and since 0.1.4 nothing sizes it as one: a scene replay passes
+   * its own slice's attempt count (`history-scene.ts`), because a slice cannot outgrow the
+   * screen. On the live tap the number means "how many real request captures this process keeps
+   * in full", which is why it stays fixed rather than following a viewport — the captures cannot
+   * be recovered once dropped, and the bytes that actually weigh (the raw payloads) are budgeted
+   * separately by `BlobStore`.
+   */
   readonly maxBricks?: number
   /** Blob store used for raw payloads. */
   readonly store?: BlobStore
@@ -294,7 +303,14 @@ export interface LedgerOptions {
   readonly observedBy?: 'host' | 'replay'
 }
 
-const DEFAULT_MAX_BRICKS = 400
+/**
+ * How many real request captures a live ledger keeps, newest last.
+ *
+ * One number, one job: **live forensic retention.** It is deliberately not the board's capacity
+ * (the board materializes the scene it is showing, at any session length) and deliberately not
+ * dynamic (a smaller viewport is no reason to throw away a capture that cannot be re-made).
+ */
+const DEFAULT_LIVE_DETAIL_RECORDS = 400
 
 /** The per-session ledger. */
 export class BrickLedger {
@@ -319,7 +335,7 @@ export class BrickLedger {
 
   constructor(sessionId: string, options: LedgerOptions = {}) {
     this.sessionId = sessionId
-    this.maxBricks = options.maxBricks ?? DEFAULT_MAX_BRICKS
+    this.maxBricks = options.maxBricks ?? DEFAULT_LIVE_DETAIL_RECORDS
     this.store = options.store ?? new BlobStore()
     this.observedBy = options.observedBy ?? 'host'
   }

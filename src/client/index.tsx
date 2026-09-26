@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 // The renderer owns the `ctx.slots` registry this half registers into; the other
 // two supply the node contract and the chat-store/selector face it reads.
@@ -16,10 +16,11 @@ import { BrickFeedClient } from './feed'
 import { BrickPanel, type JumpReport, type RawKind, type TranscriptState } from './panel'
 import { boardFromReadings, boardFromSources, type BoardData, type StepReading } from './bricks'
 import {
-  durableEvents, ensureTurnTranscriptLoaded, loadRequestForTurn, readTranscript, resolveHistoricalStep, sessionFaceOf,
+  durableEvents, ensureTurnTranscriptLoaded, HistoryPager, loadRequestForTurn, onWindowChange, readTranscript,
+  resolveHistoricalStep, sessionFaceOf,
   type LoadReport, type LoadRequest, type SessionFace,
 } from './navigation'
-import { replaySession } from '../core/replay'
+import { HistoryScene, type SceneDemand } from './history-scene'
 import { diffBricks } from '../shared/diff'
 import type { BrickFeed, BrickRecord } from '../shared/brick'
 
@@ -91,34 +92,28 @@ function loaderFor(sessionId: string | undefined): (request: LoadRequest) => Pro
 }
 
 /**
- * The session's own log, folded into bricks — the board's historical source.
+ * The session's own log, read a **scene** at a time — the board's historical source.
  *
  * The collector only ever sees this process, so a brick older than it used to lose its type, its
- * lifecycle and its target. The log has held all of that all along; this reads it with the same
- * observations the collector uses (`../core/replay`), so a replayed brick means what a live one
- * means, minus the request capture the log never had.
+ * lifecycle and its target. The log has held all of that all along; `./history-scene` reads it
+ * with the same observations the collector uses, so a replayed brick means what a live one means,
+ * minus the request capture the log never had.
  *
- * Memoised on the window it read: the durable window only grows when something *settles*, so a
- * long answer costs one replay per step rather than one per chunk.
+ * What changed in 0.1.4 is *how much* of it is read at once. Replaying the whole window worked
+ * while the window was one session's tail; once it could page older history in, the replay grew
+ * past the ledger's brick budget and the oldest bricks came back typed by the client fold. The
+ * board now says which Turns and steps are on screen, and only that slice is replayed.
+ *
+ * One service per session, kept outside the component so a re-render cannot lose a warm scene.
  */
-let replayCache: { key: string; feed: BrickFeed } | undefined
+let historySceneRef: { sessionId: string; scene: HistoryScene } | undefined
 
-function replayOf(sessionId: string | undefined): BrickFeed | undefined {
+function historySceneOf(sessionId: string | undefined): HistoryScene | undefined {
   if (sessionId === undefined || sessionId === '') return undefined
-  let face: SessionFace | undefined
-  try {
-    face = faceFor(sessionId)
-  } catch {
-    return undefined
-  }
-  if (face === undefined) return undefined
-  const events = durableEvents(face)
-  if (events.length === 0) return undefined
-  const key = `${sessionId}|${String(events.length)}|${String(events[0]!.seq)}|${String(events[events.length - 1]!.seq)}`
-  if (replayCache?.key === key) return replayCache.feed
-  const report = replaySession(sessionId, events)
-  replayCache = { key, feed: report.feed }
-  return report.feed
+  // A different session is a different window: replace the service rather than accumulating one
+  // raw-payload store per session visited.
+  if (historySceneRef?.sessionId !== sessionId) historySceneRef = { sessionId, scene: new HistoryScene({ sessionId }) }
+  return historySceneRef.scene
 }
 
 /** The session face for this board's session, resolved fresh on every call. */
@@ -308,6 +303,55 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
     )
   }
 
+  /**
+   * The pager, and the one thing to do when a page lands: rebuild the index from the window the
+   * session now holds, re-cut the screen the reader is on, and let React see the new scene.
+   *
+   * The board asks for a page on every paint near the left edge, so both halves are idempotent:
+   * `need()` answers `stalled`/`busy`/`no-more` without a request, and `window()` rescans only
+   * when the window actually moved.
+   */
+  const pagerRef = useRef<HistoryPager | undefined>(undefined)
+  const refreshScene = useRef<() => void>(() => {})
+  refreshScene.current = () => {
+    const scene = historySceneOf(sessionId)
+    if (scene === undefined) return
+    const face = faceFor(sessionId)
+    if (face !== undefined) scene.window(durableEvents(face))
+    scene.refresh()
+  }
+  pagerRef.current ??= new HistoryPager(undefined)
+  pagerRef.current.aim(faceFor(sessionId))
+
+  /**
+   * The scene service is a store, and the scene it currently holds is its snapshot: when a
+   * scene is cut, the key changes and React re-renders. A lookup that hit the memo changes
+   * nothing, so panning inside a scene costs no renders at all.
+   */
+  const scene = historySceneOf(sessionId)
+  useSyncExternalStore(
+    (listener) => scene?.subscribe(listener) ?? (() => {}),
+    () => scene?.scene?.key ?? '',
+    // A server render has no window and no scene: the board is a browser overlay, and the seat
+    // it is mounted into must render nothing at all (see `client-bundle.spec.ts`).
+    () => '',
+  )
+
+  // A page can also arrive from outside this board (a jump, the conversation's own loader).
+  // Only a window that grew at the *older* end changes the index, and that is one number to
+  // compare — an append is picked up by the ordinary render path.
+  const oldestSeq = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (scene === undefined) return undefined
+    return onWindowChange(faceFor(sessionId), () => {
+      const face = faceFor(sessionId)
+      const oldest = face?.eventSource?.getSnapshot()?.entries?.[0]?.event?.seq
+      if (oldest === oldestSeq.current) return
+      oldestSeq.current = oldest
+      refreshScene.current()
+    })
+  }, [sessionId, scene])
+
   // The board is created once and driven imperatively: it lives outside React's
   // tree (body-level overlay) and must never be re-created by a render.
   useEffect(() => {
@@ -340,6 +384,16 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
       // The board repeats what it actually reached rather than upgrading a near miss to a
       // success: `exact` is the brick's own row, `context` the Turn header, `none` nothing.
       onRevealed: (brick, outcome) => { reporter.current(brick, outcome) },
+      // What the reader is looking at, sent only when it changes. The scene service replays
+      // exactly that slice and announces the result, which re-renders this component and hands
+      // the board a board built from exact records — one round trip, no polling.
+      onScene: (demand: SceneDemand) => { historySceneOf(sessionId)?.demand(demand) },
+      // Near the left edge of the history this client holds: ask for a page. The pager decides
+      // whether asking means anything (`hasMore`, a page in flight, the same window twice), and
+      // a page that landed is a new window — rebuild the index and re-cut the reader's screen.
+      onNeedOlder: () => {
+        void pagerRef.current?.need().then((status) => { if (status === 'loaded') refreshScene.current() })
+      },
     })
     selectedRef.current = undefined
     setSelected(undefined)
@@ -360,7 +414,13 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
   // the ones that had a type and a row to go to. See `boardFromSources`.
   const readings = readingsOf(turns)
   const live = feed !== undefined && feed.sessionId === sessionId ? feed : undefined
-  const replayed = replayOf(sessionId)
+  // Note the window the session holds now; the scan happens only when it moved, and the scene
+  // for the reader's last screen is re-cut silently so this render never sees a stale one.
+  if (scene !== undefined) {
+    const face = faceFor(sessionId)
+    if (face !== undefined) scene.window(durableEvents(face))
+  }
+  const replayed = scene?.scene?.feed
   const data: BoardData = live === undefined && replayed === undefined
     ? boardFromReadings(readings)
     : boardFromSources({
