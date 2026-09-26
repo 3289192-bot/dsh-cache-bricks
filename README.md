@@ -1,4 +1,8 @@
-# dsh-cache-bricks
+# Cache Bricks Lite（可选精简版）
+
+> 本页介绍可选的 Lite 分支。**默认推荐 [Cache Bricks 完整版](https://github.com/3289192-bot/dsh-cache-bricks#readme)**，提供请求详情、对话定位、对比和活动翻面。
+>
+> Lite 适合只需要缓存棋盘的用户。[下载入口位于完整版发布页面底部](https://github.com/3289192-bot/dsh-cache-bricks/releases/tag/v0.1.4)。两个版本均限定 DSH `0.1.7-rc.2` Web profile。
 
 > **一句话产品定义：一次真实模型请求结束 → 落一块砖；砖的颜色只表示这次请求的 prompt cache 命中情况。**
 >
