@@ -1,3 +1,5 @@
+> 当前公开测试使用基线为 DSH `0.1.7-rc.2` Web profile。下文版本与接口记录描述开发基线，安装 peer 声明已放宽；其他版本未完成本次兼容性验证，不保证兼容。
+
 # Runtime contract this plugin is built on
 
 > **0.1.4 (Lite).** Only the facts this line actually depends on — the taps, the settlement, the

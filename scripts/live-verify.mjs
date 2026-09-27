@@ -7,7 +7,7 @@
  *
  * Usage:
  *   node scripts/live-verify.mjs                    # port 18090, newest log's token, this session
- *   node scripts/live-verify.mjs --port 18091 --home <path-to-DSH-home>
+ *   node scripts/live-verify.mjs --port 18091 --home C:\path\to\dsh-home
  *   node scripts/live-verify.mjs --session session-… --expect-brick
  *
  * `--expect-brick` makes "a brick appeared" a requirement rather than a report: use it when the

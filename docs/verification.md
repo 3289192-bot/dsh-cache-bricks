@@ -119,7 +119,7 @@ unconditionally. One band was the whole difference.
 
 ## The live run
 
-The built plugin was run in a **real harness**: an isolated home (`<temporary-DSH-home>`,
+The built plugin was run in a **real harness**: an isolated home (`/path/to/dsh-lite-test`,
 since deleted) with a custom `lite` profile, the tarball installed through the official command
 (`dsh plugin --profile lite add file:…/dsh-cache-bricks-0.1.4.tgz`, which also added the bundle
 entry), booted as `dsh --profile lite --host 127.0.0.1 --port 18099`. Then, over its real HTTP

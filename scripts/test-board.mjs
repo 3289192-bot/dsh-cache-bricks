@@ -365,7 +365,7 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui}
       font: `${style.fontWeight} ${style.fontSize}/${style.lineHeight}`,
       numeric: style.fontVariantNumeric,
       radius: style.borderRadius,
-      transition: style.transitionProperty.includes('bottom') ? 'bottom' : style.transitionProperty,
+      transition: style.transitionProperty,
       badBackground: badStyle.backgroundColor,
       badColor: badStyle.color,
       badWeight: badStyle.fontWeight,
@@ -380,10 +380,51 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui}
   check('the reading is tabular monospace at the size the digits were measured for',
     material.font === '500 12px/12px' && material.numeric === 'tabular-nums' && material.radius === '3px',
     JSON.stringify([material.font, material.numeric, material.radius]))
-  check('the brick falls on 0.1.3\'s curve, and only red is set bold',
-    material.transition.includes('bottom') && material.badBackground === 'rgb(220, 38, 38)'
+  check('only red is set bold, and no brick animates a position property',
+    !material.transition.includes('bottom') && !material.transition.includes('right')
+    && material.badBackground === 'rgb(220, 38, 38)'
     && material.badColor === 'rgb(255, 255, 255)' && material.badWeight === '700',
     JSON.stringify([material.transition, material.badBackground, material.badWeight]))
+
+  // The fall itself: 0.1.3's curve, one row above the cell, on `transform` — the compositor's
+  // property, so a drop costs no layout (this is what the full line does too).
+  const fall = await page.evaluate(async () => {
+    const brick = window.__fixture.brick
+    const seen = []
+    window.__fixture.push({
+      sessionId: 'S',
+      bricks: [brick(1, 1, 'good'), brick(2, 1, 'good')],
+      dropped: 0, endedTurns: [], backfilled: 0, dispatched: 2,
+    })
+    await new Promise((resolve) => {
+      const until = performance.now() + 400
+      const tick = () => {
+        for (const element of document.querySelectorAll('[data-cache-bricks-brick]')) {
+          for (const animation of element.getAnimations()) {
+            const timing = animation.effect?.getTiming()
+            const frames = animation.effect?.getKeyframes?.() ?? []
+            seen.push({
+              duration: Math.round(Number(timing?.duration ?? 0)),
+              easing: String(timing?.easing ?? ''),
+              from: String(frames[0]?.transform ?? ''),
+              to: String(frames[1]?.transform ?? ''),
+              properties: Object.keys(frames[0] ?? {}).filter((name) => name !== 'offset' && name !== 'computedOffset' && name !== 'easing' && name !== 'composite'),
+            })
+          }
+        }
+        if (performance.now() > until) resolve()
+        else requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    })
+    return seen
+  })
+  check('the brick falls on 0.1.3\'s curve, as a transform from one row above',
+    fall.length > 0
+    && fall.every((entry) => entry.duration === 420 && entry.easing === 'cubic-bezier(0.45, 0.02, 0.95, 0.55)')
+    && fall.some((entry) => entry.from.includes('-18px') && entry.to.includes('0px'))
+    && fall.every((entry) => entry.properties.includes('transform') && !entry.properties.some((name) => ['bottom', 'right', 'top', 'left', 'height'].includes(name))),
+    JSON.stringify(fall.slice(0, 2)))
 
   // ── the window: rails, pan, fades, the way back ─────────────────────────────────────
   await page.evaluate(() => {
@@ -583,7 +624,10 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui}
 
   check('no unhandled browser error', pageErrors.length === 0, pageErrors.join(' | '))
 
-  // A reader who asked for less motion gets no transitions at all: the brick is simply there.
+  // A reader who asked for less motion still gets the bricks — and, deliberately, still gets the
+  // drop: 0.1.x never consulted the preference for this motion, and a board that silently stops
+  // dropping is a board whose bricks appear out of nowhere. What it never gets is a position
+  // property animating, whatever the setting.
   const calm = await browser.newPage({ viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce' })
   try {
     await calm.setContent(TRANSCRIPT)
@@ -600,17 +644,39 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui}
       window.__fixture.push({ sessionId: 'S', bricks: [window.__fixture.brick(1, 1, 'good')], backfilled: 0, dropped: 0, endedTurns: [1], dispatched: 1 })
     })
     await calm.waitForTimeout(300)
-    const still = await calm.evaluate(() => {
+    const still = await calm.evaluate(async () => {
+      const brick = window.__fixture.brick
+      const drops = []
+      window.__fixture.push({
+        sessionId: 'S',
+        bricks: [brick(1, 1, 'good'), brick(2, 1, 'good')],
+        backfilled: 0, dropped: 0, endedTurns: [1], dispatched: 2,
+      })
+      await new Promise((resolve) => {
+        const until = performance.now() + 400
+        const tick = () => {
+          for (const element of document.querySelectorAll('[data-cache-bricks-brick]')) {
+            for (const animation of element.getAnimations()) {
+              drops.push(Math.round(Number(animation.effect?.getTiming()?.duration ?? 0)))
+            }
+          }
+          if (performance.now() > until) resolve()
+          else requestAnimationFrame(tick)
+        }
+        requestAnimationFrame(tick)
+      })
       const slab = document.querySelector('[data-cache-bricks-brick]')
       const ghost = document.querySelector('[data-cache-bricks-ghost]')
       return {
         transition: getComputedStyle(slab).transitionProperty,
         ghostTransition: getComputedStyle(ghost).transitionProperty,
         text: (slab.textContent ?? '').trim(),
+        drops,
       }
     })
-    check('prefers-reduced-motion draws the same bricks with no animation at all',
-      still.transition === 'none' && still.ghostTransition === 'none' && still.text === '99.0%',
+    check('prefers-reduced-motion still gets the bricks and still gets the drop',
+      still.transition === 'none' && still.ghostTransition === 'none'
+      && still.text === '99.0%' && still.drops.includes(420),
       JSON.stringify(still))
   } finally {
     await calm.close()

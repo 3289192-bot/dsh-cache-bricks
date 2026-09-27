@@ -13,7 +13,9 @@
  *   appears only while the board is showing history;
  * - **the motion** — a brick falls in on `bottom 420ms cubic-bezier(.45,.02,.95,.55)`, a finished
  *   Turn's stack slides left on `right 260ms ease-out`, and a hand-driven pan turns both off so a
- *   drag is not a rubber band. `prefers-reduced-motion` turns them off for good.
+ *   drag is not a rubber band. `prefers-reduced-motion` deliberately does **not** disable them:
+ *   0.1.x never consulted it for these two motions (only the full line's card flip did), and a
+ *   board that silently stops dropping is a board whose bricks appear out of nowhere.
  *
  * What is **not** here, because a Lite brick has nothing to show for it: the flip, the type face,
  * the inspector, navigation, the auxiliary lane. One brick, one colour, one number.
@@ -62,7 +64,21 @@ const GRID_LEFT = RAIL
 const FADE = 9
 
 /** The brick transition: gravity on the way down, a shorter slide when the stack shifts left. */
-const SLAB_TRANSITION = 'bottom 420ms cubic-bezier(.45,.02,.95,.55), right 260ms ease-out'
+/**
+ * The fall: 420ms of gravity, from one brick-height above the cell.
+ *
+ * It is a `transform` animation, not a `bottom` transition, for the reason the full line gives:
+ * `bottom` is a layout property, so a transition on it re-runs style and layout on every frame of
+ * every drop, while `transform` is the compositor's. Same curve, same duration, same start.
+ */
+const FALL_MS = 420
+const FALL_EASE = 'cubic-bezier(.45,.02,.95,.55)'
+/** The fall's animation id, so a brick replaces its own rather than stacking two transforms. */
+const FALL_ID = 'cache-bricks-fall'
+/** A finished Turn slides the whole grid one cell left: one animation, not one per brick. */
+const SLIDE_MS = 260
+/** The slide's animation id, so two slides in a row replace each other instead of stacking. */
+const SLIDE_ID = 'cache-bricks-slide'
 
 /** How long a hand-driven pan keeps the bricks from animating their own moves, in milliseconds. */
 const PAN_QUIET_MS = 200
@@ -121,10 +137,6 @@ const TONE_WEIGHT: Record<BrickTone, string> = {
 const CHIP_FONT = '700 9px/1 ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif'
 
 /** Whether the reader asked for less motion. */
-function prefersReducedMotion(): boolean {
-  return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
-}
-
 /** One drawn brick. */
 interface Slab {
   readonly element: HTMLDivElement
@@ -216,9 +228,7 @@ export class CacheBoard {
   private lastNewestTurn: number | undefined
   private tallestCache: { columns: readonly BoardColumn[]; tallest: number } | undefined
   private frame: number | undefined
-  private settle: number | undefined
   private observer: MutationObserver | undefined
-  private panUntil = 0
   private panTimer: number | undefined
   private drag: {
     axis: 'x' | 'y'
@@ -298,8 +308,15 @@ export class CacheBoard {
       display: 'none',
       borderRadius: '3px',
       border: '1px dashed rgba(148, 163, 184, 0.35)',
-      transition: prefersReducedMotion() ? 'none' : 'bottom 260ms ease-out, right 260ms ease-out',
+      // The slot marks a cell; it is a child of the grid now, so it pans and slides with the bricks
+      // on the compositor and animates nothing of its own.
+      transition: 'none',
     } satisfies Partial<CSSStyleDeclaration>)
+
+    // Its coordinates are grid coordinates, so it belongs to the grid: an overlay in the host's
+    // frame sat `GRID_LEFT`/`CHROME_H` off the cell it names. First child, so a brick landing there
+    // paints over the dashed outline.
+    this.grid.prepend(this.ghost)
 
     this.fadeLeft = this.createFade('left')
     this.fadeRight = this.createFade('right')
@@ -314,7 +331,6 @@ export class CacheBoard {
     this.host.append(
       this.floor,
       this.grid,
-      this.ghost,
       this.fadeLeft,
       this.fadeRight,
       this.fadeTop,
@@ -357,7 +373,6 @@ export class CacheBoard {
     window.removeEventListener('resize', this.onLayoutChange)
     this.observer?.disconnect()
     if (this.frame !== undefined) cancelAnimationFrame(this.frame)
-    if (this.settle !== undefined) cancelAnimationFrame(this.settle)
     if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
     this.host.remove()
     this.slabs.clear()
@@ -441,12 +456,11 @@ export class CacheBoard {
     this.syncGhost(metrics, view)
     this.syncChip(view, gridWidth)
     this.syncNotice()
-    this.settleNow()
   }
 
   /** Reconcile the bricks with the window. */
   private syncBricks(metrics: BoardMetrics, view: BoardWindow): void {
-    const smooth = !this.isPanning()
+    const previousNewest = this.lastNewestTurn
     const seen = new Set<string>()
     const newestIndex = this.columns.length - 1
     const bricks = this.feed?.bricks ?? []
@@ -467,8 +481,8 @@ export class CacheBoard {
         const { right, bottom } = cellPlacement(metrics, cell.column, cell.row)
         seen.add(brick.id)
         const existing = this.slabs.get(brick.id)
-        if (existing === undefined) this.createSlab(brick, metrics, right, bottom, smooth)
-        else this.updateSlab(existing, brick, right, bottom, smooth)
+        if (existing === undefined) this.createSlab(brick, metrics, right, bottom)
+        else this.updateSlab(existing, brick, right, bottom)
       }
     }
     for (const [key, slab] of this.slabs) {
@@ -476,6 +490,15 @@ export class CacheBoard {
       slab.element.remove()
       this.slabs.delete(key)
     }
+    // A new Turn while the board is following is one slide of the whole grid, not one `right`
+    // transition per brick: the bricks are already painted in their new cells, and the grid starts
+    // a cell to the right of that and animates home — see {@link slideIn}.
+    const newest = this.columns[this.columns.length - 1]?.turn
+    if (this.scroll === undefined && previousNewest !== undefined && newest !== undefined && newest > previousNewest) {
+      const cells = this.columns.filter((column) => column.turn > previousNewest).length
+      this.slideIn(cells, metrics)
+    }
+    this.lastNewestTurn = newest
   }
 
   /** A brick's identity without its session prefix, so a column lookup is cheap. */
@@ -484,7 +507,7 @@ export class CacheBoard {
   }
 
   /** Create one brick, already wearing its face. */
-  private createSlab(brick: CacheBrick, metrics: BoardMetrics, right: number, bottom: number, smooth: boolean): void {
+  private createSlab(brick: CacheBrick, metrics: BoardMetrics, right: number, bottom: number): void {
     const element = document.createElement('div')
     element.dataset.cacheBricksBrick = brick.id
     Object.assign(element.style, {
@@ -497,7 +520,10 @@ export class CacheBoard {
       alignItems: 'center',
       justifyContent: 'center',
       pointerEvents: 'auto',
-      transition: smooth && !prefersReducedMotion() ? SLAB_TRANSITION : 'none',
+      // Nothing here animates a position property any more: the drop is a transform animation and
+      // the stack's slide is one transform on the grid, so a `right`/`bottom` write is always a
+      // jump — during a pan, and under a new Turn, where the grid's own slide cancels it out.
+      transition: 'none',
     } satisfies Partial<CSSStyleDeclaration>)
     const label = brickLabel(brick)
     this.paintFace(element, brick.tone, label)
@@ -507,14 +533,14 @@ export class CacheBoard {
     element.addEventListener('pointerenter', () => { element.style.filter = FOCUS_FILTER })
     element.addEventListener('pointerleave', () => { element.style.filter = '' })
     this.grid.append(element)
-    // Start one row higher, then settle on the next frame so the fall has a start.
     element.style.right = `${String(right)}px`
-    element.style.bottom = `${String(bottom + pitchY(metrics))}px`
+    element.style.bottom = `${String(bottom)}px`
     this.slabs.set(brick.id, { element, right, bottom, tone: brick.tone, label, title })
+    this.fallIn(element, pitchY(metrics))
   }
 
   /** Move, repaint or retitle an existing brick. */
-  private updateSlab(slab: Slab, brick: CacheBrick, right: number, bottom: number, smooth: boolean): void {
+  private updateSlab(slab: Slab, brick: CacheBrick, right: number, bottom: number): void {
     const label = brickLabel(brick)
     if (slab.tone !== brick.tone || slab.label !== label) {
       this.paintFace(slab.element, brick.tone, label)
@@ -527,8 +553,6 @@ export class CacheBoard {
       slab.element.setAttribute('aria-label', title)
       slab.title = title
     }
-    const wanted = smooth && !prefersReducedMotion() ? SLAB_TRANSITION : 'none'
-    if (slab.element.style.transition !== wanted) slab.element.style.transition = wanted
     if (slab.right !== right) {
       slab.right = right
       slab.element.style.right = `${String(right)}px`
@@ -539,13 +563,42 @@ export class CacheBoard {
     }
   }
 
-  /** On the frame after layout, let the freshly created bricks fall into place. */
-  private settleNow(): void {
-    if (this.settle !== undefined) return
-    this.settle = requestAnimationFrame(() => {
-      this.settle = undefined
-      for (const slab of this.slabs.values()) slab.element.style.bottom = `${String(slab.bottom)}px`
-    })
+  /** Drop one brick into its cell on the compositor: from one brick-height above, 420ms of gravity. */
+  private fallIn(element: HTMLDivElement, drop: number): void {
+    // No reduced-motion check on purpose, the same call the full line makes: 0.1.x dropped every new
+    // brick whatever the system asked for, and a board that silently stops dropping is a board whose
+    // bricks appear out of nowhere. Only a pan turns the motion off, and a pan does not create bricks.
+    if (typeof element.animate !== 'function') return
+    for (const running of element.getAnimations()) {
+      if (running.id === FALL_ID) running.cancel()
+    }
+    element.style.willChange = 'transform'
+    const animation = element.animate([
+      { transform: `translate3d(0px, ${String(-drop)}px, 0)` },
+      { transform: 'translate3d(0px, 0px, 0)' },
+    ], { duration: FALL_MS, easing: FALL_EASE, fill: 'none', id: FALL_ID })
+    animation.addEventListener('finish', () => { element.style.willChange = 'auto' }, { once: true })
+  }
+
+  /**
+   * Slide the whole grid one cell to the left because a new Turn arrived while following.
+   *
+   * One compositor animation on the container instead of a `right` transition on every brick: the
+   * bricks are already painted in their new cells, and the grid starts `cells` to the right of that
+   * and animates home, which is exactly where the stack used to be.
+   */
+  private slideIn(cells: number, metrics: BoardMetrics): void {
+    if (cells <= 0 || typeof this.grid.animate !== 'function') return
+    const from = `translate3d(${String(cells * pitchX(metrics))}px, 0px, 0)`
+    for (const running of this.grid.getAnimations()) {
+      if (running.id === SLIDE_ID) running.cancel()
+    }
+    this.grid.style.willChange = 'transform'
+    const animation = this.grid.animate([
+      { transform: from },
+      { transform: 'translate3d(0px, 0px, 0)' },
+    ], { duration: SLIDE_MS, easing: 'ease-out', fill: 'none', id: SLIDE_ID })
+    animation.addEventListener('finish', () => { this.grid.style.willChange = 'auto' }, { once: true })
   }
 
   /** The colour and the number: the whole face of a brick. */
@@ -735,24 +788,19 @@ export class CacheBoard {
   }
 
   /**
-   * Note that a hand-driven pan is in flight.
+   * Note that a hand-driven pan is in flight, and repaint once it has gone quiet.
    *
-   * While it is, slabs drop their transition: a pan moves every brick at once, and the 420 ms drop
-   * animation would turn a drag into a rubber band. The timer restores the animation afterwards,
-   * so the next real drop still falls.
+   * A pan used to need this: slabs animated their own `right`/`bottom`, so a drag had to switch the
+   * transitions off or it read as a rubber band. Nothing animates a position property now — the drop
+   * is a transform on a new brick (a pan creates none) and the stack's slide is skipped while the
+   * reader is off the live corner — so all that is left is the repaint that ends the gesture.
    */
   private markPan(): void {
-    this.panUntil = performance.now() + PAN_QUIET_MS
     if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
     this.panTimer = window.setTimeout(() => {
       this.panTimer = undefined
       this.schedule()
     }, PAN_QUIET_MS + 40)
-  }
-
-  /** True while a hand-driven pan is still settling. */
-  private isPanning(): boolean {
-    return performance.now() < this.panUntil
   }
 
   /** Keep the tallest column measured once per content array, not once per paint. */

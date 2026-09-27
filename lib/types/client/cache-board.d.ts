@@ -13,7 +13,9 @@
  *   appears only while the board is showing history;
  * - **the motion** — a brick falls in on `bottom 420ms cubic-bezier(.45,.02,.95,.55)`, a finished
  *   Turn's stack slides left on `right 260ms ease-out`, and a hand-driven pan turns both off so a
- *   drag is not a rubber band. `prefers-reduced-motion` turns them off for good.
+ *   drag is not a rubber band. `prefers-reduced-motion` deliberately does **not** disable them:
+ *   0.1.x never consulted it for these two motions (only the full line's card flip did), and a
+ *   board that silently stops dropping is a board whose bricks appear out of nowhere.
  *
  * What is **not** here, because a Lite brick has nothing to show for it: the flip, the type face,
  * the inspector, navigation, the auxiliary lane. One brick, one colour, one number.
@@ -70,9 +72,7 @@ export declare class CacheBoard {
     private lastNewestTurn;
     private tallestCache;
     private frame;
-    private settle;
     private observer;
-    private panUntil;
     private panTimer;
     private drag;
     private disposed;
@@ -99,8 +99,16 @@ export declare class CacheBoard {
     private createSlab;
     /** Move, repaint or retitle an existing brick. */
     private updateSlab;
-    /** On the frame after layout, let the freshly created bricks fall into place. */
-    private settleNow;
+    /** Drop one brick into its cell on the compositor: from one brick-height above, 420ms of gravity. */
+    private fallIn;
+    /**
+     * Slide the whole grid one cell to the left because a new Turn arrived while following.
+     *
+     * One compositor animation on the container instead of a `right` transition on every brick: the
+     * bricks are already painted in their new cells, and the grid starts `cells` to the right of that
+     * and animates home, which is exactly where the stack used to be.
+     */
+    private slideIn;
     /** The colour and the number: the whole face of a brick. */
     private paintFace;
     /**
@@ -147,15 +155,14 @@ export declare class CacheBoard {
     /** Move the window, clamped to what the content allows right now. */
     private setScroll;
     /**
-     * Note that a hand-driven pan is in flight.
+     * Note that a hand-driven pan is in flight, and repaint once it has gone quiet.
      *
-     * While it is, slabs drop their transition: a pan moves every brick at once, and the 420 ms drop
-     * animation would turn a drag into a rubber band. The timer restores the animation afterwards,
-     * so the next real drop still falls.
+     * A pan used to need this: slabs animated their own `right`/`bottom`, so a drag had to switch the
+     * transitions off or it read as a rubber band. Nothing animates a position property now — the drop
+     * is a transform on a new brick (a pan creates none) and the stack's slide is skipped while the
+     * reader is off the live corner — so all that is left is the repaint that ends the gesture.
      */
     private markPan;
-    /** True while a hand-driven pan is still settling. */
-    private isPanning;
     /** Keep the tallest column measured once per content array, not once per paint. */
     private tallestOf;
     /** The `⤓ 最新` control, built once and shown only while the board is showing history. */

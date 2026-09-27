@@ -41,8 +41,8 @@ const option = (name, fallback) => {
 const DEFAULT_BUILDS = [
   { label: 'no plugin (baseline)', path: 'baseline' },
   { label: '0.1.4 lite', path: root },
-  { label: '0.1.4 full/scene', path: process.env.DSH_FULL_BUILD ?? resolve(root, '..', '..', 'bench', 'full') },
-  { label: '0.1.3 stable', path: process.env.DSH_STABLE_BUILD ?? resolve(root, '..', '..', 'bench', 'v013') },
+  { label: '0.1.4 full/scene', path: '../full' },
+  { label: '0.1.3 stable', path: '../v013' },
 ]
 
 // ── the child: one build, one workload, one JSON line ────────────────────────────────────
