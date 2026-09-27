@@ -22,12 +22,14 @@ import {
   auxLaneRow,
   boardWindow,
   cellPlacement,
+  clampPan,
   clampScroll,
   columnRowLimit,
   countNewerThan,
   heldScroll,
   leadOf,
   liveScroll,
+  motionCell,
   newestTurnOf,
   pitchX,
   pitchY,
@@ -195,6 +197,67 @@ describe('panning', () => {
     expect(windowCell(0, 4, 0, LIVE_SCROLL, 4, 5)).toEqual({ column: 0, row: 4 })
     expect(windowCell(0, 5, 0, LIVE_SCROLL, 4, 5)).toBeUndefined()
     expect(windowCell(0, 5, 0, LIVE_SCROLL, 4, 6)).toEqual({ column: 0, row: 5 })
+  })
+})
+
+/**
+ * The ring a fractional pan is painted with.
+ *
+ * The data layer only ever holds whole cells, so a board that moves by fractions of a cell — which
+ * is what a hand-dragged pan does — has to *paint* one extra column and one extra row on every side
+ * of the window. At rest that ring sits outside the grid box and the face clips it; while the plane
+ * carries up to a whole cell it is what keeps the board's edge from going blank. These are the
+ * facts the view depends on: the ring is exactly `ring` cells wide, it is outside `windowCell` in
+ * every direction, and it still names real cells rather than inventing them.
+ */
+describe('the motion ring', () => {
+  it('is windowCell plus exactly one cell on every side', () => {
+    const inside = { back: 0, up: 0 }
+    // A window of four columns and six rows, its bottom-right cell at (0,0).
+    expect(motionCell(0, 0, 0, inside, 4, 6, 1)).toEqual({ column: 0, row: 0 })
+    expect(motionCell(-1, 0, 0, inside, 4, 6, 1)).toEqual({ column: -1, row: 0 })
+    expect(motionCell(4, 0, 0, inside, 4, 6, 1)).toEqual({ column: 4, row: 0 })
+    expect(motionCell(0, 6, 0, inside, 4, 6, 1)).toEqual({ column: 0, row: 6 })
+    expect(motionCell(0, -1, 0, inside, 4, 6, 1)).toEqual({ column: 0, row: -1 })
+    // One cell further out in each direction is outside the ring as well.
+    expect(motionCell(-2, 0, 0, inside, 4, 6, 1)).toBeUndefined()
+    expect(motionCell(5, 0, 0, inside, 4, 6, 1)).toBeUndefined()
+    expect(motionCell(0, 7, 0, inside, 4, 6, 1)).toBeUndefined()
+    expect(motionCell(0, -2, 0, inside, 4, 6, 1)).toBeUndefined()
+  })
+
+  it('keeps naming the cell the pan put there, ring or not', () => {
+    // Panned three cells back with four columns: the window shows cells 0..3, and the ring adds
+    // cell -1 (newer, right of the window) and cell 4 (older, left of it).
+    expect(motionCell(3, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toEqual({ column: 0, row: 0 })
+    expect(motionCell(6, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toEqual({ column: 3, row: 0 })
+    expect(motionCell(2, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toEqual({ column: -1, row: 0 })
+    expect(motionCell(7, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toEqual({ column: 4, row: 0 })
+    expect(motionCell(1, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toBeUndefined()
+    expect(motionCell(8, 0, 0, { back: 3, up: 0 }, 4, 6, 1)).toBeUndefined()
+    // The lead cell counts: a finished Turn reserves it, and the ring counts from there.
+    expect(motionCell(0, 0, 1, { back: 0, up: 0 }, 4, 6, 1)).toEqual({ column: 1, row: 0 })
+  })
+
+  it('agrees with the un-ringed window wherever the window has an answer', () => {
+    const metrics: BoardMetrics = { width: BRICK_W, height: BRICK_H, gap: GAP, columns: 4, rows: 6 }
+    const columns = Array.from({ length: 12 }, (_, index) => column(index + 1, 1))
+    const view = boardWindow(columns, metrics, { back: 2, up: 0 }, false)
+    for (let index = view.columnStart; index < view.columnEnd; index += 1) {
+      const distance = 11 - index
+      const plain = windowCell(distance, 0, view.lead, view.scroll, metrics.columns, view.limit)
+      expect(motionCell(distance, 0, view.lead, view.scroll, metrics.columns, view.limit, 1)).toEqual(plain)
+    }
+  })
+})
+
+describe('the motion target keeps its fraction', () => {
+  it('clamps without rounding, where clampScroll rounds', () => {
+    const limit = { back: 10, up: 4 }
+    expect(clampScroll({ back: 3.6, up: 1.4 }, limit)).toEqual({ back: 4, up: 1 })
+    expect(clampPan({ back: 3.6, up: 1.4 }, limit)).toEqual({ back: 3.6, up: 1.4 })
+    expect(clampPan({ back: -2.5, up: 9.75 }, limit)).toEqual({ back: 0, up: 4 })
+    expect(clampPan({ back: 12.25, up: 0 }, limit)).toEqual({ back: 10, up: 0 })
   })
 })
 

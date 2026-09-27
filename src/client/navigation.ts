@@ -32,6 +32,8 @@
  * runtime — so the whole strategy is testable without a browser.
  */
 import type { BrickTarget, HistoricalStepTarget } from './target'
+import { replayFromStream } from '../core/observe'
+import type { BrickRecord } from '../shared/brick'
 
 /** One entry of the session's contiguous event window. */
 export interface WindowEntry {
@@ -141,6 +143,157 @@ export function durableEventsOf(window: WindowSnapshot | undefined): DurableEven
 /** Every durable event the session face is holding right now. */
 export function durableEvents(face: SessionFace): DurableEvent[] {
   return durableEventsOf(face.eventSource?.getSnapshot())
+}
+
+/**
+ * How many entries inward a boundary seq is looked for before giving up.
+ *
+ * The window is an event list with occasional non-event entries in it (a transient chunk), so the
+ * first entry is not always a durable one. Walking a few steps covers that without turning the
+ * cheap key into a scan.
+ */
+const WINDOW_BOUNDARY_SCAN = 8
+
+/** The seq of the first durable entry at or after `index` in direction `step`, or `x` for none. */
+function seqNear(entries: readonly WindowEntry[], index: number, step: number): string {
+  for (let at = index, seen = 0; at >= 0 && at < entries.length && seen < WINDOW_BOUNDARY_SCAN; at += step, seen += 1) {
+    const entry = entries[at]
+    // The rows {@link durableEventsOf} would keep, and no others: a transient chunk is not an end
+    // of the window, and naming it as one would let a live chunk read as history moving.
+    if (entry === undefined || (entry.type !== undefined && entry.type !== 'event')) continue
+    const event = entry.event
+    if (event === undefined || typeof event.type !== 'string') continue
+    const seq = event.seq
+    if (typeof seq === 'number' && Number.isSafeInteger(seq)) return String(seq)
+  }
+  return 'x'
+}
+
+/**
+ * Identity of the window a snapshot holds, read **without** copying it.
+ *
+ * {@link durableEventsOf} walks every entry and sorts the result, which is the price of an answer
+ * that *is* the durable list. The render path asks a cheaper question on every pass — "is this the
+ * window I already indexed?" — and the runtime answers it outright: `SessionEventWindow.revision`
+ * counts every accepted mutation of the window (`contract/events.d.ts:59`). The entry count and the
+ * two boundary seqs ride along so the key still moves on a core that publishes no revision, and so
+ * a window that changed shape without moving its ends cannot hide behind a stale counter.
+ *
+ * A caller that sees the key it saw last time may skip {@link durableEventsOf} entirely; a caller
+ * that sees a different one must materialize the events and let the scene decide by its own, exact
+ * key (`windowKeyOf`). The two are not the same question on purpose: this one may say "changed"
+ * when nothing durable moved — one extra index rebuild — but it may never say "same" when the
+ * durable window did.
+ *
+ * @param window - the event window as the session face publishes it.
+ * @returns a string that changes whenever the window has to be re-indexed.
+ */
+export function windowKeyOfSnapshot(window: WindowSnapshot | undefined): string {
+  const entries = window?.entries ?? []
+  return [
+    String(window?.revision ?? 'none'),
+    String(entries.length),
+    seqNear(entries, 0, 1),
+    seqNear(entries, entries.length - 1, -1),
+  ].join('|')
+}
+
+/**
+ * The durable events a window holds **outside** a seq range, and how many it holds in all.
+ *
+ * This is what makes an incremental window possible: a log is append-only, so a window that only
+ * grew at an end is the old window plus these events — and the caller can prove that with the count
+ * (`indexed + older + newer === total`) instead of materializing everything to compare it. Only the
+ * events outside the range are materialized; the rest are counted as entries go by.
+ *
+ * @param window - the event window as the session face publishes it.
+ * @param bounds - the oldest and newest seq a caller has already indexed.
+ * @returns the events older than `bounds.oldest`, the ones newer than `bounds.newest`, and the total.
+ */
+export function durableEventsOutside(
+  window: WindowSnapshot | undefined,
+  bounds: { oldest: number; newest: number },
+): { older: DurableEvent[]; newer: DurableEvent[]; total: number } {
+  const older: DurableEvent[] = []
+  const newer: DurableEvent[] = []
+  let total = 0
+  for (const entry of window?.entries ?? []) {
+    if (entry.type !== undefined && entry.type !== 'event') continue
+    const event = entry.event
+    if (event === undefined || typeof event.type !== 'string' || typeof event.seq !== 'number' || !Number.isSafeInteger(event.seq)) continue
+    total += 1
+    if (event.seq >= bounds.oldest && event.seq <= bounds.newest) continue
+    const materialized: DurableEvent = {
+      type: event.type,
+      seq: event.seq,
+      ...(event.time === undefined ? {} : { time: event.time }),
+      data: event.data !== null && typeof event.data === 'object' ? event.data as Record<string, unknown> : {},
+    }
+    if (event.seq < bounds.oldest) older.push(materialized)
+    else newer.push(materialized)
+  }
+  // The window is ordered, so each list came out ascending; the sort is the same one
+  // `durableEventsOf` does, kept here so a caller may feed these straight into an index.
+  older.sort((left, right) => left.seq - right.seq)
+  newer.sort((left, right) => left.seq - right.seq)
+  return { older, newer, total }
+}
+
+/** The kinds of raw payload a client-side replay can hand back from the log it is holding. */
+export type LogRawKind = 'stream' | 'replay' | 'header'
+
+/**
+ * Read one raw payload for a brick a **client-side replay** produced, straight out of the session log.
+ *
+ * A scene replay is lazy about raw payloads on purpose (`core/replay.ts`, `raw: 'lazy'`): hashing a
+ * step's stream, its tool results and its header into a blob store is work nobody asked for while a
+ * board is being drawn. The bytes are not gone — they are the session's own events, which this
+ * client is holding — so the payload is read here, at the moment a reader opens one, and handed
+ * over as it is. No hashing is needed for that either: the panel is showing bytes, not a reference.
+ *
+ * Only what the log actually holds is answerable: a live request capture's message hashes and tool
+ * declarations exist nowhere in the durable stream, so they stay unavailable for a replayed brick.
+ *
+ * @param face - the session face, resolved at use time.
+ * @param record - the brick's record, which names the seq it settled at.
+ * @param kind - which payload to read.
+ * @returns the payload, or undefined when the log does not hold one for this brick.
+ */
+export function logRawPayload(face: SessionFace | undefined, record: BrickRecord, kind: LogRawKind): unknown {
+  const snapshot = face?.eventSource?.getSnapshot()
+  const seq = record.settlementSeq
+  if (snapshot === undefined || seq === undefined) return undefined
+  if (kind === 'header') {
+    // The header in force: the last one written at or before the settlement. (A `request/header`
+    // written *inside* the step would be newer than the one the scene carried, which the scene's
+    // own slice rule decides; this is the closest honest answer the log itself gives.)
+    let found: Record<string, unknown> | undefined
+    for (const entry of snapshot.entries ?? []) {
+      if (entry.type !== undefined && entry.type !== 'event') continue
+      const event = entry.event
+      if (event === undefined || typeof event.seq !== 'number' || event.seq > seq) continue
+      if (event.type === 'request/header' && event.data !== null && typeof event.data === 'object') {
+        found = event.data as Record<string, unknown>
+      }
+    }
+    return found
+  }
+  const settled = eventAtSeq(snapshot, seq)
+  if (settled === undefined) return undefined
+  const stream = settled.stream
+  if (kind === 'stream') return stream ?? null
+  return replayFromStream(stream as never)
+}
+
+/** The data of the durable event at one seq, without materializing the window around it. */
+function eventAtSeq(snapshot: WindowSnapshot, seq: number): Record<string, unknown> | undefined {
+  for (const entry of snapshot.entries ?? []) {
+    if (entry.type !== undefined && entry.type !== 'event') continue
+    const event = entry.event
+    if (event === undefined || event.seq !== seq) continue
+    return event.data !== null && typeof event.data === 'object' ? event.data as Record<string, unknown> : undefined
+  }
+  return undefined
 }
 
 /**

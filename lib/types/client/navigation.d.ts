@@ -32,6 +32,7 @@
  * runtime — so the whole strategy is testable without a browser.
  */
 import type { BrickTarget, HistoricalStepTarget } from './target';
+import type { BrickRecord } from '../shared/brick';
 /** One entry of the session's contiguous event window. */
 export interface WindowEntry {
     /** `event` is durable, `transient` is a client-only live chunk. */
@@ -103,6 +104,66 @@ export declare function sessionFaceOf(service: unknown, sessionId: string | unde
 export declare function durableEventsOf(window: WindowSnapshot | undefined): DurableEvent[];
 /** Every durable event the session face is holding right now. */
 export declare function durableEvents(face: SessionFace): DurableEvent[];
+/**
+ * Identity of the window a snapshot holds, read **without** copying it.
+ *
+ * {@link durableEventsOf} walks every entry and sorts the result, which is the price of an answer
+ * that *is* the durable list. The render path asks a cheaper question on every pass — "is this the
+ * window I already indexed?" — and the runtime answers it outright: `SessionEventWindow.revision`
+ * counts every accepted mutation of the window (`contract/events.d.ts:59`). The entry count and the
+ * two boundary seqs ride along so the key still moves on a core that publishes no revision, and so
+ * a window that changed shape without moving its ends cannot hide behind a stale counter.
+ *
+ * A caller that sees the key it saw last time may skip {@link durableEventsOf} entirely; a caller
+ * that sees a different one must materialize the events and let the scene decide by its own, exact
+ * key (`windowKeyOf`). The two are not the same question on purpose: this one may say "changed"
+ * when nothing durable moved — one extra index rebuild — but it may never say "same" when the
+ * durable window did.
+ *
+ * @param window - the event window as the session face publishes it.
+ * @returns a string that changes whenever the window has to be re-indexed.
+ */
+export declare function windowKeyOfSnapshot(window: WindowSnapshot | undefined): string;
+/**
+ * The durable events a window holds **outside** a seq range, and how many it holds in all.
+ *
+ * This is what makes an incremental window possible: a log is append-only, so a window that only
+ * grew at an end is the old window plus these events — and the caller can prove that with the count
+ * (`indexed + older + newer === total`) instead of materializing everything to compare it. Only the
+ * events outside the range are materialized; the rest are counted as entries go by.
+ *
+ * @param window - the event window as the session face publishes it.
+ * @param bounds - the oldest and newest seq a caller has already indexed.
+ * @returns the events older than `bounds.oldest`, the ones newer than `bounds.newest`, and the total.
+ */
+export declare function durableEventsOutside(window: WindowSnapshot | undefined, bounds: {
+    oldest: number;
+    newest: number;
+}): {
+    older: DurableEvent[];
+    newer: DurableEvent[];
+    total: number;
+};
+/** The kinds of raw payload a client-side replay can hand back from the log it is holding. */
+export type LogRawKind = 'stream' | 'replay' | 'header';
+/**
+ * Read one raw payload for a brick a **client-side replay** produced, straight out of the session log.
+ *
+ * A scene replay is lazy about raw payloads on purpose (`core/replay.ts`, `raw: 'lazy'`): hashing a
+ * step's stream, its tool results and its header into a blob store is work nobody asked for while a
+ * board is being drawn. The bytes are not gone — they are the session's own events, which this
+ * client is holding — so the payload is read here, at the moment a reader opens one, and handed
+ * over as it is. No hashing is needed for that either: the panel is showing bytes, not a reference.
+ *
+ * Only what the log actually holds is answerable: a live request capture's message hashes and tool
+ * declarations exist nowhere in the durable stream, so they stay unavailable for a replayed brick.
+ *
+ * @param face - the session face, resolved at use time.
+ * @param record - the brick's record, which names the seq it settled at.
+ * @param kind - which payload to read.
+ * @returns the payload, or undefined when the log does not hold one for this brick.
+ */
+export declare function logRawPayload(face: SessionFace | undefined, record: BrickRecord, kind: LogRawKind): unknown;
 /**
  * Whether the window the session currently holds covers one log position.
  *

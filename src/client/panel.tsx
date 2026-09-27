@@ -333,6 +333,14 @@ function RawTab({ props }: { props: BrickPanelProps }): ReactElement {
     ['stream', record.raw.streamRef],
     ['replay', record.raw.replayRef],
   ]
+  // A brick the client replayed has no refs by design: its raw payloads were never hashed, because
+  // nothing had asked for them (see `core/replay.ts`, `raw: 'lazy'`). They are the session's own
+  // events, so the ones the log can answer for are offered as *readable from the log* instead of
+  // being drawn as absent — which is what they would look like in the ref table.
+  const fromLog: RawKind[] = record.observedBy === 'replay' && record.settlementSeq !== undefined
+    ? ['stream', 'replay', 'header']
+    : []
+  const loadable = [...new Set([...refs.filter(([, ref]) => ref !== undefined).map(([kind]) => kind), ...fromLog])]
   return (
     <div>
       <Heading>Stored by reference</Heading>
@@ -342,13 +350,15 @@ function RawTab({ props }: { props: BrickPanelProps }): ReactElement {
       </div>
       <div style={GRID}>
         {refs.map(([kind, ref]) => (
-          <Row key={kind} label={kind} value={ref === undefined ? '—' : showHash(ref)} mono />
+          <Row key={kind} label={kind} value={ref === undefined
+            ? (fromLog.includes(kind) ? 'read from the log' : '—')
+            : showHash(ref)} mono />
         ))}
         {store === undefined ? null : <Row label="store" value={`${showNumber(store.blobs)} blobs · ${showNumber(store.bytes)} bytes`} mono />}
       </div>
       {onLoadRaw === undefined ? null : (
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-          {refs.filter(([, ref]) => ref !== undefined).map(([kind]) => (
+          {loadable.map((kind) => (
             <button key={kind} type="button" onClick={() => { onLoadRaw(kind) }} style={{ cursor: 'pointer' }}>
               load {kind}
             </button>

@@ -50,6 +50,14 @@ export interface BoardData {
      * rather than a Turn column, which would invent a relationship that does not exist.
      */
     readonly aux: readonly Brick[];
+    /**
+     * The tallest column, when the caller already knows it.
+     *
+     * The board measures it once per content array otherwise, which is a scan of every Turn: the
+     * world knows it from the columns it just built, so a pan that replaced fifty Turns does not make
+     * the board re-measure ten thousand (see `CacheTetrisBoard.setColumns`).
+     */
+    readonly tallest?: number;
 }
 /**
  * Bricks from the collector's feed: one per attempt, columns per Turn.
@@ -201,21 +209,6 @@ export interface StepReading {
  * @returns a record with the fields the client can honestly claim.
  */
 export declare function recordFromReading(reading: StepReading): BrickRecord;
-/**
- * Bricks from the fallback source: one per **step**, keyed `turn:step`.
- *
- * This is the one place the board shows a different granularity from the rest of it, and
- * it is a degradation, not a mode: with no host half there is no attempt identity to be
- * had. That costs the brick its *attempt* precision — it cannot say which of a step's
- * requests it is — but not its place in the conversation: it carries a `historical-step`
- * target, which the jump resolves against the durable log, so a folded brick still opens
- * the row its step became (`resolveHistoricalStep`).
- *
- * The records are reduced (`observedBy: 'client'`), which is enough for the
- * overview tab and the diff's cache rows, and visibly not enough for the rest.
- * @param turns - per-step readings derived on the client.
- * @returns board data, with a reduced record per brick.
- */
 export declare function boardFromReadings(turns: readonly StepReading[]): BoardData;
 /**
  * Everything the board can be built from, weakest first.
@@ -239,14 +232,123 @@ export interface BoardSources {
     readonly readings?: readonly StepReading[];
 }
 /**
+ * The board as a persistent world: one light base, two overlays, patched rather than rebuilt.
+ *
+ * The merge itself is unchanged — per **attempt**, strongest source last (`live` > `exact` >
+ * `fold`), with a folded step dropped as soon as any attempt-level brick covers it. What changed is
+ * *when* it runs. `boardFromSources` used to rebuild the whole session on every call, and the board
+ * calls it whenever the scene on screen is re-cut: a pan to a new screen re-folded every reading the
+ * session had, rebuilt every Turn's column, and re-sorted all of them — O(session) work for a
+ * viewport-sized change. That is the one place where a "window" board still behaved like a backlog.
+ *
+ * The world separates the rates:
+ *
+ * - the **base** is the fold, rebuilt only when the fold itself changes (the streaming rate, not the
+ *   pan rate);
+ * - the **exact overlay** is the scene's replay, applied by patch: the steps it covers are replaced,
+ *   the steps it stopped covering fall back to their fold brick — O(scene), and adjacent scenes share
+ *   most of their steps;
+ * - the **live overlay** is the collector's feed, applied only when it changes.
+ *
+ * A materialization is then one array of Turn pointers plus the columns that were actually touched,
+ * which is what a pan should cost. `order` stays lazy: it is a list of every brick on the board, and
+ * only the panel (which needs "the brick before this one") ever asks for it.
+ */
+export declare class BoardWorld {
+    /**
+     * What the world has cost, in counts rather than milliseconds.
+     *
+     * A pan should move `columnsRebuilt` and nothing else: `foldRebuilds` counts the O(session) work
+     * and must stay flat while the reader pans, `orderBuilds` counts the session-sized list that only
+     * the panel asks for, and `exactSteps` counts what the scene actually replaced. Read by the
+     * browser checks through `window.__dshCacheBricksStats()`, and by nothing in the plugin.
+     */
+    readonly stats: {
+        /** Materializations: one per scene change, one per fold change. */
+        boards: number;
+        /** Times the fold layer was rebuilt — the only O(session) step, and it runs at the fold's rate. */
+        foldRebuilds: number;
+        /** Steps the fold layer holds after the last rebuild. */
+        foldSteps: number;
+        /** Scene patches, and the steps each one replaced. */
+        exactPatches: number;
+        exactSteps: number;
+        /** Collector patches. */
+        livePatches: number;
+        /** Turns whose column was rebuilt because something inside it changed. */
+        columnsRebuilt: number;
+        /** Times the session-sized `order` list was materialized (the panel asking for it). */
+        orderBuilds: number;
+    };
+    private readings;
+    /** Turns in ascending order, maintained on insert. */
+    private turns;
+    private readonly byTurn;
+    private readonly steps;
+    /** The steps the exact overlay covered last time, so leaving them can release them. */
+    private exactSteps;
+    /** The attempt keys the live overlay held last time. */
+    private liveKeys;
+    /** The collector's feed object the overlay was built from: a pan hands back the same one. */
+    private liveFeed;
+    private readonly records;
+    private readonly titles;
+    private aux;
+    private readonly auxRecords;
+    private readonly auxTitles;
+    private endedTurns;
+    /**
+     * Bring the world up to date and hand back a board for this moment.
+     *
+     * @param sources - live feed, replayed feed and folded readings, any of them optional.
+     * @returns the merged board. Only the columns whose content changed are rebuilt; `order` is
+     *   computed on first use.
+     */
+    board(sources: BoardSources): BoardData;
+    /** Whether the last {@link board} call had no feed behind it at all. */
+    private foldedOnly;
+    /** Replace the fold layer: the only step that is O(session), and it runs at the fold's rate. */
+    private setFold;
+    /** Replace the collector's overlay. */
+    private setLive;
+    /** Replace the replay overlay: the scene on screen, in and out. */
+    private setExact;
+    /** The attempt-level entries of one feed, keyed `${turn}:${step}:${attempt}`. */
+    private entriesOf;
+    private putOverlay;
+    /** One layer drops an attempt: the step falls back to whatever is left under it. */
+    private removeOverlay;
+    /** The scene moved on: this step is no longer exactly known. */
+    private releaseExact;
+    /** The lane: auxiliary calls belong to no Turn, so the strongest feed's list wins. */
+    private applyAux;
+    private stepState;
+    private ensureTurn;
+    /** Note that one Turn's content changed (and optionally its ended flag). */
+    private touch;
+    /**
+     * The effective bricks of one step: the overlays if any of them has it, the fold otherwise.
+     *
+     * This is the whole merge rule, in one place, and it is why a patch costs the step rather than
+     * the session.
+     */
+    private bricksOf;
+    /** The record and title behind one effective brick. */
+    private detailOf;
+    /** Build the board for this moment, rebuilding only the Turns that changed. */
+    private materialize;
+    private columns;
+    /** Every brick on the board, newest last: built only when a caller asks (the panel does). */
+    private orderOf;
+    /** The steps of one Turn, in step order. */
+    private stepsOf;
+}
+/**
  * Build one board out of everything available.
  *
- * Merging is **per attempt**, not per step: a step whose first attempt happened before the
- * collector started and whose second it watched must still come out as two bricks, because that
- * pair is the case this plugin exists for. So the live feed wins on the attempts it has, a
- * replay fills the attempts it does not, and the fold supplies steps neither covers — one
- * step-level brick per step, dropped as soon as any attempt-level brick covers that step, since
- * keeping both would count the same request twice.
+ * The merge rules live in {@link BoardWorld} (per attempt, `live` > `exact` > `fold`, see there);
+ * this is the one-shot form of it, for a caller that has no world to keep — the panel tests, and
+ * anything that merges a single snapshot.
  *
  * @param sources - live feed, replayed feed and folded readings, any of them optional.
  * @returns the merged board. The board-level `estimated` flag is set only for a board that is

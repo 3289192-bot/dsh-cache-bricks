@@ -1,6 +1,6 @@
 {
   "name": "dsh-cache-bricks",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "DSH web plugin: cache hit rate as falling Tetris-style bricks in the blank gutter beside the conversation — one brick per real model request attempt, one column per task, amber below 90% and red below 70%.",
   "type": "module",
   "main": "lib/index.js",
@@ -60,10 +60,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-chat": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-client-ui-conversation": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-client-ui-renderer": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-client-ui-chat": "*",
+    "@deepseek-ai/dsh-client-ui-conversation": "*",
+    "@deepseek-ai/dsh-client-ui-renderer": "*",
+    "@deepseek-ai/dsh-client-ui-slots": "*",
     "react": "^18.0.0"
   },
   "devDependencies": {
@@ -98,5 +98,19 @@
     "dsh-plugin",
     "deepseek-harness",
     "prompt-cache"
-  ]
+  ],
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-ui-chat": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-conversation": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-renderer": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-slots": {
+      "optional": true
+    }
+  }
 }

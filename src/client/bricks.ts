@@ -77,6 +77,14 @@ export interface BoardData {
    * rather than a Turn column, which would invent a relationship that does not exist.
    */
   readonly aux: readonly Brick[]
+  /**
+   * The tallest column, when the caller already knows it.
+   *
+   * The board measures it once per content array otherwise, which is a scan of every Turn: the
+   * world knows it from the columns it just built, so a pan that replaced fifty Turns does not make
+   * the board re-measure ten thousand (see `CacheTetrisBoard.setColumns`).
+   */
+  readonly tallest?: number
 }
 
 /**
@@ -108,6 +116,8 @@ export function boardFromFeed(feed: BrickFeed): BoardData {
       // record says which. The board paints them differently for exactly one reason: a
       // replayed brick has no request capture behind it, and the reader is owed that.
       origin: record.observedBy === 'replay' ? 'replay' : 'live',
+      // A live draft is the one brick that has not settled yet: the collector is still watching it.
+      settled: record.settlement !== 'running',
       tone: toneOfRatio(ratio, record.metrics.promptTokens),
       label: labelOfRatio(ratio),
       kind,
@@ -526,6 +536,43 @@ export function recordFromReading(reading: StepReading): BrickRecord {
  * @param turns - per-step readings derived on the client.
  * @returns board data, with a reduced record per brick.
  */
+/**
+ * The brick the client's own fold stands for.
+ *
+ * The fold sees usage and whether the step ended — not which channels ran — so every brick it
+ * produces is the quiet default type. Claiming 思考 or 工具 here would be a guess dressed as a
+ * measurement. It carries no attempt identity either: these are one per *step*. That is a claim
+ * about precision, not about reachability — the step is a real place in the conversation, and the
+ * durable log says which row it became — so the target is a `historical-step`, resolved against the
+ * log when the jump runs (see `resolveHistoricalStep`), and the brick is drawn dashed so a board of
+ * them is never read as a board of real requests.
+ *
+ * @param reading - one materialized step reading.
+ * @returns the brick, with no record behind it.
+ */
+function foldBrickOf(reading: StepReading): Brick {
+  return {
+    key: brickKey(reading.turn, reading.step),
+    turn: reading.turn,
+    step: reading.step,
+    attempt: 0,
+    tone: reading.tone,
+    label: reading.label,
+    kind: 'output',
+    estimated: true,
+    origin: 'fold',
+    // The fold can only speak about a step that has a usage reading behind it, so its bricks are
+    // born settled — they get the birth drop and nothing else.
+    settled: true,
+    target: {
+      kind: 'historical-step',
+      turn: reading.turn,
+      step: reading.step,
+      ...(reading.seq === undefined || reading.seq <= 0 ? {} : { loadSeq: reading.seq }),
+    },
+  }
+}
+
 export function boardFromReadings(turns: readonly StepReading[]): BoardData {
   const columns = new Map<number, { turn: number; ended: boolean; bricks: Brick[] }>()
   const titles = new Map<string, string>()
@@ -533,32 +580,7 @@ export function boardFromReadings(turns: readonly StepReading[]): BoardData {
   const order: string[] = []
   for (const reading of turns) {
     const key = brickKey(reading.turn, reading.step)
-    const brick: Brick = {
-      key,
-      turn: reading.turn,
-      step: reading.step,
-      attempt: 0,
-      tone: reading.tone,
-      label: reading.label,
-      // The client's own fold sees usage and whether the step ended — not which
-      // channels ran — so every brick it produces is the quiet default type.
-      // Claiming 思考 or 工具 here would be a guess dressed as a measurement.
-      kind: 'output',
-      // No attempt identity at all: these bricks are one per *step*, folded from the session
-      // event feed. That is a claim about precision, not about reachability — the step is a
-      // real place in the conversation, and the durable log says which row it became. So the
-      // target is a `historical-step`, resolved against the log when the jump runs (see
-      // `resolveHistoricalStep`), and the brick is drawn dashed so a board of them is never
-      // read as a board of real requests.
-      estimated: true,
-      origin: 'fold',
-      target: {
-        kind: 'historical-step',
-        turn: reading.turn,
-        step: reading.step,
-        ...(reading.seq === undefined || reading.seq <= 0 ? {} : { loadSeq: reading.seq }),
-      },
-    }
+    const brick = foldBrickOf(reading)
     const column = columns.get(reading.turn) ?? { turn: reading.turn, ended: reading.ended, bricks: [] }
     column.bricks.push(brick)
     column.ended = reading.ended
@@ -610,107 +632,410 @@ function attemptKey(turn: number, step: number, attempt: number): string {
   return `${String(turn)}:${String(step)}:${String(attempt)}`
 }
 
+/** One step's row in the world: the fold's brick, and whatever an overlay put on top of it. */
+interface StepState {
+  readonly turn: number
+  readonly step: number
+  /** The fold's own brick for this step, when the conversation has rendered it. */
+  fold?: { brick: Brick; record: BrickRecord; title: string } | undefined
+  /** Exact attempts replayed from the session log for the scene on screen. */
+  exact?: Map<number, OverlayEntry> | undefined
+  /** Exact attempts the collector of *this* process observed. */
+  live?: Map<number, OverlayEntry> | undefined
+}
+
+/** One attempt-level brick from an overlay, with everything the board needs to show it. */
+interface OverlayEntry {
+  readonly brick: Brick
+  readonly record: BrickRecord
+  readonly title: string
+}
+
+/** One Turn's column, cached until something inside it changes. */
+interface TurnState {
+  readonly turn: number
+  ended: boolean
+  bricks: Brick[]
+  dirty: boolean
+}
+
+/**
+ * The board as a persistent world: one light base, two overlays, patched rather than rebuilt.
+ *
+ * The merge itself is unchanged — per **attempt**, strongest source last (`live` > `exact` >
+ * `fold`), with a folded step dropped as soon as any attempt-level brick covers it. What changed is
+ * *when* it runs. `boardFromSources` used to rebuild the whole session on every call, and the board
+ * calls it whenever the scene on screen is re-cut: a pan to a new screen re-folded every reading the
+ * session had, rebuilt every Turn's column, and re-sorted all of them — O(session) work for a
+ * viewport-sized change. That is the one place where a "window" board still behaved like a backlog.
+ *
+ * The world separates the rates:
+ *
+ * - the **base** is the fold, rebuilt only when the fold itself changes (the streaming rate, not the
+ *   pan rate);
+ * - the **exact overlay** is the scene's replay, applied by patch: the steps it covers are replaced,
+ *   the steps it stopped covering fall back to their fold brick — O(scene), and adjacent scenes share
+ *   most of their steps;
+ * - the **live overlay** is the collector's feed, applied only when it changes.
+ *
+ * A materialization is then one array of Turn pointers plus the columns that were actually touched,
+ * which is what a pan should cost. `order` stays lazy: it is a list of every brick on the board, and
+ * only the panel (which needs "the brick before this one") ever asks for it.
+ */
+export class BoardWorld {
+  /**
+   * What the world has cost, in counts rather than milliseconds.
+   *
+   * A pan should move `columnsRebuilt` and nothing else: `foldRebuilds` counts the O(session) work
+   * and must stay flat while the reader pans, `orderBuilds` counts the session-sized list that only
+   * the panel asks for, and `exactSteps` counts what the scene actually replaced. Read by the
+   * browser checks through `window.__dshCacheBricksStats()`, and by nothing in the plugin.
+   */
+  readonly stats = {
+    /** Materializations: one per scene change, one per fold change. */
+    boards: 0,
+    /** Times the fold layer was rebuilt — the only O(session) step, and it runs at the fold's rate. */
+    foldRebuilds: 0,
+    /** Steps the fold layer holds after the last rebuild. */
+    foldSteps: 0,
+    /** Scene patches, and the steps each one replaced. */
+    exactPatches: 0,
+    exactSteps: 0,
+    /** Collector patches. */
+    livePatches: 0,
+    /** Turns whose column was rebuilt because something inside it changed. */
+    columnsRebuilt: 0,
+    /** Times the session-sized `order` list was materialized (the panel asking for it). */
+    orderBuilds: 0,
+  }
+
+  private readings: readonly StepReading[] | undefined
+  /** Turns in ascending order, maintained on insert. */
+  private turns: number[] = []
+  private readonly byTurn = new Map<number, TurnState>()
+  private readonly steps = new Map<string, StepState>()
+  /** The steps the exact overlay covered last time, so leaving them can release them. */
+  private exactSteps = new Set<string>()
+  /** The attempt keys the live overlay held last time. */
+  private liveKeys = new Set<string>()
+  /** The collector's feed object the overlay was built from: a pan hands back the same one. */
+  private liveFeed: BrickFeed | undefined
+  private readonly records = new Map<string, BrickRecord>()
+  private readonly titles = new Map<string, string>()
+  private aux: Brick[] = []
+  private readonly auxRecords = new Map<string, BrickRecord>()
+  private readonly auxTitles = new Map<string, string>()
+  private endedTurns = new Set<number>()
+
+  /**
+   * Bring the world up to date and hand back a board for this moment.
+   *
+   * @param sources - live feed, replayed feed and folded readings, any of them optional.
+   * @returns the merged board. Only the columns whose content changed are rebuilt; `order` is
+   *   computed on first use.
+   */
+  board(sources: BoardSources): BoardData {
+    // The board is "entirely folded" exactly when neither feed has a brick of its own: the claim is
+    // about every brick on it, so a lane-only feed still counts as a source.
+    this.foldedOnly = (sources.live?.bricks.length ?? 0) === 0 && (sources.replay?.bricks.length ?? 0) === 0
+    if (sources.readings !== this.readings) this.setFold(sources.readings)
+    this.setLive(sources.live)
+    this.setExact(sources.replay)
+    return this.materialize()
+  }
+
+  /** Whether the last {@link board} call had no feed behind it at all. */
+  private foldedOnly = true
+
+  /** Replace the fold layer: the only step that is O(session), and it runs at the fold's rate. */
+  private setFold(readings: readonly StepReading[] | undefined): void {
+    this.readings = readings
+    this.stats.foldRebuilds += 1
+    this.stats.foldSteps = readings?.length ?? 0
+    const seen = new Set<string>()
+    for (const reading of readings ?? []) {
+      const key = brickKey(reading.turn, reading.step)
+      seen.add(key)
+      const state = this.stepState(reading.turn, reading.step)
+      state.fold = {
+        brick: foldBrickOf(reading),
+        record: recordFromReading(reading),
+        title: reading.label,
+      }
+      this.touch(reading.turn, reading.ended)
+    }
+    for (const [key, state] of this.steps) {
+      if (seen.has(key) || state.fold === undefined) continue
+      state.fold = undefined
+      this.touch(state.turn, undefined)
+    }
+  }
+
+  /** Replace the collector's overlay. */
+  private setLive(feed: BrickFeed | undefined): void {
+    // The collector's feed is a value that changes when it changes: the same object means the same
+    // attempts, and re-applying six thousand of them on every pan is the O(source) work this world
+    // exists to avoid.
+    if (feed === this.liveFeed) return
+    this.liveFeed = feed
+    const entries = this.entriesOf(feed)
+    this.stats.livePatches += 1
+    const keys = new Set(entries.keys())
+    for (const key of this.liveKeys) {
+      if (keys.has(key)) continue
+      this.removeOverlay(key, 'live')
+    }
+    for (const [key, entry] of entries) this.putOverlay(key, 'live', entry)
+    this.liveKeys = keys
+    for (const turn of feed?.endedTurns ?? []) {
+      this.endedTurns.add(turn)
+      const state = this.byTurn.get(turn)
+      if (state !== undefined) state.ended = true
+    }
+    this.applyAux(feed, 'live')
+  }
+
+  /** Replace the replay overlay: the scene on screen, in and out. */
+  private setExact(feed: BrickFeed | undefined): void {
+    const entries = this.entriesOf(feed)
+    this.stats.exactPatches += 1
+    this.stats.exactSteps = entries.size
+    const keys = new Set(entries.keys())
+    for (const key of this.exactSteps) {
+      if (keys.has(key)) continue
+      this.releaseExact(key)
+    }
+    for (const [key, entry] of entries) this.putOverlay(key, 'exact', entry)
+    this.exactSteps = keys
+  }
+
+  /** The attempt-level entries of one feed, keyed `${turn}:${step}:${attempt}`. */
+  private entriesOf(feed: BrickFeed | undefined): Map<string, { stepKey: string; entry: OverlayEntry }> {
+    const found = new Map<string, { stepKey: string; entry: OverlayEntry }>()
+    if (feed === undefined) return found
+    const board = boardFromFeed(feed)
+    for (const column of board.columns) {
+      for (const brick of column.bricks) {
+        const record = board.records.get(brick.key)
+        if (record === undefined) continue
+        const key = attemptKey(brick.turn, brick.step, brick.attempt)
+        found.set(key, {
+          stepKey: brickKey(brick.turn, brick.step),
+          entry: { brick, record, title: board.titles.get(brick.key) ?? brick.label },
+        })
+      }
+    }
+    return found
+  }
+
+  private putOverlay(key: string, layer: 'live' | 'exact', found: { stepKey: string; entry: OverlayEntry }): void {
+    const state = this.stepState(found.entry.brick.turn, found.entry.brick.step)
+    const map = layer === 'live' ? (state.live ??= new Map()) : (state.exact ??= new Map())
+    map.set(found.entry.brick.attempt, found.entry)
+    this.touch(state.turn, undefined)
+    void key
+  }
+
+  /** One layer drops an attempt: the step falls back to whatever is left under it. */
+  private removeOverlay(attemptKeyValue: string, layer: 'live' | 'exact'): void {
+    const [turn, step, attempt] = attemptKeyValue.split(':').map(Number)
+    if (turn === undefined || step === undefined || attempt === undefined) return
+    const state = this.steps.get(brickKey(turn, step))
+    if (state === undefined) return
+    const map = layer === 'live' ? state.live : state.exact
+    if (map === undefined) return
+    map.delete(attempt)
+    if (map.size === 0) {
+      if (layer === 'live') state.live = undefined
+      else state.exact = undefined
+    }
+    this.touch(turn, undefined)
+  }
+
+  /** The scene moved on: this step is no longer exactly known. */
+  private releaseExact(stepKeyValue: string): void {
+    const state = this.steps.get(stepKeyValue)
+    if (state === undefined) return
+    state.exact = undefined
+    this.touch(state.turn, undefined)
+  }
+
+  /** The lane: auxiliary calls belong to no Turn, so the strongest feed's list wins. */
+  private applyAux(feed: BrickFeed | undefined, layer: 'live' | 'exact'): void {
+    if (feed === undefined) return
+    const board = boardFromFeed(feed)
+    if (board.aux.length === 0) return
+    if (layer === 'live') {
+      // The collector saw this process; its lane is the current one, so it replaces the replay's.
+      this.aux = []
+      this.auxRecords.clear()
+      this.auxTitles.clear()
+    }
+    for (const brick of board.aux) {
+      const record = board.records.get(brick.key)
+      if (record === undefined) continue
+      if (!this.aux.some((existing) => existing.key === brick.key)) this.aux.push(brick)
+      this.auxRecords.set(brick.key, record)
+      this.auxTitles.set(brick.key, board.titles.get(brick.key) ?? brick.label)
+    }
+  }
+
+  private stepState(turn: number, step: number): StepState {
+    const key = brickKey(turn, step)
+    const found = this.steps.get(key)
+    if (found !== undefined) return found
+    const created: StepState = { turn, step }
+    this.steps.set(key, created)
+    this.ensureTurn(turn)
+    return created
+  }
+
+  private ensureTurn(turn: number): TurnState {
+    const found = this.byTurn.get(turn)
+    if (found !== undefined) return found
+    const created: TurnState = { turn, ended: false, bricks: [], dirty: true }
+    this.byTurn.set(turn, created)
+    // Ascending order, maintained on insert: the board needs Turns oldest first, and a session
+    // appends far more often than it inserts in the middle.
+    let low = 0
+    let high = this.turns.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (this.turns[mid]! < turn) low = mid + 1
+      else high = mid
+    }
+    this.turns.splice(low, 0, turn)
+    return created
+  }
+
+  /** Note that one Turn's content changed (and optionally its ended flag). */
+  private touch(turn: number, ended: boolean | undefined): void {
+    const state = this.ensureTurn(turn)
+    state.dirty = true
+    if (ended === true) state.ended = true
+    else if (ended === false) state.ended = false
+  }
+
+  /**
+   * The effective bricks of one step: the overlays if any of them has it, the fold otherwise.
+   *
+   * This is the whole merge rule, in one place, and it is why a patch costs the step rather than
+   * the session.
+   */
+  private bricksOf(state: StepState): Brick[] {
+    const exact = state.exact
+    const live = state.live
+    if ((exact === undefined || exact.size === 0) && (live === undefined || live.size === 0)) {
+      return state.fold === undefined ? [] : [state.fold.brick]
+    }
+    // Attempt-level bricks, the stronger source last so it overwrites the other's attempts.
+    const merged = new Map<number, Brick>()
+    for (const [attempt, entry] of exact ?? []) merged.set(attempt, entry.brick)
+    for (const [attempt, entry] of live ?? []) merged.set(attempt, entry.brick)
+    const bricks = [...merged.values()]
+    bricks.sort(byStepThenAttempt)
+    return bricks
+  }
+
+  /** The record and title behind one effective brick. */
+  private detailOf(brick: Brick): { record: BrickRecord | undefined; title: string | undefined } {
+    const state = this.steps.get(brickKey(brick.turn, brick.step))
+    const entry = state?.live?.get(brick.attempt) ?? state?.exact?.get(brick.attempt)
+    if (entry !== undefined) return { record: entry.record, title: entry.title }
+    return { record: state?.fold?.record, title: state?.fold?.title }
+  }
+
+  /** Build the board for this moment, rebuilding only the Turns that changed. */
+  private materialize(): BoardData {
+    this.stats.boards += 1
+    this.records.clear()
+    this.titles.clear()
+    for (const key of this.auxRecords.keys()) {
+      this.records.set(key, this.auxRecords.get(key)!)
+      this.titles.set(key, this.auxTitles.get(key) ?? key)
+    }
+    for (const turn of this.turns) {
+      const state = this.byTurn.get(turn)!
+      if (!state.dirty) {
+        for (const brick of state.bricks) {
+          const detail = this.detailOf(brick)
+          if (detail.record !== undefined) this.records.set(brick.key, detail.record)
+          if (detail.title !== undefined) this.titles.set(brick.key, detail.title)
+        }
+        continue
+      }
+      state.dirty = false
+      this.stats.columnsRebuilt += 1
+      const found: Brick[] = []
+      for (const step of this.stepsOf(turn)) {
+        for (const brick of this.bricksOf(step)) found.push(brick)
+      }
+      found.sort(byStepThenAttempt)
+      state.bricks = found
+      for (const brick of found) {
+        const detail = this.detailOf(brick)
+        if (detail.record !== undefined) this.records.set(brick.key, detail.record)
+        if (detail.title !== undefined) this.titles.set(brick.key, detail.title)
+      }
+    }
+    const columns: BoardColumn[] = []
+    let tallest = 0
+    for (const turn of this.turns) {
+      const state = this.byTurn.get(turn)!
+      if (state.bricks.length > tallest) tallest = state.bricks.length
+      columns.push({ turn: state.turn, ended: state.ended || this.endedTurns.has(state.turn), bricks: state.bricks })
+    }
+    this.columns = columns
+    const world = this
+    return {
+      columns,
+      titles: this.titles,
+      records: this.records,
+      // Every brick on the board, newest last: only the panel asks for it (to name "the brick
+      // before this one"), and building it for every pan would be a session-sized list per frame.
+      get order(): readonly string[] {
+        return world.orderOf()
+      },
+      ...(this.foldedOnly ? { estimated: true as const } : {}),
+      aux: this.aux,
+      // The tallest column is known here without a rescan, and a board with ten thousand Turns
+      // should not be rescanned because a pan replaced fifty of them (see `setColumns`).
+      tallest,
+    }
+  }
+
+  private columns: BoardColumn[] = []
+  /** Every brick on the board, newest last: built only when a caller asks (the panel does). */
+  private orderOf(): readonly string[] {
+    this.stats.orderBuilds += 1
+    const order: string[] = []
+    for (const column of this.columns) for (const brick of column.bricks) order.push(brick.key)
+    for (const brick of this.aux) order.push(brick.key)
+    return order
+  }
+
+  /** The steps of one Turn, in step order. */
+  private stepsOf(turn: number): StepState[] {
+    const found: StepState[] = []
+    for (const state of this.steps.values()) if (state.turn === turn) found.push(state)
+    found.sort((left, right) => left.step - right.step)
+    return found
+  }
+}
+
 /**
  * Build one board out of everything available.
  *
- * Merging is **per attempt**, not per step: a step whose first attempt happened before the
- * collector started and whose second it watched must still come out as two bricks, because that
- * pair is the case this plugin exists for. So the live feed wins on the attempts it has, a
- * replay fills the attempts it does not, and the fold supplies steps neither covers — one
- * step-level brick per step, dropped as soon as any attempt-level brick covers that step, since
- * keeping both would count the same request twice.
+ * The merge rules live in {@link BoardWorld} (per attempt, `live` > `exact` > `fold`, see there);
+ * this is the one-shot form of it, for a caller that has no world to keep — the panel tests, and
+ * anything that merges a single snapshot.
  *
  * @param sources - live feed, replayed feed and folded readings, any of them optional.
  * @returns the merged board. The board-level `estimated` flag is set only for a board that is
  *   *entirely* folded, where the claim is true of every brick.
  */
 export function boardFromSources(sources: BoardSources): BoardData {
-  const live = sources.live?.bricks ?? []
-  const replay = sources.replay?.bricks ?? []
-  const readings = sources.readings ?? []
-  if (live.length === 0 && replay.length === 0) return boardFromReadings(readings)
-
-  const liveBoard = live.length === 0 ? undefined : boardFromFeed(sources.live!)
-  const replayBoard = replay.length === 0 ? undefined : boardFromFeed(sources.replay!)
-
-  // Attempt-level bricks, live last so it overwrites a replay of the same attempt.
-  const bricks = new Map<string, { brick: Brick; record: BrickRecord; title: string; turn: number; step: number; attempt: number }>()
-  const coveredSteps = new Set<string>()
-  const columns = new Map<number, { turn: number; ended: boolean; bricks: Brick[] }>()
-  const titles = new Map<string, string>()
-  const records = new Map<string, BrickRecord>()
-  const aux: Brick[] = []
-  const endedTurns = new Set<number>()
-
-  const addBoard = (board: BoardData, feed: BrickFeed | undefined): void => {
-    for (const turn of feed?.endedTurns ?? []) endedTurns.add(turn)
-    for (const column of board.columns) {
-      const entry = columns.get(column.turn) ?? { turn: column.turn, ended: false, bricks: [] }
-      // Either source reporting a Turn ended is enough: the log knows the past, the collector
-      // the present, and one that died mid-Turn never saw the end its log recorded.
-      entry.ended = entry.ended || column.ended
-      columns.set(column.turn, entry)
-      for (const brick of column.bricks) {
-        const record = board.records.get(brick.key)
-        if (record === undefined) continue
-        bricks.set(attemptKey(brick.turn, brick.step, brick.attempt), {
-          brick,
-          record,
-          title: board.titles.get(brick.key) ?? brick.label,
-          turn: brick.turn,
-          step: brick.step,
-          attempt: brick.attempt,
-        })
-        coveredSteps.add(brickKey(brick.turn, brick.step))
-      }
-    }
-    for (const brick of board.aux) {
-      const record = board.records.get(brick.key)
-      if (record === undefined) continue
-      aux.push(brick)
-      records.set(brick.key, record)
-      titles.set(brick.key, board.titles.get(brick.key) ?? brick.label)
-    }
-  }
-
-  // Weakest first, so a stronger source overwrites it: replay, then live.
-  if (replayBoard !== undefined) addBoard(replayBoard, sources.replay)
-  if (liveBoard !== undefined) addBoard(liveBoard, sources.live)
-
-  for (const entry of bricks.values()) {
-    const column = columns.get(entry.turn)!
-    column.bricks.push(entry.brick)
-    records.set(entry.brick.key, entry.record)
-    titles.set(entry.brick.key, entry.title)
-  }
-
-  // The fold fills what no attempt-level brick covers, and only that.
-  const restored = readings.filter((reading) => !coveredSteps.has(brickKey(reading.turn, reading.step)))
-  if (restored.length > 0) {
-    const folded = boardFromReadings(restored)
-    for (const column of folded.columns) {
-      const entry = columns.get(column.turn) ?? { turn: column.turn, ended: false, bricks: [] }
-      entry.ended = entry.ended || column.ended
-      columns.set(column.turn, entry)
-      for (const brick of column.bricks) {
-        const record = folded.records.get(brick.key)
-        if (record === undefined) continue
-        entry.bricks.push(brick)
-        records.set(brick.key, record)
-        titles.set(brick.key, folded.titles.get(brick.key) ?? brick.label)
-      }
-    }
-  }
-
-  const ordered = [...columns.values()].sort((left, right) => left.turn - right.turn)
-  for (const column of ordered) column.bricks.sort(byStepThenAttempt)
-  return {
-    columns: ordered,
-    titles,
-    records,
-    order: [...ordered.flatMap((column) => column.bricks.map((brick) => brick.key)), ...aux.map((brick) => brick.key)],
-    aux,
-  }
+  return new BoardWorld().board(sources)
 }
 
 /** Board order inside a column: by step, then by attempt so a retry sits after the attempt it replaced. */

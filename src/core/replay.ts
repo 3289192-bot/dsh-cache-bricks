@@ -28,10 +28,12 @@
  * activity type and the navigation target — is reconstructed exactly, from the same alphabet
  * the live path reads.
  *
- * Pure: no IO, no timers, no DSH imports, so both halves can run it.
+ * Pure: no IO, no timers, no DSH imports, so both halves can run it. The one piece of module
+ * state is a count of the raw payloads the replays have hashed ({@link replayBlobPuts}), which
+ * observes the work without taking part in it: two replays of one log still produce one feed.
  */
 import type { BrickFeed, BrickRecord } from '../shared/brick'
-import { BlobStore } from './blob-store'
+import { BlobStore, type BlobStoreStats, type StoredBlob } from './blob-store'
 import { BrickLedger, type ChunkObservation, type Observation } from './brick-ledger'
 import {
   contextObservation,
@@ -85,6 +87,137 @@ export interface ReplayOptions {
    * sees; it is left optional for a caller replaying something unbounded on purpose.
    */
   readonly maxBricks?: number
+  /**
+   * The caller guarantees `events` is already in ascending `seq` order.
+   *
+   * A scene replay is handed a slice of the durable window, and the slice sorts itself once
+   * while it is being cut (`history-scene.ts`) — so the copy-and-sort below would re-order a
+   * window-sized array to arrive at the order it was already given. With this flag the replay
+   * walks the array as given: no copy, no sort, no throwaway array as big as the window.
+   *
+   * The guarantee is not verified, and it is the whole contract: an unsorted array is read in
+   * the order it is in, so bricks come out in event order and a timing face measured from a
+   * `step/start` that has not been read yet falls back to the settlement's own time. A caller
+   * that cannot promise the order leaves the flag out and keeps the sort.
+   */
+  readonly ordered?: boolean
+  /**
+   * Whether the raw payloads a replay passes are stored and hashed, or left where they are.
+   *
+   * `eager` (the default) is what the collector's own observations want: every payload is
+   * canonicalized and SHA-256'd into the store, which is how a brick's raw view is served.
+   *
+   * `lazy` is what a *replay of history* wants. Nobody asked for those payloads — the reader asked
+   * for a board — and hashing them costs a canonical pass plus a digest per settled attempt, per
+   * tool result and per header, on the same thread that is drawing. The payloads are not lost: they
+   * are the session's own events, which the client is holding, so a reader who opens a brick's raw
+   * view can be handed the bytes from the log at that moment (`navigation.ts` reads them by seq).
+   * A lazy replay therefore makes **no** `put` calls at all, which is what
+   * {@link replayBlobPutsSkipped} counts.
+   */
+  readonly raw?: 'eager' | 'lazy'
+}
+
+/**
+ * Raw payloads the replays have hashed since this module loaded.
+ *
+ * A replayed payload is canonicalized and SHA-256'd whether or not the store already holds it,
+ * so a replay that adds nothing still pays for every raw payload in its window — each settled
+ * attempt's stream, every tool result, the request header (the `put` calls in `./observe`).
+ * The store's own `hits`/`misses` count lookups, not the hashing that precedes them, so they
+ * cannot answer "what did this replay actually cost?"; this counter can. It is observation
+ * only: nothing about what is stored, when, or under which key changes because of it.
+ */
+let blobPuts = 0
+let blobPutsSkipped = 0
+
+/**
+ * How many raw payloads the replays have hashed since this module loaded.
+ *
+ * Monotonic and module-wide, so a reader takes the difference across a replay instead of
+ * expecting a per-replay reset. The replay's counterpart of the live collector's
+ * `store.stats()`: what a replay pays even when every blob is already stored.
+ */
+export function replayBlobPuts(): number {
+  return blobPuts
+}
+
+/**
+ * How many raw payloads lazy replays left unhashed since this module loaded.
+ *
+ * The mirror image of {@link replayBlobPuts}: with `raw: 'lazy'` nothing is canonicalized, so this
+ * is the number of `put` calls that would have happened and did not. A reader takes the difference
+ * across a replay, and a scene replay that reports a growing number here and zero there is the
+ * whole claim of the lazy path.
+ */
+export function replayBlobPutsSkipped(): number {
+  return blobPutsSkipped
+}
+
+/**
+ * A store that stores nothing, for a replay whose raw payloads are already somewhere else.
+ *
+ * Every `put` answers `undefined`, so the observers in `./observe` attach no refs and no payload is
+ * canonicalized or hashed. `get`/`has` answer "not here" rather than lying, and `stats` reports an
+ * empty store — which is exactly what this replay's store is.
+ */
+class LazyStore extends BlobStore {
+  override put(): undefined {
+    blobPutsSkipped += 1
+    return undefined
+  }
+
+  override get(): undefined {
+    return undefined
+  }
+
+  override has(): boolean {
+    return false
+  }
+
+  override stats(): BlobStoreStats {
+    return { blobs: 0, bytes: 0, hits: 0, misses: 0, skipped: 0, evicted: 0 }
+  }
+}
+
+/**
+ * A store handle that counts the `put` calls the replay makes through it, and is otherwise the
+ * store it wraps.
+ *
+ * The puts being counted are the observers' — `settlementObservation` and its neighbours hash
+ * every raw payload they are handed — so the count has to sit on the handle the replay passes
+ * them. A counter inside `BlobStore` could not do this job: the scene replay shares that store
+ * with the live collector, and the collector's captures are not replay work. Every other path
+ * delegates unchanged, so dedupe, eviction and `stats()` read exactly as they did.
+ */
+class ReplayStore extends BlobStore {
+  private readonly inner: BlobStore
+
+  constructor(inner: BlobStore) {
+    super()
+    this.inner = inner
+  }
+
+  override put(value: unknown): StoredBlob | undefined {
+    blobPuts += 1
+    return this.inner.put(value)
+  }
+
+  override get(hash: string): unknown {
+    return this.inner.get(hash)
+  }
+
+  override has(hash: string): boolean {
+    return this.inner.has(hash)
+  }
+
+  override stats(): BlobStoreStats {
+    return this.inner.stats()
+  }
+
+  override clear(): void {
+    this.inner.clear()
+  }
 }
 
 /** `${turn}:${step}`, the key a step's start time is remembered under. */
@@ -97,6 +230,25 @@ function membersOf(record: Record<string, unknown>): string[] {
   const list = record.type === 'tool-call-chunks' ? record.args : record.texts
   if (!Array.isArray(list)) return []
   return list.filter((entry): entry is string => typeof entry === 'string')
+}
+
+/**
+ * The length of a compact run's members, without ever joining them.
+ *
+ * The direct spelling is `members.join('').length`, and it is the wrong one here: a settled
+ * stream carries every delta as its own member, so joining builds a second copy of the whole run
+ * — for a long answer, the very megabyte the store is about to hash a second time — only to read
+ * its length and drop it. Summing the members' own lengths is the same number, because both
+ * count UTF-16 code units (a surrogate pair is two of them either way), and allocates nothing
+ * per member.
+ *
+ * @param members - the run's delta members, as {@link membersOf} filtered them.
+ * @returns the length the joined run would have had.
+ */
+function charsOf(members: readonly string[]): number {
+  let chars = 0
+  for (const member of members) chars += member.length
+  return chars
 }
 
 /**
@@ -152,14 +304,14 @@ export function compactChunks(stream: readonly unknown[]): Array<{ at: number; c
           type: 'tool-call',
           callId,
           ...(typeof record.name === 'string' ? { name: record.name } : {}),
-          argsChars: members.join('').length,
+          argsChars: charsOf(members),
         },
       })
       continue
     }
     observations.push({
       at,
-      chunk: { type: type === 'text-chunks' ? 'text' : 'reasoning', chars: members.join('').length },
+      chunk: { type: type === 'text-chunks' ? 'text' : 'reasoning', chars: charsOf(members) },
     })
   }
   return observations
@@ -180,8 +332,8 @@ export function compactChunks(stream: readonly unknown[]): Array<{ at: number; c
  *    (kept by reference) and the settlement `seq` the brick navigates by.
  *
  * @param sessionId - the session being replayed.
- * @param events - the durable events, in any order (they are sorted by `seq`).
- * @param options - store and brick cap.
+ * @param events - the durable events; sorted by `seq` here unless `ordered` says they already are.
+ * @param options - store, brick cap, and whether the events are already in `seq` order.
  * @returns the replayed feed plus what the replay could not read.
  */
 export function replaySession(
@@ -189,7 +341,7 @@ export function replaySession(
   events: readonly ReplayEvent[],
   options: ReplayOptions = {},
 ): ReplayReport {
-  const store = options.store ?? new BlobStore()
+  const store = options.raw === 'lazy' ? new LazyStore() : new ReplayStore(options.store ?? new BlobStore())
   const ledger = new BrickLedger(sessionId, {
     store,
     observedBy: 'replay',
@@ -210,7 +362,13 @@ export function replaySession(
     return undefined
   }
 
-  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+  // The order a step's observations are folded in is the whole reading, so the events have to
+  // arrive in `seq` order. A caller that promises they already do (`ordered`) is walked as
+  // given; everyone else gets a copy sorted here, because sorting the array a caller lent us
+  // would be a side effect of a read — and `sort` on a copy is the only reason the copy exists.
+  const ordered = options.ordered === true ? events : [...events].sort((left, right) => left.seq - right.seq)
+
+  for (const event of ordered) {
     const data = event.data ?? {}
     switch (event.type) {
       case 'request/header':

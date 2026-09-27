@@ -218,7 +218,10 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
         valueText: element.getAttribute('aria-valuetext'),
       }
     }
-    const slabs = [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')].map((element) => {
+    // The ring is painted, not shown: it lives just outside the grid so a fractional pan never
+    // exposes an edge, and the face clips it. Every "what the reader sees" assertion reads the
+    // un-ringed set; the ring is counted separately, and checked on its own.
+    const slabs = [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]:not([data-cache-bricks-ring])')].map((element) => {
       const box = element.getBoundingClientRect()
       const style = element.style
       // The reading is a text node of its own (the lifecycle mark is a child span), so its
@@ -249,9 +252,22 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
       const element = document.querySelector(`[data-cache-bricks-fade="${edge}"]`)
       return element === null ? undefined : getComputedStyle(element).display !== 'none'
     }
+    const plane = document.querySelector('[data-cache-bricks-plane="cache"]')
+    const transformOf = (element) => {
+      if (element === null) return ''
+      const value = getComputedStyle(element).transform
+      return value === 'none' ? '' : value
+    }
     return {
       host: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       rails: { x: rail('x'), y: rail('y') },
+      // The motion plane: the one element a pan moves, and its offset in pixels.
+      plane: (() => {
+        if (plane === null) return undefined
+        const matrix = new DOMMatrixReadOnly(transformOf(plane) === '' ? undefined : transformOf(plane))
+        return { transform: transformOf(plane), x: Math.round(matrix.m41 * 100) / 100, y: Math.round(matrix.m42 * 100) / 100 }
+      })(),
+      ring: document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-ring]').length,
       slabs,
       // Turn 0 is the auxiliary lane, which is not a Turn: only real columns count here.
       turns: [...new Set(slabs
@@ -600,13 +616,13 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
   await board.locator('[data-cache-bricks-flip]').click()
   await page.waitForTimeout(500)
   const flipped = await page.evaluate(() => {
-    const type = [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="type"]')]
+    const type = [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="type"]:not([data-cache-bricks-ring])')]
     return { count: type.length, keys: type.map((element) => element.dataset.cacheBricksBrick).sort() }
   })
   const cacheKeys = beforeFlip.slabs.map((slab) => slab.key).sort()
   check('the back face mirrors exactly the window that is panned',
     flipped.count === cacheKeys.length && flipped.keys.join(',') === cacheKeys.join(','),
-    `${String(flipped.count)} vs ${String(cacheKeys.length)}`)
+    `${String(flipped.count)} vs ${String(cacheKeys.length)} · only-type ${flipped.keys.filter((key) => !cacheKeys.includes(key)).join(',')} · only-cache ${cacheKeys.filter((key) => !flipped.keys.includes(key)).join(',')}`)
 
   // The keys the page and the last measurement agree on, so a later failure names the state.
   void held
@@ -811,6 +827,14 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
     (await page.evaluate(() => window.__page.loads)) === 1
     && pagedTypes.some((brick) => brick.turn === 5) && pagedTypes.some((brick) => brick.turn === 6),
     `loads ${await page.evaluate(() => window.__page.loads)} · turns ${[...new Set(pagedTypes.map((brick) => brick.turn))].join(',')}`)
+  // A page landing is growth: the window gains events at the older end and nothing already indexed
+  // changes meaning. The index has to be extended by the page, not rebuilt from the whole window —
+  // this is the check that would have caught 0.1.4.b re-scanning every loaded event per page.
+  const indexAfterPage = await page.evaluate(() => window.__dshCacheBricksStats?.()?.scene)
+  check('a page landing indexes the page, not the window',
+    indexAfterPage !== undefined && (indexAfterPage.windowDeltas ?? 0) >= 1
+    && (indexAfterPage.indexDeltaEvents ?? 0) < 200,
+    JSON.stringify({ deltas: indexAfterPage?.windowDeltas, deltaEvents: indexAfterPage?.indexDeltaEvents, full: indexAfterPage?.windows }))
   check('the paged Turns are typed from the log, not estimated by the fold',
     pagedTypes.filter((brick) => brick.turn === 5).length === 2
     && pagedTypes.filter((brick) => brick.turn === 5).every((brick) => brick.label.includes(REPLAYED)),
@@ -935,8 +959,9 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
   })
   await page.waitForTimeout(500)
   const huge = await page.evaluate(() => ({
-    slabs: document.querySelectorAll('[data-cache-bricks-brick]').length,
-    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')]
+    slabs: document.querySelectorAll('[data-cache-bricks-brick]:not([data-cache-bricks-ring])').length,
+    ring: document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-ring]').length,
+    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]:not([data-cache-bricks-ring])')]
       .map((element) => Number(element.dataset.cacheBricksBrick.split(':')[1])).filter((turn) => turn > 0))].length,
   }))
   // Six thousand bricks of history; the board may only hold the cells it can show.
@@ -949,8 +974,8 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
   await page.keyboard.press('Home')
   await page.waitForTimeout(700)
   const atTheStart = await page.evaluate(() => ({
-    slabs: document.querySelectorAll('[data-cache-bricks-brick]').length,
-    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]')]
+    slabs: document.querySelectorAll('[data-cache-bricks-brick]:not([data-cache-bricks-ring])').length,
+    turns: [...new Set([...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-face="cache"]:not([data-cache-bricks-ring])')]
       .map((element) => Number(element.dataset.cacheBricksBrick.split(':')[1])).filter((turn) => turn > 0))].sort((a, b) => a - b),
   }))
   check('the oldest Turn of two thousand costs the same paint as the newest',
@@ -958,6 +983,798 @@ body{margin:0;background:#151517;color:#e5e7eb;font-family:system-ui;--dsw-alias
     JSON.stringify([atTheStart.turns[0], atTheStart.turns.length, atTheStart.slabs]))
   await backToLive()
   await shot('08-scene-and-scale')
+
+  // ── a drag costs the scene it lands on, not the session it crosses ──────────────────
+  //
+  // 0.1.4 draws a window and pans by arithmetic, so a drag *looks* like pure geometry. It was not:
+  // every painted frame of a drag cut a new scene, and answering that scene — replaying the log
+  // slice, then re-rendering the board from it — happened inside the frame that asked. The unit
+  // tests could not see it (they pin the shape of the window) and neither could this script (no
+  // counter in the DOM says how often the board asked for a scene). What is pinned here is the
+  // timing: a drag asks for **nothing** while the pointer is down and **once** when it comes up,
+  // and the thing it asks for is a slice of the log rather than the log.
+  //
+  // The counters come from `window.__dshCacheBricksStats` (see `docs/verification.md`). A build
+  // that does not publish them fails the first check rather than passing silently.
+  await page.evaluate(() => {
+    const page = window.__page
+    // A frozen world: two thousand Turns of durable history (ten events each), the same Turns in
+    // the fold, and no page left to land — a landing window clears every scene, and this check is
+    // about the cost of a drag rather than of history arriving.
+    page.entries.length = 0
+    page.seq = 3
+    page.front = 0
+    page.pending.length = 0
+    page.hasMore = false
+    for (let turn = 1; turn <= 2_000; turn += 1) page.addTurn(turn)
+    page.fold = Array.from({ length: 2_000 }, (_, index) => index + 1)
+    page.revision += 1
+    for (const listener of page.listeners) listener()
+  })
+  await page.evaluate(() => {
+    const fixture = window.__fixture
+    const jsx = window.__testExternals['react/jsx-runtime'].jsx
+    const perf = { renders: 0, frames: [], sampling: false, longtasks: 0, longtasksSupported: false }
+    window.__perf = perf
+    // A render of the board is the one thing the DOM cannot show. `useChat` is called during every
+    // render of the plugin's component, so counting its calls counts the renders — which is what
+    // makes this check readable against a build with no counters at all.
+    // The real hook is zustand's `useStore(selector)`, which memoizes the selection: the same store
+    // snapshot hands back the *same* array. The fixture used to build a fresh `nodes` array on every
+    // call, which made the data layer believe the fold had changed on every render — an artifact
+    // that hid the very difference these checks measure. Cache it on the fold's own shape.
+    let nodesCache
+    let nodesKey
+    const nodesOf = () => {
+      const fold = window.__page.fold
+      const key = `${String(fold.length)}:${String(fold[0] ?? '')}:${String(fold[fold.length - 1] ?? '')}`
+      if (nodesKey !== key) {
+        nodesKey = key
+        nodesCache = window.__page.nodes()
+      }
+      return nodesCache
+    }
+    // ...and `useSyncExternalStoreWithSelector` memoizes the *selection* too: the same snapshot
+    // yields the same selected value, so a render that changed nothing hands the component the very
+    // array it had. Without this the fixture rebuilt the fold on every render, which is exactly the
+    // cost the world is meant to keep off the pan path.
+    let selectionCache
+    let selectionKey
+    fixture.renderFold = () => {
+      const useChat = (selector) => {
+        perf.renders += 1
+        const nodes = nodesOf()
+        if (selectionKey !== nodes) {
+          selectionKey = nodes
+          selectionCache = selector({ nodes })
+        }
+        return selectionCache
+      }
+      fixture.root.render(jsx(fixture.Component, { sessionId: 'S', useChat }))
+    }
+    perf.longtasksSupported = Array.isArray(PerformanceObserver.supportedEntryTypes)
+      && PerformanceObserver.supportedEntryTypes.includes('longtask')
+    if (perf.longtasksSupported) {
+      new PerformanceObserver((list) => { perf.longtasks += list.getEntries().length })
+        .observe({ entryTypes: ['longtask'] })
+    }
+  })
+  await page.evaluate(() => window.__fixture.renderFold())
+  await page.waitForTimeout(700)
+
+  const readStats = () => page.evaluate(() => {
+    const stats = window.__dshCacheBricksStats?.()
+    return {
+      published: stats !== undefined,
+      board: stats?.board ?? { demands: 0, deferred: 0, flushed: 0 },
+      scene: stats?.scene ?? { windows: 0, demands: 0, cached: 0, replays: 0, sliceEvents: 0, replayMs: 0 },
+      window: stats?.window ?? { asked: 0, materialized: 0 },
+      raw: stats?.raw ?? { hashes: 0, skipped: 0 },
+      renders: window.__perf.renders,
+      longtasks: window.__perf.longtasks,
+      longtasksSupported: window.__perf.longtasksSupported,
+      windowEvents: window.__page.entries.length,
+    }
+  })
+  const startFrames = () => page.evaluate(() => {
+    window.__perf.frames = []
+    window.__perf.sampling = true
+    const tick = (time) => {
+      if (!window.__perf.sampling) return
+      window.__perf.frames.push(time)
+      requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+  const stopFrames = () => page.evaluate(() => {
+    window.__perf.sampling = false
+    const frames = window.__perf.frames
+    let maxGap = 0
+    for (let index = 1; index < frames.length; index += 1) {
+      maxGap = Math.max(maxGap, frames[index] - frames[index - 1])
+    }
+    return { count: frames.length, maxGap: Math.round(maxGap) }
+  })
+
+  // A render that does not move the window must not copy it. `renderFold` re-renders the tree from
+  // the top, which is what a panel opening or a tab switching does to this component; the window
+  // is twenty thousand events, and walking and sorting it per render is exactly the cost the
+  // revision counter in `windowKeyOfSnapshot` exists to avoid.
+  const beforeNoop = await readStats()
+  await page.evaluate(() => window.__fixture.renderFold())
+  // A React root render is scheduled, not synchronous: give the commit a frame before reading.
+  await page.waitForTimeout(100)
+  const afterNoop = await readStats()
+  check('a render that does not move the window does not copy it',
+    afterNoop.window.asked > beforeNoop.window.asked
+    && afterNoop.window.materialized === beforeNoop.window.materialized,
+    `asked ${beforeNoop.window.asked}→${afterNoop.window.asked}, copied ${beforeNoop.window.materialized}→${afterNoop.window.materialized}`)
+
+  // The drag itself: press exactly on the thumb (a press on the track pages first), drag half the
+  // rail's travel in 120 moves, and read the counters **while the pointer is still down**.
+  const trackBox = await page.locator('[data-cache-bricks-rail="x"]').boundingBox()
+  const thumbBox = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+  const beforeDrag = await readStats()
+  const boardBefore = await readBoard()
+  await startFrames()
+  const centre = { x: thumbBox.x + thumbBox.width / 2, y: thumbBox.y + thumbBox.height / 2 }
+  await page.mouse.move(centre.x, centre.y)
+  await page.mouse.down()
+  await page.mouse.move(centre.x - (trackBox.width - thumbBox.width) / 2, centre.y, { steps: 120 })
+  const duringDrag = await readStats()
+  await page.mouse.up()
+  const frames = await stopFrames()
+  await page.waitForTimeout(500)
+  const afterDrag = await readStats()
+  const boardAfter = await readBoard()
+
+  check('the drag really panned (the check is not measuring a still board)',
+    boardAfter.turns.join(',') !== boardBefore.turns.join(','),
+    `${boardBefore.turns.join(',')} → ${boardAfter.turns.join(',')}`)
+  check('the board publishes what a pan cost',
+    duringDrag.published && afterDrag.published,
+    JSON.stringify(duringDrag.board))
+  check('a drag asks the data layer for nothing while the pointer is down',
+    duringDrag.published
+    && duringDrag.board.demands === beforeDrag.board.demands
+    && duringDrag.scene.demands === beforeDrag.scene.demands,
+    `board ${beforeDrag.board.demands}→${duringDrag.board.demands}, scene ${beforeDrag.scene.demands}→${duringDrag.scene.demands}`)
+  check('a drag re-renders the board zero times while the pointer is down',
+    duringDrag.renders === beforeDrag.renders,
+    `renders ${beforeDrag.renders}→${duringDrag.renders}`)
+  check('the scenes the drag crossed were deferred, not dropped',
+    duringDrag.board.deferred > beforeDrag.board.deferred + 1,
+    `deferred ${beforeDrag.board.deferred}→${duringDrag.board.deferred}`)
+  // On release the deferred demand goes out — exactly one, and exactly one replay behind it. The
+  // board may ask once more immediately after, because materializing a scene changes the bricks the
+  // board is drawing and a scene plan is made of bricks: the re-cut converges on the first retry.
+  // What must not survive is the old shape of the cost — an ask per painted frame, for as long as
+  // the reader keeps moving.
+  const released = afterDrag.board.demands - duringDrag.board.demands
+  // Scenes are assembled out of steps now, so the *step* replays are not the unit this check is
+  // about: what must not happen is a second scene cut after the hand let go (`assembled` counts
+  // those). The step count rides along in the detail.
+  const replayedAfter = afterDrag.scene.assembled - duringDrag.scene.assembled
+  const stepsAfter = afterDrag.scene.replays - duringDrag.scene.replays
+  check('the scene the drag landed on is materialized once, on release',
+    afterDrag.board.flushed - duringDrag.board.flushed === 1
+    && released >= 1 && released <= 2
+    && replayedAfter <= 2,
+    `demands ${duringDrag.board.demands}→${afterDrag.board.demands}, flushed ${duringDrag.board.flushed}→${afterDrag.board.flushed}, scenes cut ${String(replayedAfter)}, steps replayed ${String(stepsAfter)}`)
+  // The replay it triggers is handed the slice the window shows, not the window: a scene is a few
+  // screens, so a twenty-thousand-event session must not be replayed whole.
+  const sliced = afterDrag.scene.sliceEvents - beforeDrag.scene.sliceEvents
+  // The other half of a replay's cost: it is *lazy* about raw payloads. Every scene cut in this
+  // drag would have canonicalized and SHA-256'd each settled attempt's stream, each tool result and
+  // each header into the blob store — work nobody asked for while a board is being drawn. The
+  // payloads are not lost: they are the session's own events, read by seq when a reader opens one
+  // (`logRawPayload`). This is the check that keeps "raw hashes: 0" honest.
+  const hashes = afterDrag.raw.hashes - beforeDrag.raw.hashes
+  const skipped = afterDrag.raw.skipped - beforeDrag.raw.skipped
+  console.log(`  · raw payloads: hashed ${String(hashes)}, unhashed ${String(skipped)}`)
+  check('a scene replay hashes no raw payloads, and skips the hashing it would have done',
+    hashes === 0 && skipped > 0,
+    `hashes +${String(hashes)}, unhashed +${String(skipped)}`)
+
+  check('the scene replay is handed a slice of the log, not the log',
+    afterDrag.scene.replays > beforeDrag.scene.replays && sliced <= afterDrag.windowEvents / 8,
+    `${sliced} of ${afterDrag.windowEvents} events, in ${Math.round(afterDrag.scene.replayMs - beforeDrag.scene.replayMs)} ms`)
+  // A guard rail, not a benchmark: the frame budget of a headless machine is not a fact about the
+  // board, but a drag that stalls the input thread for a quarter of a second is one.
+  check('the drag painted frames instead of stalling the input thread',
+    frames.count >= 5 && frames.maxGap <= 250,
+    JSON.stringify({ ...frames, longtasks: afterDrag.longtasks - beforeDrag.longtasks, longtasksSupported: afterDrag.longtasksSupported }))
+
+  // ── the motion model: one plane per face, and no position property ever animated ─────
+  //
+  // The data layer only knows whole cells; the *view* moves by fractions of one. That fraction is
+  // carried by a single element per face — `translate3d` on the motion plane — so a pan costs the
+  // compositor a transform and costs the main thread nothing at all: no style recalc, no layout, no
+  // paint per pointer event. What is pinned here is that split, measured with the browser's own
+  // counters: `LayoutCount` across a drag against the number of whole cells that drag actually
+  // crossed. Before this model, a hundred-brick board re-laid-out the grid on every pointer move.
+  await backToLive()
+  const structure = await page.evaluate(() => {
+    const planes = [...document.querySelectorAll('[data-cache-bricks-plane]')].map((plane) => plane.dataset.cacheBricksPlane)
+    const turnBrick = document.querySelector('[data-cache-bricks-brick]:not([data-cache-bricks-ring])')
+    return {
+      planes,
+      brickRides: turnBrick === null ? undefined : turnBrick.parentElement?.dataset.cacheBricksPlane,
+      brickStops: turnBrick === null ? 0 : (() => { let depth = 0; let node = turnBrick.parentElement; while (node !== null && node.dataset.cacheBricksBoard === undefined) { depth += 1; node = node.parentElement } return depth })(),
+    }
+  })
+  check('each face carries one motion plane, and every brick rides the plane of its own side',
+    structure.planes.join(',') === 'cache,type' && structure.brickRides === 'cache' && structure.brickStops > 0,
+    JSON.stringify(structure))
+
+  const offenders = await page.evaluate(() => {
+    const board = document.querySelector('[data-cache-bricks-board]')
+    const forbidden = new Set(['top', 'left', 'right', 'bottom', 'width', 'height', 'all'])
+    const found = []
+    for (const element of [board, ...board.querySelectorAll('*')]) {
+      const style = getComputedStyle(element)
+      const property = style.transitionProperty
+      if (property === 'none') continue
+      const durations = style.transitionDuration.split(',').map((value) => Number.parseFloat(value) || 0)
+      if (durations.every((value) => value === 0)) continue
+      for (const part of property.split(',').map((value) => value.trim())) {
+        if (forbidden.has(part)) found.push(`${element.tagName}[${element.dataset.cacheBricksBrick ?? element.dataset.cacheBricksPlane ?? element.dataset.cacheBricksLayer ?? ''}]:${part}`)
+      }
+    }
+    return found
+  })
+  check('no element in the board transitions a position property (the invariant)',
+    offenders.length === 0, offenders.slice(0, 4).join(' | '))
+
+  const planeOf = () => page.evaluate(() => {
+    const plane = document.querySelector('[data-cache-bricks-plane="cache"]')
+    if (plane === null) return undefined
+    const style = getComputedStyle(plane)
+    if (style.transform === 'none') return { x: 0, y: 0 }
+    const matrix = new DOMMatrixReadOnly(style.transform)
+    return { x: Math.round(matrix.m41 * 100) / 100, y: Math.round(matrix.m42 * 100) / 100 }
+  })
+
+  // A drag sampled at every step: the plane has to move on each one, and the pan has to commit
+  // whole cells only. `LayoutCount` is the browser's own count of layout runs.
+  const sampled = []
+  // Style mutations are the main thread's actual work in a pan: 0.1.4.a wrote `right` and `bottom`
+  // on every visible brick each time the pan committed, 0.1.4.b writes one `transform` on the plane
+  // per frame and touches the bricks only on a commit. Counted, not argued.
+  await page.evaluate(() => {
+    window.__styleWrites = 0
+    const board = document.querySelector('[data-cache-bricks-board]')
+    window.__styleObserver?.disconnect()
+    window.__styleObserver = new MutationObserver((records) => { window.__styleWrites += records.length })
+    window.__styleObserver.observe(board, { attributes: true, attributeFilter: ['style'], subtree: true })
+  })
+  // The browser's own counters, over CDP: `LayoutCount` is the number of layout runs, which is the
+  // honest measure of "did this drag touch layout?" (`page.metrics()` is gone from playwright-core).
+  const cdp = await page.context().newCDPSession(page).catch(() => undefined)
+  await cdp?.send('Performance.enable').catch(() => undefined)
+  const counters = async () => {
+    if (cdp === undefined) return undefined
+    try {
+      const { metrics } = await cdp.send('Performance.getMetrics')
+      const map = Object.fromEntries(metrics.map((entry) => [entry.name, entry.value]))
+      return { layout: map.LayoutCount ?? 0, recalc: map.RecalcStyleCount ?? 0 }
+    } catch {
+      return undefined
+    }
+  }
+  const motionBefore = await counters()
+  const railTrack = await page.locator('[data-cache-bricks-rail="x"]').boundingBox()
+  const railThumb = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+  const railWanted = await page.locator('[data-cache-bricks-rail="x"]').getAttribute('aria-valuenow')
+  await page.mouse.move(railThumb.x + railThumb.width / 2, railThumb.y + railThumb.height / 2)
+  await page.mouse.down()
+  for (let step = 1; step <= 12; step += 1) {
+    await page.mouse.move(railThumb.x + railThumb.width / 2 - (railTrack.width - railThumb.width) * (step / 24), railThumb.y + railThumb.height / 2)
+    await page.waitForTimeout(40)
+    sampled.push({
+      plane: await planeOf(),
+      pan: Number(await page.locator('[data-cache-bricks-rail="x"]').getAttribute('aria-valuenow')),
+      motion: await page.evaluate(() => window.__dshCacheBricksStats?.()?.motion),
+    })
+  }
+  const motionDuring = await counters()
+  const styleWrites = await page.evaluate(() => { window.__styleObserver?.disconnect(); return window.__styleWrites })
+  await page.mouse.up()
+  await page.waitForTimeout(400)
+  const settled = { plane: await planeOf(), pan: Number(await page.locator('[data-cache-bricks-rail="x"]').getAttribute('aria-valuenow')) }
+  const motionAfter = await counters()
+
+  const xs = sampled.map((sample) => sample.plane?.x ?? 0)
+  const distinct = new Set(xs.map((value) => value.toFixed(1))).size
+  // A drag in either direction has to be monotone; which direction is the pointer's business.
+  const monotone = xs.every((value, index) => index === 0 || value <= xs[index - 1] + 0.01)
+    || xs.every((value, index) => index === 0 || value >= xs[index - 1] - 0.01)
+  const betweenCells = xs.filter((value) => Math.abs(value) > 0.5).every((value) => Math.abs((Math.abs(value) % PITCH_X)) > 0.5)
+  check('the board follows the pointer by the pixel, not by the cell',
+    distinct >= 10 && monotone && betweenCells && Math.max(...xs.map((value) => Math.abs(value))) > PITCH_X / 2,
+    `plane x ${xs.map((value) => value.toFixed(1)).join(' ')} · pans ${sampled.map((sample) => String(sample.pan)).join(' ')} · motion ${JSON.stringify(sampled.map((sample) => sample.motion))}`)
+  check('the whole-cell pan commits only when a cell is crossed, and never mid-cell on release',
+    settled.plane !== undefined && Math.abs(settled.plane.x) < 0.75 && Math.abs(settled.plane.y) < 0.75
+    && Number.isInteger(settled.pan) && railWanted !== undefined,
+    `settled plane ${JSON.stringify(settled.plane)} pan ${String(settled.pan)}`)
+  const layout = motionBefore === undefined || motionDuring === undefined
+    ? undefined
+    : motionDuring.layout - motionBefore.layout
+  const crossed = Math.abs(settled.pan - Number(railWanted))
+  console.log(`  · motion: 12 pointer moves, ${String(crossed)} whole cells crossed, style writes ${String(styleWrites)}, LayoutCount +${String(layout)}`
+    + ` (recalcStyle +${String(motionBefore === undefined || motionDuring === undefined ? '?' : motionDuring.recalc - motionBefore.recalc)}),`
+    + ` plane carried ${xs.map((value) => value.toFixed(1)).join(' ')}`)
+  check('a twelve-step drag costs about one layout per cell crossed, not per pointer event',
+    layout === undefined || layout <= crossed + 6,
+    `LayoutCount +${String(layout)} for ${String(crossed)} cells over 12 moves (release: +${String(motionAfter === undefined || motionDuring === undefined ? '?' : motionAfter.layout - motionDuring.layout)})`)
+
+  // A pan must not rewrite the grid: the plane carries it, and the bricks are touched only when a
+  // whole cell is committed. The fixture's drag is deliberately brutal (each move crosses ~83
+  // cells), so this is the worst case: one commit per frame, ~200 style writes per commit if every
+  // brick were repositioned, against two per frame for the plane.
+  check('a pan writes the plane and the chrome, not a hundred bricks',
+    styleWrites !== undefined && styleWrites < 400,
+    `${String(styleWrites)} attached style mutations over 12 moves × ${String(Math.round(crossed / 12))} cells each`)
+
+  // A new Turn is the other half of the motion model. 0.1.4.a slid the stack by transitioning `right`
+  // on every visible brick — a layout-property animation, so every frame of it re-ran layout on a
+  // hundred elements. 0.1.4.b paints the new cells once and animates **one** transform on the plane,
+  // which the compositor carries. Counted with the browser's own LayoutCount.
+  await backToLive()
+  const beforeTurn = await counters()
+  await page.evaluate(() => {
+    const feed = window.__fixture.feed
+    const turn = (Number(feed.bricks[feed.bricks.length - 1].identity.turn) || 18) + 1
+    const brick = {
+      observedBy: 'host',
+      identity: { id: `S:${String(turn)}:1:0`, sessionId: 'S', turn, step: 1, attemptOrdinal: 0 },
+      settlement: 'message', settlementSeq: turn * 100 + 1,
+      route: { provider: 'fixture', model: 'fixture' },
+      usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+      metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+      request: {}, tools: [], raw: {},
+    }
+    const bricks = [...feed.bricks, brick]
+    window.__pushFeed({
+      sessionId: 'S',
+      bricks,
+      endedTurns: bricks.map((entry) => Number(entry.identity.turn)).slice(0, -1),
+      store: { blobs: 0, bytes: 0 },
+    })
+  })
+  await page.waitForTimeout(450)
+  const afterTurn = await counters()
+  const turnLayout = beforeTurn === undefined || afterTurn === undefined ? undefined : afterTurn.layout - beforeTurn.layout
+  const turnRecalc = beforeTurn === undefined || afterTurn === undefined ? undefined : afterTurn.recalc - beforeTurn.recalc
+  console.log(`  · new Turn: LayoutCount +${String(turnLayout)} · recalcStyle +${String(turnRecalc)}`)
+  check('a new Turn slides the plane instead of re-laying-out every brick',
+    turnLayout === undefined || turnLayout <= 3,
+    `LayoutCount +${String(turnLayout)} for one new column`)
+
+  // The ring: painted outside the grid so a fractional pan cannot expose an edge, clipped by the
+  // face, and never offered to the reader.
+  const ring = await page.evaluate(() => {
+    const bricks = [...document.querySelectorAll('[data-cache-bricks-brick][data-cache-bricks-ring]')]
+    const plane = document.querySelector('[data-cache-bricks-plane="cache"]')?.getBoundingClientRect()
+    const inside = bricks.filter((brick) => {
+      const box = brick.getBoundingClientRect()
+      return plane !== undefined && box.x >= plane.x && box.right <= plane.right && box.y >= plane.y && box.bottom <= plane.bottom
+    })
+    return {
+      count: bricks.length,
+      inside: inside.length,
+      interactive: bricks.filter((brick) => brick.tabIndex === 0 || getComputedStyle(brick).pointerEvents !== 'none' || brick.getAttribute('aria-hidden') !== 'true').length,
+    }
+  })
+  check('the motion ring is painted outside the grid and never offered to the reader',
+    ring.count > 0 && ring.inside === 0 && ring.interactive === 0,
+    JSON.stringify(ring))
+
+  // ── reviewing old bricks costs the scene, not the session ────────────────────────────
+  //
+  // The board is a window and the pan is arithmetic, but the *data* layer used to rebuild the whole
+  // session's board every time the scene on screen was re-cut: every fold reading re-folded, every
+  // Turn's column rebuilt and sorted. On the six-thousand-brick world this section builds, panning
+  // across ten screens is ten scene changes, and each of them used to be O(session). What is pinned
+  // here is that a pan moves only what it touched — and, because a count is not a cost, the script
+  // time the browser spent doing it.
+  const worldStats = () => page.evaluate(() => window.__dshCacheBricksStats?.()?.world)
+  // Thirty thousand steps, which is the size the "reviewing history is O(session)" complaint is
+  // about: three bricks per Turn, ten thousand Turns.
+  await page.evaluate(() => {
+    const bricks = []
+    for (let turn = 1; turn <= 10_000; turn += 1) {
+      for (let step = 1; step <= 3; step += 1) {
+        bricks.push({
+          observedBy: 'host',
+          identity: { id: `S:${String(turn)}:${String(step)}:0`, sessionId: 'S', turn, step, attemptOrdinal: 0 },
+          settlement: 'message', settlementSeq: turn * 100 + step,
+          route: { provider: 'fixture', model: 'fixture' },
+          usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+          metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+          request: {}, tools: [], raw: {},
+        })
+      }
+    }
+    window.__fixture.records.S = bricks
+    window.__pushFeed({ sessionId: 'S', bricks, endedTurns: Array.from({ length: 9_999 }, (_, index) => index + 1), store: { blobs: 0, bytes: 0 } })
+    // The durable window has to cover what the reader pans through, or the board has nothing to
+    // replay and a scene change never happens. Two events per Turn keeps the window at the same
+    // size the earlier sections used while covering all ten thousand Turns.
+    const page = window.__page
+    page.entries.length = 0
+    page.seq = 3
+    page.front = 0
+    page.pending.length = 0
+    page.hasMore = false
+    for (let turn = 1; turn <= 10_000; turn += 1) {
+      for (const type of ['step/start', 'step/end']) {
+        page.entries.push({ type: 'event', event: { seq: page.seq, type, time: page.seq * 100, data: { turn, step: 1 } } })
+        page.seq += 1
+      }
+    }
+    page.fold = Array.from({ length: 10_000 }, (_, index) => index + 1)
+    page.revision += 1
+    for (const listener of page.listeners) listener()
+  })
+  await page.waitForTimeout(1200)
+  const cdp2 = await page.context().newCDPSession(page).catch(() => undefined)
+  await cdp2?.send('Performance.enable').catch(() => undefined)
+  const scriptSeconds = async () => {
+    if (cdp2 === undefined) return undefined
+    try {
+      const { metrics } = await cdp2.send('Performance.getMetrics')
+      return Object.fromEntries(metrics.map((entry) => [entry.name, entry.value])).ScriptDuration ?? 0
+    } catch {
+      return undefined
+    }
+  }
+  const beforeWorld = await worldStats()
+  const beforeScript = await scriptSeconds()
+  const rail = page.locator('[data-cache-bricks-rail="x"]')
+  const railBox = await rail.boundingBox()
+  const worldThumb = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+  const worldTravel = railBox.width - worldThumb.width
+  const maxPan = Number(await rail.getAttribute('aria-valuemax'))
+  const pans = []
+  // Ten *separate* gestures: each one is released, so each one lands on a screen the board has not
+  // cut yet and pays for whatever that costs — which is the reading this section exists for.
+  for (let screen = 1; screen <= 10; screen += 1) {
+    const handle = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+    const track = await rail.boundingBox()
+    const span = track.width - handle.width
+    await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+    await page.mouse.down()
+    // One screenful of Turns per gesture, so the view lands somewhere new every time.
+    await page.mouse.move(handle.x + handle.width / 2 - span / 14, handle.y + handle.height / 2, { steps: 6 })
+    await page.mouse.up()
+    await page.waitForTimeout(260)
+    pans.push({ pan: Number(await rail.getAttribute('aria-valuenow')), stats: await worldStats() })
+  }
+  const afterWorld = await worldStats()
+  const lastSample = pans[pans.length - 1]?.stats
+  console.log('  · on release: ' + JSON.stringify({
+    fold: (afterWorld?.foldRebuilds ?? 0) - (lastSample?.foldRebuilds ?? 0),
+    live: (afterWorld?.livePatches ?? 0) - (lastSample?.livePatches ?? 0),
+    exact: (afterWorld?.exactPatches ?? 0) - (lastSample?.exactPatches ?? 0),
+    exactSteps: afterWorld?.exactSteps,
+    columns: (afterWorld?.columnsRebuilt ?? 0) - (lastSample?.columnsRebuilt ?? 0),
+    boards: (afterWorld?.boards ?? 0) - (lastSample?.boards ?? 0),
+    order: (afterWorld?.orderBuilds ?? 0) - (lastSample?.orderBuilds ?? 0),
+  }))
+  const afterScript = await scriptSeconds()
+  const scriptMs = beforeScript === undefined || afterScript === undefined ? undefined : (afterScript - beforeScript) * 1000
+  console.log(`  · ten screen-pans over 10,000 Turns: script ${String(scriptMs === undefined ? '?' : Math.round(scriptMs))} ms`
+    + ` · fold rebuilds +${String((afterWorld?.foldRebuilds ?? 0) - (beforeWorld?.foldRebuilds ?? 0))}`
+    + ` · columns rebuilt +${String((afterWorld?.columnsRebuilt ?? 0) - (beforeWorld?.columnsRebuilt ?? 0))}`
+    + ` · order builds +${String((afterWorld?.orderBuilds ?? 0) - (beforeWorld?.orderBuilds ?? 0))}`
+    + ` · scene patches +${String((afterWorld?.exactPatches ?? 0) - (beforeWorld?.exactPatches ?? 0))}`)
+  // The pans themselves: this is where the session used to be rebuilt. Nothing at all may happen
+  // while the hand moves — the scene is deferred to the release (0.1.4.a) and the world is only
+  // patched when a new scene actually arrives.
+  const panDeltas = pans.map((entry, index) => {
+    const before = index === 0 ? beforeWorld : pans[index - 1].stats
+    return {
+      pan: entry.pan,
+      fold: (entry.stats?.foldRebuilds ?? 0) - (before?.foldRebuilds ?? 0),
+      live: (entry.stats?.livePatches ?? 0) - (before?.livePatches ?? 0),
+      exact: (entry.stats?.exactPatches ?? 0) - (before?.exactPatches ?? 0),
+      columns: (entry.stats?.columnsRebuilt ?? 0) - (before?.columnsRebuilt ?? 0),
+      boards: (entry.stats?.boards ?? 0) - (before?.boards ?? 0),
+      order: (entry.stats?.orderBuilds ?? 0) - (before?.orderBuilds ?? 0),
+    }
+  })
+  check('ten screen-pans across a ten-thousand-Turn world never rebuild the fold or the session-sized order list',
+    beforeWorld !== undefined && panDeltas.length === 10
+    && panDeltas.every((delta) => delta.fold === 0 && delta.live === 0 && delta.order === 0)
+    // Each gesture patches the scene it landed on: a screenful of Turns, never the 2,000 on the board.
+    && panDeltas.every((delta) => delta.columns < 260 && delta.boards <= 3),
+    JSON.stringify(panDeltas.map((delta) => [delta.pan, delta.fold, delta.columns, delta.boards])))
+  // And the release: exactly one new scene, and it costs that scene. `exactSteps` is the number of
+  // steps the patch replaced — a screenful, never the session (the world holds 2,000 Turns here).
+  // Pan back over ground already covered: the screens are in the scene LRU only if they were the
+  // last three, but every *step* of them is still cached, so a re-read costs lookups rather than
+  // replays. This is the "second look at the same area" the step cache exists for.
+  const stepStatsOf = () => page.evaluate(() => window.__dshCacheBricksStats?.()?.steps)
+  const beforeReturn = await stepStatsOf()
+  const returnScriptBefore = await scriptSeconds()
+  for (let back = 1; back <= 3; back += 1) {
+    const handle = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+    const track = await rail.boundingBox()
+    const span = track.width - handle.width
+    await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(handle.x + handle.width / 2 + span / 14, handle.y + handle.height / 2, { steps: 6 })
+    await page.mouse.up()
+    await page.waitForTimeout(260)
+  }
+  const afterReturn = await stepStatsOf()
+  const returnScriptAfter = await scriptSeconds()
+  const returnScriptMs = returnScriptBefore === undefined || returnScriptAfter === undefined
+    ? undefined
+    : (returnScriptAfter - returnScriptBefore) * 1000
+  const returnHits = (afterReturn?.hits ?? 0) - (beforeReturn?.hits ?? 0)
+  const returnMisses = (afterReturn?.misses ?? 0) - (beforeReturn?.misses ?? 0)
+  console.log(`  · panning back over three screens: step hits +${String(returnHits)}, step misses +${String(returnMisses)}`
+    + `, script ${String(returnScriptMs === undefined ? '?' : Math.round(returnScriptMs))} ms`)
+  check('a screen already read is answered from the step cache, not replayed',
+    beforeReturn !== undefined && afterReturn !== undefined
+    && returnHits >= 20 && returnMisses === 0,
+    `hits +${String(returnHits)}, misses +${String(returnMisses)}`)
+
+  check('the scene a pan lands on is patched, not rebuilt, and the session-sized order list stays unbuilt',
+    afterWorld !== undefined && (afterWorld.exactPatches - (lastSample?.exactPatches ?? 0)) <= 2
+    && (afterWorld.exactSteps ?? 0) <= 200
+    && afterWorld.orderBuilds === beforeWorld.orderBuilds,
+    JSON.stringify({ exactSteps: afterWorld?.exactSteps, order: afterWorld?.orderBuilds }))
+  // A count is not a cost: the same ten pans, in the browser's own script clock. 2,000 Turns and
+  // 6,000 steps are on the board, so anything proportional to the session shows up here.
+  check('ten screen-pans cost the scene, not the session',
+    scriptMs === undefined || scriptMs < 3_000,
+    `${String(scriptMs === undefined ? '?' : Math.round(scriptMs))} ms of script for 10 scene changes`)
+  console.log('  · per-pan world deltas: ' + pans.map((entry, index) => {
+    const before = index === 0 ? beforeWorld : pans[index - 1].stats
+    return `${String(entry.pan)}:f${String((entry.stats?.foldRebuilds ?? 0) - (before?.foldRebuilds ?? 0))}`
+      + `,b${String((entry.stats?.boards ?? 0) - (before?.boards ?? 0))}`
+      + `,l${String((entry.stats?.livePatches ?? 0) - (before?.livePatches ?? 0))}`
+      + `,e${String((entry.stats?.exactPatches ?? 0) - (before?.exactPatches ?? 0))}`
+      + `,c${String((entry.stats?.columnsRebuilt ?? 0) - (before?.columnsRebuilt ?? 0))}`
+  }).join(' '))
+  void maxPan
+  void pans
+  await backToLive()
+
+  // The dashed ghost names the cell the running Turn's next brick will land in. It used to be an
+  // overlay in the host's coordinates, moving itself with a position transition; it is a child of
+  // the cache plane now, so it rides the same transform the bricks do — no animation of its own, no
+  // position property touched, and it sits on the cell it names. A Turn in flight is what asks for
+  // it, so this stands a one-Turn world up from scratch rather than inheriting a finished one.
+  await page.evaluate(() => {
+    const turn = 30_001
+    const page = window.__page
+    page.fold = [turn]
+    page.nodes = () => new Map([[`fold-${String(turn)}`, {
+      kind: 'cache-bricks',
+      data: { turn, ended: false, steps: [{ step: 1, seq: 9_200_000, provider: 'fixture', usage: { inputTokens: 100, cacheReadTokens: 900, cacheWriteTokens: 0, outputTokens: 10 } }] },
+    }]])
+    for (const listener of page.listeners) listener()
+    window.__fixture.renderFold()
+    window.__pushFeed({
+      sessionId: 'S',
+      bricks: [{
+        observedBy: 'host',
+        identity: { id: `S:${String(turn)}:1:0`, sessionId: 'S', turn, step: 1, attemptOrdinal: 0 },
+        settlement: 'message', settlementSeq: 9_200_001,
+        route: { provider: 'fixture', model: 'fixture' },
+        usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+        metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+        request: {}, tools: [], raw: {},
+      }],
+      endedTurns: [],
+      store: { blobs: 0, bytes: 0 },
+    })
+  })
+  await page.waitForTimeout(400)
+  await backToLive()
+  await page.waitForTimeout(250)
+  const ghost = await page.evaluate(() => {
+    const element = document.querySelector('[data-cache-bricks-ghost]')
+    const plane = document.querySelector('[data-cache-bricks-plane="cache"]')
+    if (element === null || plane === null) return { present: false }
+    const box = element.getBoundingClientRect()
+    const grid = plane.getBoundingClientRect()
+    const style = getComputedStyle(element)
+    return {
+      present: true,
+      visible: style.display !== 'none' && box.width > 0,
+      onThePlane: element.parentElement === plane,
+      firstChild: plane.firstElementChild === element,
+      insideTheGrid: box.x >= grid.x - 0.5 && box.right <= grid.right + 0.5 && box.y >= grid.y - 0.5 && box.bottom <= grid.bottom + 0.5,
+      dashed: style.borderTopStyle === 'dashed',
+      ownMovements: style.transitionProperty,
+    }
+  })
+  check('the dashed next-cell ghost rides the plane, on the cell it names',
+    ghost.present === true && ghost.visible === true && ghost.onThePlane === true && ghost.firstChild === true
+    && ghost.insideTheGrid === true && ghost.dashed === true
+    && (ghost.ownMovements === 'none' || ghost.ownMovements === 'all'),
+    JSON.stringify(ghost))
+
+  // ── the motion the reader feels: the fall, and the slide ────────────────────────────
+  //
+  // The board asks for reduced motion, so nothing here had ever run in this suite: the fall and the
+  // slide are both skipped when `prefers-reduced-motion` is set, which is right for a reader who
+  // asked for it and a blind spot for a test that did not. So this section asks for motion, drives
+  // one brick and one Turn, and **seeks the animations themselves** rather than timing a sampler —
+  // a rAF loop is at the mercy of the page's frame production, while `Animation.currentTime` puts
+  // the motion at an exact moment. What is pinned is the motion 0.1.4 had, since that is the feel
+  // being kept: a brick spawns one brick-height up and falls for 420 ms on
+  // `cubic-bezier(.45,.02,.95,.55)`, and a new Turn slides the stack one cell in 260 ms ease-out.
+  await backToLive()
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+  await page.waitForTimeout(120)
+  const pushed = await page.evaluate(() => {
+    const feed = window.__fixture.feed
+    const turn = (Number(feed.bricks[feed.bricks.length - 1].identity.turn) || 18) + 1
+    const brick = {
+      observedBy: 'host',
+      identity: { id: `S:${String(turn)}:1:0`, sessionId: 'S', turn, step: 1, attemptOrdinal: 0 },
+      settlement: 'message', settlementSeq: turn * 100 + 1,
+      route: { provider: 'fixture', model: 'fixture' },
+      usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 },
+      metrics: { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 },
+      request: {}, tools: [], raw: {},
+    }
+    window.__pushed = brick.identity.id
+    window.__pushFeed({ sessionId: 'S', bricks: [...feed.bricks, brick], endedTurns: feed.endedTurns ?? [], store: { blobs: 0, bytes: 0 } })
+    return brick.identity.id
+  })
+  const fall = await (async () => {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const found = await page.evaluate(() => {
+        const element = document.querySelector(`[data-cache-bricks-brick="${window.__pushed}"]`)
+        if (element === null || element.getAnimations().length === 0) return undefined
+        const animation = element.getAnimations()[0]
+        const duration = Number(animation.effect?.getTiming().duration ?? 0)
+        if (!(duration > 0)) return undefined
+        animation.pause()
+        const seek = (time) => {
+          animation.currentTime = time
+          return Math.round(element.getBoundingClientRect().top * 10) / 10
+        }
+        const rest = seek(duration)
+        const curve = []
+        for (let time = 0; time <= duration; time += 15) {
+          curve.push([time, Math.round((rest - seek(time)) * 10) / 10])
+        }
+        animation.currentTime = duration
+        return { duration, easing: animation.effect?.getTiming().easing, curve }
+      })
+      if (found !== undefined) return found
+      await page.waitForTimeout(50)
+    }
+    return undefined
+  })()
+  const fallAt = (ms) => {
+    const curve = fall?.curve ?? []
+    let value = curve[0]?.[1] ?? 0
+    for (const [time, offset] of curve) if (time <= ms) value = offset
+    return value
+  }
+  console.log(`  · fall: ${String(fall?.duration)}ms ${String(fall?.easing)} · start ${String(fallAt(0))}px`
+    + ` · curve ${[0, 100, 200, 300, 400].map((ms) => `${String(ms)}:${String(fallAt(ms))}`).join(' ')}`)
+  check('a new brick falls on 0.1.4\'s own motion: one brick-height, 420 ms, its curve, no bounce',
+    fall !== undefined && fall.duration === 420
+    && (fall.easing ?? '').replaceAll(' ', '') === 'cubic-bezier(0.45,0.02,0.95,0.55)'
+    && Math.abs(fallAt(0) - 15) <= 0.5
+    // A falling brick only ever moves down towards its cell, and it is there when the clock is.
+    && (fall.curve ?? []).every(([, offset]) => offset >= -0.5)
+    && Math.abs(fallAt(415)) <= 2.5,
+    JSON.stringify({ duration: fall?.duration, easing: fall?.easing, start: fallAt(0), end: fallAt(415) }))
+
+  // The new Turn, which the push above also added while the board was following: the plane carries
+  // the whole stack one cell in 260 ms ease-out, the clock the old `right` transition used.
+  const slide = await page.evaluate(() => {
+    const plane = document.querySelector('[data-cache-bricks-plane="cache"]')
+    if (plane === null) return undefined
+    const animation = plane.getAnimations().find((entry) => Number(entry.effect?.getTiming().duration ?? 0) > 100)
+    if (animation === undefined) return undefined
+    const duration = Number(animation.effect?.getTiming().duration ?? 0)
+    animation.pause()
+    const seek = (time) => {
+      animation.currentTime = time
+      const value = getComputedStyle(plane).transform
+      return value === 'none' ? 0 : Math.round(new DOMMatrixReadOnly(value).m41 * 10) / 10
+    }
+    const from = seek(0)
+    const middle = seek(duration / 2)
+    const end = seek(duration)
+    animation.currentTime = duration
+    return { duration, easing: animation.effect?.getTiming().easing, from, middle, end }
+  })
+  console.log(`  · new Turn slide: ${String(slide?.duration)}ms ${String(slide?.easing)} · ${String(slide?.from)}px -> ${String(slide?.end)}px`)
+  check('a new Turn slides the stack one cell on the clock it always used (260 ms, ease-out)',
+    slide !== undefined && slide.duration === 260 && (slide.easing ?? '') === 'ease-out'
+    && slide.from > 30 && Math.abs(slide.end) < 1 && (slide.middle ?? 0) < slide.from && (slide.middle ?? 0) > 0,
+    JSON.stringify(slide))
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  void pushed
+
+  // ── a brick's two drops: born a draft, settled as a reading ─────────────────────────
+  //
+  // The life a reader watches: a request starts, its brick is born as a draft (`n/a`, because no
+  // usage has landed) and drops into its cell; the dashed box marks the cell above it; the request
+  // settles, and the brick drops again — now wearing its reading. Both drops are the same motion on
+  // `transform`, so the second one costs exactly what the first did.
+  const DROP_TURN = 40_001
+  const dropBrick = (settled) => ({
+    observedBy: 'host',
+    identity: { id: `S:${String(DROP_TURN)}:1:0`, sessionId: 'S', turn: DROP_TURN, step: 1, attemptOrdinal: 0 },
+    settlement: settled ? 'message' : 'running',
+    settlementSeq: settled ? DROP_TURN * 100 + 1 : 0,
+    route: { provider: 'fixture', model: 'fixture' },
+    ...(settled ? { usage: { inputTokens: 100, cacheReadTokens: 900, outputTokens: 10 } } : {}),
+    metrics: settled
+      ? { promptTokens: 1_000, cacheHitRatio: 0.9, chunkCount: 3, textChars: 10, reasoningChars: 0, toolCallCount: 0 }
+      : { promptTokens: 0, cacheHitRatio: 0, chunkCount: 0, textChars: 0, reasoningChars: 0, toolCallCount: 0 },
+    request: {}, tools: [], raw: {},
+  })
+  const pushFeed = (bricks) => page.evaluate((list) => {
+    window.__pushFeed({ sessionId: 'S', bricks: list, endedTurns: [], store: { blobs: 0, bytes: 0 } })
+  }, bricks)
+  const watch = (frames) => page.evaluate((count) => {
+    window.__drop = []
+    window.__dropOn = true
+    const key = 'S:40001:1:0'
+    const tick = () => {
+      if (!window.__dropOn) return
+      const element = document.querySelector(`[data-cache-bricks-brick="${key}"]`)
+      if (element !== null) {
+        const animations = element.getAnimations()
+        const properties = animations.length === 0
+          ? []
+          : Object.keys(animations[0].effect?.getKeyframes?.()[0] ?? {}).filter((name) => name !== 'offset' && name !== 'computedOffset' && name !== 'easing')
+        window.__drop.push([
+          Math.round(performance.now()),
+          Math.round(element.getBoundingClientRect().top * 10) / 10,
+          animations.length,
+          properties.join(','),
+          (element.textContent ?? '').trim(),
+        ])
+      }
+      requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+    void count
+  }, frames)
+  const stopWatch = () => page.evaluate(() => { window.__dropOn = false; return window.__drop })
+
+  // Deliberately left on the suite's reduced-motion default: 0.1.4 dropped bricks without ever
+  // consulting the preference, and this check exists because a board that honours it here reads as
+  // bricks appearing out of nowhere.
+  await watch()
+  await pushFeed([dropBrick(false)])
+  await page.waitForTimeout(560)
+  const birth = await stopWatch()
+  await watch()
+  await pushFeed([dropBrick(true)])
+  await page.waitForTimeout(560)
+  const settle = await stopWatch()
+
+  const rest = birth.length === 0 ? 0 : Math.max(...birth.map((frame) => frame[1]))
+  const lifted = (frames) => frames.filter((frame) => frame[1] <= rest - 13 && frame[2] > 0)
+  // The animation must move the brick on the compositor: `transform`, and never a layout property.
+  const transformOnly = (frames) => frames.filter((frame) => frame[2] > 0).every((frame) => {
+    const properties = frame[3].split(',')
+    return properties.includes('transform')
+      && !properties.some((name) => ['bottom', 'right', 'top', 'left', 'width', 'height'].includes(name))
+  })
+  check('a brick drops when it is born and drops again when it settles',
+    birth.length > 0 && settle.length > 0
+    && lifted(birth).length > 0 && lifted(settle).length > 0
+    && settle.some((frame) => frame[4].includes('%') && frame[2] > 0)
+    && transformOnly(birth) && transformOnly(settle),
+    `rest ${String(rest)} · birth lifted ${String(lifted(birth).length)}/${String(birth.length)} · settle lifted ${String(lifted(settle).length)}/${String(settle.length)} · settle label ${String(settle.find((frame) => frame[2] > 0)?.[4] ?? '')}`)
 
   check('no unhandled browser error', pageErrors.length === 0, pageErrors.join(' | '))
 

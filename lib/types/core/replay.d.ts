@@ -28,7 +28,9 @@
  * activity type and the navigation target — is reconstructed exactly, from the same alphabet
  * the live path reads.
  *
- * Pure: no IO, no timers, no DSH imports, so both halves can run it.
+ * Pure: no IO, no timers, no DSH imports, so both halves can run it. The one piece of module
+ * state is a count of the raw payloads the replays have hashed ({@link replayBlobPuts}), which
+ * observes the work without taking part in it: two replays of one log still produce one feed.
  */
 import type { BrickFeed } from '../shared/brick';
 import { BlobStore } from './blob-store';
@@ -71,7 +73,53 @@ export interface ReplayOptions {
      * sees; it is left optional for a caller replaying something unbounded on purpose.
      */
     readonly maxBricks?: number;
+    /**
+     * The caller guarantees `events` is already in ascending `seq` order.
+     *
+     * A scene replay is handed a slice of the durable window, and the slice sorts itself once
+     * while it is being cut (`history-scene.ts`) — so the copy-and-sort below would re-order a
+     * window-sized array to arrive at the order it was already given. With this flag the replay
+     * walks the array as given: no copy, no sort, no throwaway array as big as the window.
+     *
+     * The guarantee is not verified, and it is the whole contract: an unsorted array is read in
+     * the order it is in, so bricks come out in event order and a timing face measured from a
+     * `step/start` that has not been read yet falls back to the settlement's own time. A caller
+     * that cannot promise the order leaves the flag out and keeps the sort.
+     */
+    readonly ordered?: boolean;
+    /**
+     * Whether the raw payloads a replay passes are stored and hashed, or left where they are.
+     *
+     * `eager` (the default) is what the collector's own observations want: every payload is
+     * canonicalized and SHA-256'd into the store, which is how a brick's raw view is served.
+     *
+     * `lazy` is what a *replay of history* wants. Nobody asked for those payloads — the reader asked
+     * for a board — and hashing them costs a canonical pass plus a digest per settled attempt, per
+     * tool result and per header, on the same thread that is drawing. The payloads are not lost: they
+     * are the session's own events, which the client is holding, so a reader who opens a brick's raw
+     * view can be handed the bytes from the log at that moment (`navigation.ts` reads them by seq).
+     * A lazy replay therefore makes **no** `put` calls at all, which is what
+     * {@link replayBlobPutsSkipped} counts.
+     */
+    readonly raw?: 'eager' | 'lazy';
 }
+/**
+ * How many raw payloads the replays have hashed since this module loaded.
+ *
+ * Monotonic and module-wide, so a reader takes the difference across a replay instead of
+ * expecting a per-replay reset. The replay's counterpart of the live collector's
+ * `store.stats()`: what a replay pays even when every blob is already stored.
+ */
+export declare function replayBlobPuts(): number;
+/**
+ * How many raw payloads lazy replays left unhashed since this module loaded.
+ *
+ * The mirror image of {@link replayBlobPuts}: with `raw: 'lazy'` nothing is canonicalized, so this
+ * is the number of `put` calls that would have happened and did not. A reader takes the difference
+ * across a replay, and a scene replay that reports a growing number here and zero there is the
+ * whole claim of the lazy path.
+ */
+export declare function replayBlobPutsSkipped(): number;
 /**
  * Read one **compact** stream into the ledger's chunk alphabet.
  *
@@ -106,8 +154,8 @@ export declare function compactChunks(stream: readonly unknown[]): Array<{
  *    (kept by reference) and the settlement `seq` the brick navigates by.
  *
  * @param sessionId - the session being replayed.
- * @param events - the durable events, in any order (they are sorted by `seq`).
- * @param options - store and brick cap.
+ * @param events - the durable events; sorted by `seq` here unless `ordered` says they already are.
+ * @param options - store, brick cap, and whether the events are already in `seq` order.
  * @returns the replayed feed plus what the replay could not read.
  */
 export declare function replaySession(sessionId: string, events: readonly ReplayEvent[], options?: ReplayOptions): ReplayReport;

@@ -113,6 +113,49 @@ export interface SceneIndex {
 /** Identity of a durable window: what it holds, not how it was read. */
 export declare function windowKeyOf(events: readonly DurableEvent[]): string;
 /**
+ * The mutable side of a scene index: one pass over events, and the state a second pass can extend.
+ *
+ * A window that only *grew* at one end does not need a new scan of everything it holds — the log is
+ * append-only, and an event that was already in the window says the same thing it said before. The
+ * builder is what makes that true: `indexEvents` is one `feed` followed by `freeze`, and a page
+ * landing is `prepend`/`feed` of the new events followed by `freeze` again. Without it,
+ * `loadOlder()` re-read the whole window to learn about one page of it.
+ */
+declare class SceneIndexBuilder {
+    private readonly spans;
+    private readonly open;
+    private readonly turnEnds;
+    private headerSeqs;
+    private contextSeqs;
+    private oldest;
+    private newest;
+    /** First and last seq this builder has been fed, ascending by construction. */
+    get bounds(): {
+        oldest: number;
+        newest: number;
+    };
+    /**
+     * Take events in ascending seq order, on top of whatever this builder already holds.
+     *
+     * A step's span is opened with its own start as a placeholder end: a step that is still running
+     * when the window ends is closed at the window's last seq by {@link freeze}, which is the same
+     * rule the one-shot scan used.
+     */
+    feed(events: readonly DurableEvent[]): void;
+    /**
+     * Take events older than everything fed so far.
+     *
+     * The two carried-seq lists are kept ascending by sorting after the fact: they hold one entry per
+     * request series, so this is a handful of numbers, while the alternative — rebuilding the index —
+     * is the whole window again.
+     */
+    prepend(events: readonly DurableEvent[]): void;
+    /** Freeze what has been fed into an index, closing the steps the window ends inside. */
+    freeze(events: readonly DurableEvent[], key: string): SceneIndex;
+}
+/** A builder, for a caller that keeps an index across window changes (see `HistoryScene`). */
+export declare function sceneIndexBuilder(): SceneIndexBuilder;
+/**
  * Scan a window once and remember where each step is.
  *
  * A step is a bracket — `step/start` opens it, `step/end` closes it — and the log writes both
@@ -120,12 +163,22 @@ export declare function windowKeyOf(events: readonly DurableEvent[]): string;
  * bracket is closed at the end of the window, which is what a running step needs.
  *
  * @param events - the durable window, in seq order.
+ * @param key - the window's identity, when the caller has already read one from the raw snapshot
+ *   (see `windowKeyOfSnapshot`); it is stored with the index, so the next caller can be answered
+ *   without materializing the window at all.
  * @returns the index, with its own identity included.
  */
-export declare function indexEvents(events: readonly DurableEvent[]): SceneIndex;
+export declare function indexEvents(events: readonly DurableEvent[], key?: string): SceneIndex;
 /** What one {@link sceneSlice} handed to the replay. */
 export interface SceneSlice {
     readonly events: readonly DurableEvent[];
+    /**
+     * The header and context events carried into the slice, in that order, when the window holds
+     * them: the sticky facts a bracket cannot carry (see {@link sceneSlice}).
+     */
+    readonly carried: readonly number[];
+    /** The first seq the demand asked for, before the carried events: what "in force" is relative to. */
+    readonly firstSeq: number;
     /** Steps the slice actually covers (the demand may name steps the window never held). */
     readonly spans: number;
     /** Settlement events in the slice — one per attempt — used to size the ledger budget. */
@@ -188,11 +241,30 @@ export declare function prefetchDue(window: BoardWindow, metrics: BoardMetrics):
  * @returns the slice, with what it covers and how many attempts it holds.
  */
 export declare function sceneSlice(index: SceneIndex, demand: SceneDemand): SceneSlice;
+/**
+ * Identity of one step's exact replay.
+ *
+ * A finished step never changes: its `step/start` and `step/end` say which seqs it owns, and the
+ * header and context in force when the scene was cut say what those events mean. Anything that
+ * could change the replayed brick is in the key — so a page landing at the *older* end, a newer
+ * Turn arriving, or the window being re-read entirely cannot invalidate it, and re-visiting the
+ * same screen is a map lookup rather than a replay.
+ *
+ * @param turn - the Turn.
+ * @param step - the step.
+ * @param startSeq - where the step's bracket opens.
+ * @param endSeq - where it closes (or the window's end, for a running step).
+ * @param carried - the header and context seqs the slice carried, in that order.
+ * @returns the cache key.
+ */
+export declare function stepVersionKey(turn: number, step: number, startSeq: number, endSeq: number, carried: readonly number[]): string;
 /** Options for {@link HistoryScene}. */
 export interface HistorySceneOptions {
     readonly sessionId: string;
     /** Scenes kept warm. Three is one screen back, one live, one prefetch ahead. */
     readonly maxScenes?: number;
+    /** How many steps' exact replays to keep (see {@link HistoryScene.maxSteps}). */
+    readonly maxSteps?: number;
     /** Raw-payload budget shared by every scene this object replays. */
     readonly maxTotalBytes?: number;
 }
@@ -204,22 +276,64 @@ export interface SceneRead {
     readonly attempts: number;
     readonly cached: boolean;
 }
-/**
- * The scene cache: the durable window, indexed once, replayed a screen at a time.
- *
- * A scene is memoised on `window ⊕ demand`, so panning back over ground already covered is a
- * map lookup, and a page landing (which changes the window) invalidates every scene at once
- * rather than leaving stale ones to be mistaken for current.
- */
 export declare class HistoryScene {
     readonly sessionId: string;
     private readonly maxScenes;
+    /**
+     * How many steps' exact replays to keep.
+     *
+     * A scene is a *view*: three of them is a sensible cache for a window, but a step is a **fact**
+     * — a finished step's events never change again — so caching at scene granularity threw away
+     * work that could never go stale. Two neighbouring scenes overlap by most of their steps, and
+     * panning back over ground already covered replayed all of it. The step cache is what makes a
+     * step cost its own replay exactly once per version.
+     */
+    private readonly maxSteps;
+    private readonly stepCache;
     private readonly store;
     private readonly scenes;
     private readonly listeners;
     private index;
+    /** The builder the live index was frozen from: a window that only grew extends this one. */
+    private builder;
     private current;
     private lastDemand;
+    /**
+     * What this service has cost so far.
+     *
+     * Read by the verification scripts through the read-only handle in `index.tsx`, and by nothing
+     * else: a demand's price is a *count* before it is a duration — how many windows were re-indexed,
+     * how many demands were answered from the memo, and how much of the log each replay was handed.
+     * `replayMs` is the one duration kept here, because the alternative is timing a whole frame in a
+     * headless browser, which says more about the machine than about the board.
+     */
+    readonly stats: {
+        /** Times the window was scanned in full — the O(window) path, which growth must not take. */
+        windows: number;
+        /** Times a window that only grew at an end was indexed by its growth alone. */
+        windowDeltas: number;
+        /** Events a delta actually had to read. */
+        indexDeltaEvents: number;
+        demands: number;
+        cached: number;
+        assembled: number;
+        replays: number;
+        sliceEvents: number;
+        replayMs: number;
+    };
+    /**
+     * What the step cache did, in counts.
+     *
+     * `hits` is the number of steps a scene did not have to replay at all — the number that grows
+     * with how much of this session the reader has already looked at, and the one a pan should move
+     * instead of `replays`. `misses` is the new ground. Read by `scripts/test-scroll.mjs` through
+     * `window.__dshCacheBricksStats()`.
+     */
+    readonly stepStats: {
+        hits: number;
+        misses: number;
+        evictions: number;
+    };
     constructor(options: HistorySceneOptions);
     /**
      * Note the window this scene reads.
@@ -227,13 +341,60 @@ export declare class HistoryScene {
      * Called on every render; a scan happens only when the window actually changed — its length,
      * its oldest seq or its newest seq — because those are the only ways a durable window moves.
      *
+     * The key is what decides that, and the caller may read it from the raw snapshot instead of from
+     * the events ({@link windowKeyOfSnapshot}): the whole point is that a render which changed
+     * nothing must not copy the window to find out. When no key is given, the events' own identity
+     * is used, which is what a caller that already materialized them wants.
+     *
      * Silent on purpose: this runs while a tree is rendering, and the scene it rebuilds is read
      * by that same render. Nothing is announced, because nothing has been asked for yet.
      *
      * @param events - the durable window, oldest first.
+     * @param key - the window's identity; defaults to the identity of `events`.
      * @returns true when this call rebuilt the index.
      */
-    window(events: readonly DurableEvent[]): boolean;
+    window(events: readonly DurableEvent[], key?: string): boolean;
+    /**
+     * Note a window that only **grew**, and index the growth instead of the window.
+     *
+     * The log is append-only: a page landing at the older end adds events, and a Turn settling adds
+     * events, but neither changes one event already indexed. So there is nothing to re-read — the only
+     * honest work is the new events, which is what this does. It is the difference between a hundred
+     * thousand events re-scanned per page and five hundred.
+     *
+     * The caller must be sure the window really is the old one plus these ranges (see
+     * `durableEventsOutside`); anything else is a different window and belongs in {@link window}.
+     *
+     * @param older - events older than everything indexed, ascending.
+     * @param newer - events newer than everything indexed, ascending.
+     * @param key - the window's new identity.
+     * @returns true when this call re-cut the scene (it always does; the shape mirrors `window`).
+     */
+    windowGrew(older: readonly DurableEvent[], newer: readonly DurableEvent[], key: string): boolean;
+    /** The seq range the index covers, for a caller that can tell growth from a different window. */
+    get windowBounds(): {
+        oldest: number;
+        newest: number;
+    } | undefined;
+    /** Durable events the index holds, for the caller's growth check. */
+    get indexedCount(): number;
+    /**
+     * Drop the scenes and re-cut the reader's screen.
+     *
+     * Scenes belong to the window that produced them, so they go — but the *steps* they were
+     * assembled from do not: their keys are seq versions, so a page landing costs the new ground and
+     * the screen the reader is on comes back from the step cache.
+     */
+    private recut;
+    /**
+     * The identity of the window this scene is holding, or undefined before the first
+     * {@link window}.
+     *
+     * Read by the render path to answer "did the window move?" without copying it — the comparison
+     * the scene used to make *after* `durableEvents` had already walked and sorted the whole
+     * session.
+     */
+    get indexKey(): string | undefined;
     /** The index for the window last noted, or undefined before the first {@link window}. */
     get currentIndex(): SceneIndex | undefined;
     /** The scene last produced, or undefined when nothing has been demanded yet. */
@@ -261,5 +422,8 @@ export declare class HistoryScene {
     get blobStore(): BlobStore;
     /** Cut, replay and memoise one scene. Notifies nobody: the caller decides what that means. */
     private replay;
+    /** Remember one step's replay, evicting the least recently added when the cache is full. */
+    private remember;
     private notify;
 }
+export {};

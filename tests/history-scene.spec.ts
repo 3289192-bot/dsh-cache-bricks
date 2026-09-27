@@ -266,7 +266,10 @@ describe('cutting a scene', () => {
 
   it('returns nothing rather than everything when the demand names nothing the window holds', () => {
     const index = indexEvents(windowOf(2, 3))
-    expect(sceneSlice(index, { turns: [{ turn: 99, fromStep: 1, toStep: 9 }] })).toEqual({ events: [], spans: 0, attempts: 0 })
+    // A caller caching per step keys on the carried seqs and the first seq the demand named, so the
+    // empty slice reports them even when it holds nothing.
+    expect(sceneSlice(index, { turns: [{ turn: 99, fromStep: 1, toStep: 9 }] }))
+      .toEqual({ events: [], carried: [], firstSeq: 0, spans: 0, attempts: 0 })
     expect(sceneSlice(index, { turns: [] }).events).toEqual([])
   })
 })
@@ -325,6 +328,120 @@ describe('the scene cache', () => {
     expect(again.cached).toBe(true)
     expect(again.key).toBe(first.key)
     expect(scene.scene?.key).toBe(first.key)
+  })
+
+  it('takes the window\'s identity from its caller, and skips the scan when it has not moved', () => {
+    const scene = new HistoryScene({ sessionId: 'cheap-key' })
+    // A key read from the raw snapshot, before the events were ever materialized. This is what the
+    // render path does: ask the window about itself, and only pay for the copy when it moved.
+    expect(scene.indexKey).toBeUndefined()
+    expect(scene.window(events, 'rev7|20|1|114')).toBe(true)
+    expect(scene.indexKey).toBe('rev7|20|1|114')
+    expect(scene.stats.windows).toBe(1)
+    // The same key, different events: the caller was told the window did not move, so this must not
+    // rescan — the scan is the cost the key exists to avoid.
+    expect(scene.window([header(0), ...events], 'rev7|20|1|114')).toBe(false)
+    expect(scene.stats.windows).toBe(1)
+    expect(scene.window([header(0), ...events], 'rev8|21|0|114')).toBe(true)
+    expect(scene.stats.windows).toBe(2)
+  })
+
+  it('counts what it was asked for, and how much of the log each replay was handed', () => {
+    const scene = new HistoryScene({ sessionId: 'stats' })
+    scene.window(events)
+    const demand = { turns: [{ turn: 10, fromStep: 1, toStep: 6 }] }
+    scene.demand(demand)
+    // A demand is a demand; a replay is what it cost. A scene is assembled out of its **steps**, so
+    // a cold screen is one replay per step it covers (six here), and each of those is handed that
+    // step's own bracket plus the sticky facts — never the window it was cut from.
+    expect(scene.stats.demands).toBe(1)
+    expect(scene.stats.windows).toBe(1)
+    expect(scene.stats.replays).toBe(6)
+    expect(scene.stepStats.misses).toBe(6)
+    expect(scene.stepStats.hits).toBe(0)
+    expect(scene.stats.cached).toBe(0)
+    expect(scene.stats.sliceEvents).toBeGreaterThan(0)
+    expect(scene.stats.sliceEvents).toBeLessThan(events.length)
+    expect(scene.stats.replayMs).toBeGreaterThanOrEqual(0)
+    // Asking again is answered from the scene memo, and costs nothing at all.
+    scene.demand(demand)
+    expect(scene.stats.demands).toBe(2)
+    expect(scene.stats.cached).toBe(1)
+    expect(scene.stats.replays).toBe(6)
+    expect(scene.stepStats.misses).toBe(6)
+  })
+
+  it('replays only the steps a scene does not already hold, and says the same thing either way', () => {
+    // The proof that a step is a fact and not a slice artefact: a scene assembled from cached steps
+    // must be *identical* to the same scene replayed from the window in one go.
+    const whole = new HistoryScene({ sessionId: 'cold' })
+    whole.window(events)
+    const fresh = whole.demand({ turns: [{ turn: 8, fromStep: 1, toStep: 6 }] })!
+    const cold = new HistoryScene({ sessionId: 'cold' })
+    cold.window(events)
+    const first = cold.demand({ turns: [{ turn: 1, fromStep: 1, toStep: 6 }, { turn: 2, fromStep: 1, toStep: 6 }, { turn: 3, fromStep: 1, toStep: 6 }] })!
+    const missesAfterFirst = cold.stepStats.misses
+    // Three Turns of overlap and three of new ground: the overlap must not be replayed.
+    const second = cold.demand({ turns: [{ turn: 3, fromStep: 1, toStep: 6 }, { turn: 4, fromStep: 1, toStep: 6 }, { turn: 5, fromStep: 1, toStep: 6 }] })!
+    // Six steps of overlap, twelve of new ground: the shared Turn is reused, the new Turns are
+    // replayed — and nothing else is. Before the step cache the whole eighteen were replayed.
+    expect(cold.stepStats.hits).toBe(6)
+    expect(cold.stepStats.misses - missesAfterFirst).toBe(12)
+    // Both screens cover eighteen steps; what changed is that six of the second screen's steps were
+    // already replayed, so only twelve were replayed again.
+    expect(first.spans).toBe(18)
+    expect(second.spans).toBe(18)
+    const oneShot = new HistoryScene({ sessionId: 'cold' })
+    oneShot.window(events)
+    const reference = oneShot.demand({ turns: [{ turn: 3, fromStep: 1, toStep: 6 }, { turn: 4, fromStep: 1, toStep: 6 }, { turn: 5, fromStep: 1, toStep: 6 }] })!
+    expect(second.feed.bricks.map(meaning)).toEqual(reference.feed.bricks.map(meaning))
+    expect(second.feed.endedTurns).toEqual(reference.feed.endedTurns)
+    void fresh
+  })
+
+  it('answers a re-visited screen from the step cache after the scene memo has dropped it', () => {
+    const scene = new HistoryScene({ sessionId: 'revisit', maxScenes: 1 })
+    scene.window(events)
+    const first = scene.demand({ turns: [{ turn: 3, fromStep: 1, toStep: 6 }] })!
+    // A different screen evicts the first from the scene LRU — but not from the step cache.
+    scene.demand({ turns: [{ turn: 12, fromStep: 1, toStep: 6 }] })
+    const missesAfterOther = scene.stepStats.misses
+    const again = scene.demand({ turns: [{ turn: 3, fromStep: 1, toStep: 6 }] })!
+    expect(again.cached).toBe(false)
+    expect(scene.stepStats.misses).toBe(missesAfterOther)
+    expect(scene.stepStats.hits).toBeGreaterThanOrEqual(6)
+    expect(again.feed.bricks.map(meaning)).toEqual(first.feed.bricks.map(meaning))
+  })
+
+  it('keeps a step valid when the window grows at the older end', () => {
+    const scene = new HistoryScene({ sessionId: 'grow' })
+    scene.window(events)
+    const demand = { turns: [{ turn: 15, fromStep: 1, toStep: 6 }] }
+    const before = scene.demand(demand)!
+    const missesBefore = scene.stepStats.misses
+    // A page lands: the index is rebuilt, the scenes are dropped, and every step of this screen
+    // still has the same bracket and the same header — so none of them is replayed.
+    const grown = [header(0), context(-1), ...events]
+    expect(scene.window(grown)).toBe(true)
+    const after = scene.demand(demand)!
+    expect(scene.stepStats.misses).toBe(missesBefore)
+    expect(after.feed.bricks.map(meaning)).toEqual(before.feed.bricks.map(meaning))
+  })
+
+  it('replays a step again when the header that governs it changes', () => {
+    const scene = new HistoryScene({ sessionId: 'version' })
+    scene.window(events)
+    const demand = { turns: [{ turn: 4, fromStep: 1, toStep: 3 }] }
+    scene.demand(demand)
+    const missesBefore = scene.stepStats.misses
+    // A *different* header in force before the demanded Turn is a different meaning for the same
+    // events, so the step's version changes and it has to be replayed. The window has to change
+    // shape to be re-read at all — an edit in place is invisible to the window's identity, which is
+    // the point of keying on the window rather than on a revision counter.
+    const changed = [{ ...header(0), data: { ...header(0).data, reason: 'resume' } }, ...events.slice(1)]
+    expect(scene.window(changed, 'window-with-a-resumed-header')).toBe(true)
+    scene.demand(demand)
+    expect(scene.stepStats.misses).toBeGreaterThan(missesBefore)
   })
 
   it('re-cuts the reader\'s screen when the window changes underneath it', () => {
@@ -390,6 +507,62 @@ describe('the scene cache', () => {
  * too little (a brick on screen stays untyped), and asking differently for every row of scroll
  * (a replay per wheel notch, and a scene that never settles).
  */
+describe('indexing a window that only grew', () => {
+  it('reads the growth, not the window, and lands exactly where a full scan would', () => {
+    const small = windowOf(6, 3)
+    const grown = windowOf(7, 3)
+    const lastSeq = small[small.length - 1]!.seq
+    const newer = grown.filter((event) => event.seq > lastSeq)
+    // A page landing at the older end: a Turn before anything already indexed.
+    const older: DurableEvent[] = []
+    turn(older, { at: -30 }, { turn: 0, steps: 2, kind: () => 'text' })
+
+    const deltas = new HistoryScene({ sessionId: 'grown' })
+    deltas.window(small, 'w1')
+    const whole = new HistoryScene({ sessionId: 'grown' })
+    whole.window([...older, ...small, ...newer], 'w2')
+
+    expect(deltas.windowGrew(older, newer, 'w2')).toBe(true)
+    // The index behind the growth is the index a full scan of the same window would have built —
+    // every step, both carried-seq lists, every turn end, and both ends of the range.
+    expect(deltas.indexedCount).toBe(older.length + small.length + newer.length)
+    expect(deltas.stats.windowDeltas).toBe(1)
+    expect(deltas.stats.windows).toBe(1)
+    expect(deltas.stats.indexDeltaEvents).toBe(older.length + newer.length)
+    expect(deltas.stats.indexDeltaEvents).toBeLessThan(deltas.indexedCount)
+    expect(deltas.windowBounds).toEqual({ oldest: older[0]!.seq, newest: newer[newer.length - 1]!.seq })
+    for (let turnNumber = 0; turnNumber <= 7; turnNumber += 1) {
+      for (let step = 1; step <= 4; step += 1) {
+        expect(deltas.currentIndex?.spanAt(turnNumber, step)).toEqual(whole.currentIndex?.spanAt(turnNumber, step))
+      }
+    }
+    // Same mapping, whatever order the two scans happened to insert it in: a prepend learns the
+    // older turn ends after the newer ones, and that is not part of the index's contract.
+    const ends = (index: SceneIndex | undefined): [number, number][] =>
+      [...(index?.turnEnds ?? [])].map(([turn, seq]) => [turn, seq]).sort((left, right) => left[0] - right[0])
+    expect(ends(deltas.currentIndex)).toEqual(ends(whole.currentIndex))
+    expect(deltas.currentIndex?.headerSeqs).toEqual(whole.currentIndex?.headerSeqs)
+    expect(deltas.currentIndex?.contextSeqs).toEqual(whole.currentIndex?.contextSeqs)
+    expect(deltas.currentIndex?.spanCount).toBe(whole.currentIndex?.spanCount)
+  })
+
+  it('re-cuts the reader\'s screen from steps, so a page landing replays nothing already read', () => {
+    const small = windowOf(6, 3)
+    const scene = new HistoryScene({ sessionId: 'page' })
+    scene.window(small, 'w1')
+    scene.demand({ turns: [{ turn: 4, fromStep: 1, toStep: 3 }] })
+    const missesBefore = scene.stepStats.misses
+    const older: DurableEvent[] = []
+    turn(older, { at: -30 }, { turn: 0, steps: 2, kind: () => 'text' })
+    scene.windowGrew(older, [], 'w2')
+    const after = scene.demand({ turns: [{ turn: 4, fromStep: 1, toStep: 3 }] })!
+    // The window moved, so the scene was re-cut — but every step of it was already known.
+    expect(scene.stepStats.misses).toBe(missesBefore)
+    expect(scene.stepStats.hits).toBeGreaterThanOrEqual(3)
+    expect(after.feed.bricks.length).toBeGreaterThan(0)
+  })
+})
+
 describe('planning a scene from the viewport', () => {
   const metrics = (columns: number, rows: number): BoardMetrics => ({ width: BRICK_W, height: BRICK_H, gap: GAP, columns, rows })
   const board = (length: number, steps: number, endStep = 40): BoardColumn[] => Array.from({ length }, (_, index) => ({

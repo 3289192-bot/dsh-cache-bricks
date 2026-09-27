@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 // The renderer owns the `ctx.slots` registry this half registers into; the other
 // two supply the node contract and the chat-store/selector face it reads.
@@ -14,13 +14,15 @@ import type { Brick } from './tetris'
 import { locateResultOf, type RevealOutcome } from './reveal'
 import { BrickFeedClient } from './feed'
 import { BrickPanel, type JumpReport, type RawKind, type TranscriptState } from './panel'
-import { boardFromReadings, boardFromSources, type BoardData, type StepReading } from './bricks'
+import { BoardWorld, type BoardData, type StepReading } from './bricks'
 import {
-  durableEvents, ensureTurnTranscriptLoaded, HistoryPager, loadRequestForTurn, onWindowChange, readTranscript,
-  resolveHistoricalStep, sessionFaceOf,
+  durableEventsOf, durableEventsOutside, ensureTurnTranscriptLoaded, HistoryPager, loadRequestForTurn, logRawPayload,
+  onWindowChange, readTranscript, resolveHistoricalStep, sessionFaceOf, windowKeyOfSnapshot,
+  type LogRawKind,
   type LoadReport, type LoadRequest, type SessionFace,
 } from './navigation'
 import { HistoryScene, type SceneDemand } from './history-scene'
+import { replayBlobPuts, replayBlobPutsSkipped } from '../core/replay'
 import { diffBricks } from '../shared/diff'
 import type { BrickFeed, BrickRecord } from '../shared/brick'
 
@@ -31,6 +33,9 @@ import type { BrickFeed, BrickRecord } from '../shared/brick'
  * package this plugin deliberately does not depend on (it never imports it at
  * runtime), so the shape is restated here instead.
  */
+/** The raw kinds a replayed brick's payloads can be read out of the log for. */
+const LOG_RAW_KINDS: readonly string[] = ['stream', 'replay', 'header']
+
 type ChatSelector = <T>(selector: (snapshot: ChatSnapshot) => T) => T
 
 /** The session seat delivers the Chat store selector (ui-chat's SessionStandardProps). */
@@ -119,6 +124,53 @@ function historySceneOf(sessionId: string | undefined): HistoryScene | undefined
 /** The session face for this board's session, resolved fresh on every call. */
 function faceFor(sessionId: string | undefined): SessionFace | undefined {
   try { return sessionFaceOf(ctxRef.current?.get('sessions'), sessionId) } catch { return undefined }
+}
+
+/**
+ * How often the render path asked about the session window, and how often the answer was "it
+ * moved, copy it".
+ *
+ * `asked` counts renders of this component; `materialized` counts the ones that had to walk and
+ * sort the durable window. The gap between them is the whole point of asking the snapshot for its
+ * revision first: a panel opening, a tab switching, a notice timing out — none of those move the
+ * window, and none of them may pay for it. Read-only, for the verification scripts.
+ */
+const windowNotes = { asked: 0, materialized: 0, deltas: 0 }
+
+/**
+ * Hand the scene the window the session holds now, at the price of one comparison.
+ *
+ * `durableEvents` copies and sorts the entire window, and this runs on **every** render — a
+ * selection, a tab switch, a transcript read, the scene the board just asked for. So the window is
+ * asked about itself first: its own revision counter, plus its ends and its length
+ * ({@link windowKeyOfSnapshot}), says whether anything moved, and only a window that moved is worth
+ * materializing. The scene still decides by its exact key, so a cheap key that over-reports costs
+ * one index rebuild — never a stale one.
+ *
+ * @param scene - the scene service for this session.
+ * @param face - the session face, when the core publishes one.
+ * @returns true when this call rebuilt the scene's index.
+ */
+function noteWindow(scene: HistoryScene, face: SessionFace | undefined): boolean {
+  const snapshot = face?.eventSource?.getSnapshot()
+  if (snapshot === undefined) return false
+  windowNotes.asked += 1
+  const key = windowKeyOfSnapshot(snapshot)
+  if (scene.indexKey === key) return false
+  windowNotes.materialized += 1
+  // A log is append-only, so most window changes are *growth*: a page landed at the older end, or a
+  // Turn settled at the newer one. Then there is nothing to re-read — ask the snapshot for what it
+  // holds outside the range the index already covers, and prove it is the whole difference by
+  // counting (`indexed + older + newer === total`). Anything else is a different window.
+  const bounds = scene.windowBounds
+  if (bounds !== undefined) {
+    const { older, newer, total } = durableEventsOutside(snapshot, bounds)
+    if (scene.indexedCount + older.length + newer.length === total) {
+      windowNotes.deltas += 1
+      return scene.windowGrew(older, newer, key)
+    }
+  }
+  return scene.window(durableEventsOf(snapshot), key)
 }
 
 /**
@@ -316,8 +368,7 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
   refreshScene.current = () => {
     const scene = historySceneOf(sessionId)
     if (scene === undefined) return
-    const face = faceFor(sessionId)
-    if (face !== undefined) scene.window(durableEvents(face))
+    noteWindow(scene, faceFor(sessionId))
     scene.refresh()
   }
   pagerRef.current ??= new HistoryPager(undefined)
@@ -400,6 +451,29 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
     setNotice(undefined)
     boardRef.current = board
     board.start()
+    // The one place a browser check can count what a pan cost. A pan asks the data layer for a
+    // scene, the data layer replays a slice of the log, and React re-renders the board from it —
+    // all of it invisible in the DOM, which is why `scripts/test-scroll.mjs` used to be able to
+    // assert the *shape* of a long board and nothing about the price of moving it. The handle
+    // answers with the current numbers and nothing else: read-only, and read by nothing in the
+    // plugin. See `docs/verification.md`.
+    const handle = globalThis as { __dshCacheBricksStats?: () => unknown }
+    handle.__dshCacheBricksStats = () => ({
+      board: boardRef.current?.stats,
+      scene: historySceneRef?.scene.stats,
+      // The step cache is where a re-visited screen is answered from (see `HistoryScene.stepStats`):
+      // `hits` should move on a pan back over ground already covered, and `misses` should not.
+      steps: historySceneRef?.scene.stepStats,
+      window: { ...windowNotes },
+      // The float pan the view is showing against the whole-cell pan the DOM is painted at: the
+      // difference is what the motion plane is carrying, in cells.
+      motion: boardRef.current?.motionState,
+      // What the data layer cost: a pan should move `columnsRebuilt` and nothing else.
+      world: worldRef.current?.world.stats,
+      // Raw payload hashing: a scene replay is lazy, so `hashes` must stay flat while `skipped`
+      // grows — the bytes are still in the log, read on demand (`logRawPayload`).
+      raw: { hashes: replayBlobPuts(), skipped: replayBlobPutsSkipped() },
+    })
     return () => {
       boardRef.current = undefined
       board.dispose()
@@ -412,25 +486,38 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
   // A feed that answered with anything used to replace the history outright, so resuming an
   // old session dropped every brick older than the collector — and the bricks it dropped were
   // the ones that had a type and a row to go to. See `boardFromSources`.
-  const readings = readingsOf(turns)
+  //
+  // Both the fold and the merge are memos, and that is a *drag* concern: `useChat` memoizes its
+  // selection, so `turns` keeps its identity across every render the chat store did not cause —
+  // which is every render a pan causes. Without the memos each of those re-read the whole fold and
+  // rebuilt the whole board, handed the board a **new** columns array, and so forced a repaint
+  // whose tallest-column memo had just been invalidated. A drag would then cost O(session) per
+  // frame no matter how little of it the board draws.
+  const readings = useMemo(() => readingsOf(turns), [turns])
   const live = feed !== undefined && feed.sessionId === sessionId ? feed : undefined
   // Note the window the session holds now; the scan happens only when it moved, and the scene
   // for the reader's last screen is re-cut silently so this render never sees a stale one.
-  if (scene !== undefined) {
-    const face = faceFor(sessionId)
-    if (face !== undefined) scene.window(durableEvents(face))
-  }
+  if (scene !== undefined) noteWindow(scene, faceFor(sessionId))
   const replayed = scene?.scene?.feed
-  const data: BoardData = live === undefined && replayed === undefined
-    ? boardFromReadings(readings)
-    : boardFromSources({
+  // One world per session, kept outside the memo: a scene change is a *patch* to it, not a rebuild.
+  // The memo below still runs when a source changes — that is the point — but the work it does is
+  // now the scene (plus the columns it touched), where it used to be the whole session.
+  const worldRef = useRef<{ sessionId: string | undefined; world: BoardWorld } | undefined>(undefined)
+  if (worldRef.current === undefined || worldRef.current.sessionId !== sessionId) {
+    worldRef.current = { sessionId, world: new BoardWorld() }
+  }
+  const world = worldRef.current.world
+  const data: BoardData = useMemo(
+    () => world.board({
       ...(live === undefined ? {} : { live }),
       ...(replayed === undefined ? {} : { replay: replayed }),
       readings,
-    })
+    }),
+    [world, live, replayed, readings],
+  )
 
   useEffect(() => {
-    boardRef.current?.setColumns(data.columns, data.titles, data.aux)
+    boardRef.current?.setColumns(data.columns, data.titles, data.aux, data.tallest)
     // The notice is for a board that is *entirely* folded, where "one brick per step,
     // no attempt telemetry" is true of every brick. In a mixed board the claim is per
     // brick — the restored ones are drawn dashed — so a whole-board notice would lie.
@@ -534,7 +621,15 @@ function CacheBricksBoard(props: CacheBricksBoardProps): ReactElement | null {
                 : kind === 'stream'
                   ? record.raw.streamRef
                   : record.raw.replayRef
-        if (ref === undefined) return
+        if (ref === undefined) {
+          // No ref means nothing was hashed for this brick — a replayed one (see `raw: 'lazy'`).
+          // Its payloads are the session's own events, so read the one that was asked for.
+          const face = faceFor(sessionId)
+          const value = LOG_RAW_KINDS.includes(kind) ? logRawPayload(face, record, kind as LogRawKind) : undefined
+          if (value === undefined || selectedRef.current !== record.identity.id) return
+          setRaw((current) => ({ ...current, [kind]: value }))
+          return
+        }
         const key = record.identity.id
         void feedClientRef.current?.blob(ref).then((value) => {
           if (selectedRef.current !== key) return

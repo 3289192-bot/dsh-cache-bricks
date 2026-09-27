@@ -11,6 +11,28 @@
 > (1.7.2-a, `historical-step`), and history had no type because the log was read by a poorer reader
 > than the live path (1.7.2-c, `src/core/replay.ts`).
 
+## 0.1.4-e
+
+Two checks guard what a reader sees while a request is in flight, both new here because the suite runs
+with `prefers-reduced-motion: reduce` by default and had never exercised either.
+
+**A brick drops when it is born, and drops again when it settles.** The check turns motion on, builds
+a one-request world, and records the brick frame by frame across two pushes: a draft (settlement
+`running`) and then the same attempt settled. It asserts both drops lift the brick (13 px or more
+above its resting row, animating) and that *every* frame of *both* animations names `transform` and no
+layout property. Reproduced by hand from the same recorder:
+
+```
+START  : +0ms  S:40001:1:0  0.0%  top=774  anim 420ms
+         +416ms S:40001:1:0  0.0%  top=789  -
+SETTLE : +5ms  S:40001:1:0 90.0%  top=774  anim 420ms
+```
+
+**The dashed next-cell ghost rides the plane.** It has to be a child of the cache plane (first child,
+so a brick landing in that cell paints over it), be drawn while a Turn is in flight, sit inside the
+grid box on the cell it names, keep its dashed edge, and animate no position property of its own —
+its motion is the plane's.
+
 ## 0.1.4 — history as a scene
 
 One change of shape on top of 0.1.3, and one defect it closes.
@@ -79,7 +101,7 @@ Verification on this release:
 ### Measured on the running instance
 
 The instance was moved from the 0.1.3 tarball to the 0.1.4 tarball with the official command
-(`dsh plugin --profile web add file:…/dsh-cache-bricks-0.1.4.tgz`, `DSH_HOME=<path-to-DSH-home>`),
+(`dsh plugin --profile web add file:…/dsh-cache-bricks-0.1.4.tgz`, `DSH_HOME=/path/to/dsh-home`),
 and **the host half did not change**: `lib/index.js` is byte-identical between the two releases
 (`e164496c5884051a`), only `lib/client.js` differs. The served bundle is content-hash versioned
 (`plugins/??…dsh-cache-bricks/client.js&rev=…`), so a page refresh picks the new client up and the
@@ -110,6 +132,255 @@ now asks for them, and the ask has an exit, but the paging is bounded by the run
 page and by `hasMore`. The inspector's own hydration is unchanged in this release: a brick on
 screen is exact, its raw payload still comes from the collector's blob endpoint when that process
 captured it.
+
+## 0.1.4.d — the fall keeps its old motion on the new property
+
+One change of *timing*, on top of 0.1.4.c. 0.1.4.b moved motion from `bottom`/`right` transitions to
+`transform` — the right change, since transitions on layout properties re-ran style recalc and layout
+on every frame of every animation — but it took the old *numbers* with it: the fall became 260 ms,
+`cubic-bezier(.35,.9,.4,1)`, from one row pitch up, with a 1 px settle. A 36×15 brick arriving in
+~105 ms reads as a hop; 0.1.4's own motion was 420 ms of `cubic-bezier(.45,.02,.95,.55)` from one
+brick-height up, which is slow to start and accelerates into the landing.
+
+The two properties interpolate identically, so the fix is to write the old numbers on the new
+property — no mechanism changes, and nothing about the work changes either.
+
+**Measured, both builds, by seeking the animation** (`Animation.currentTime`, so the page's frame
+production cannot distort the curve) and reading the brick's visual top:
+
+| time (ms) | 0.1.4 (`bottom` transition) | 0.1.4.d (`transform` animation) |
+|---|---|---|
+| 0 | 15.0 px above the cell | 15.0 |
+| 50 | 14.8 | 14.8 |
+| 100 | 14.3 | 14.3 |
+| 150 | 13.3 | 13.3 |
+| 200 | 12.3 | 12.3 |
+| 250 | 11.0 | 11.0 |
+| 300 | 8.9 | 8.9 |
+| 350 | 6.7 | 6.8 |
+| 400 | 3.8 | 3.8 |
+| 415 | 2.4 | 2.4 |
+
+Maximum difference 0.1 px; duration, easing and the last frame of movement are identical. The new
+Turn slides on 260 ms `ease-out` again (one cell, 39 px → 0), and a new Turn still costs
+`LayoutCount +1` / `RecalcStyleCount +1` against 0.1.4's +100 / +101.
+
+Verification on this release:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **439 unit tests passing, 3 skipped**;
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `node scripts/test-scroll.mjs` — **81/81** (0.1.4.c's 79 plus 2). The suite runs with
+  `prefers-reduced-motion: reduce`, which is why the fall and the slide had never been exercised:
+  the new section asks for motion with `page.emulateMedia`, drives one brick and one Turn, and
+  asserts the clock, the curve and the trajectory by seeking the animation.
+
+## 0.1.4.c — the data layer stops rebuilding the session
+
+One change of *shape* on top of 0.1.4.b, in four places, each of which was O(history) where the
+screen is O(viewport). No brick, contract, colour or window decision changed.
+
+**The defect.** The board is a window and the pan is arithmetic, but the data layer re-derived the
+session whenever the screen moved: `boardFromSources` re-folded every reading and rebuilt every
+Turn's column; the scene cache held three whole scenes and was dropped whenever the window changed;
+`indexEvents` re-scanned every loaded event when one page arrived; and every replayed stream, tool
+result and header was canonicalized and SHA-256'd into the blob store for a brick nobody had asked
+to inspect.
+
+**The change.**
+
+- **A world, patched rather than rebuilt** (`bricks.ts`, `BoardWorld`): a base from the fold
+  (rebuilt only when the fold itself changes — the streaming rate, not the pan rate), an exact
+  overlay applied per scene, and a live overlay skipped entirely when the collector's feed is the
+  object it already was. Only the Turns whose content changed are rebuilt; `order` is materialized
+  on demand; the tallest column is handed to the board instead of re-measured per patch.
+  `boardFromSources` is now the one-shot form of the same code.
+- **A step is a fact** (`history-scene.ts`): the step cache keys a finished step by its bracket and
+  the header/context in force, and a scene is assembled out of steps. Neighbouring screens share
+  their overlap, a re-read is a lookup, and a window change does not invalidate any of it.
+- **A page landing indexes the page** (`SceneIndexBuilder`, `durableEventsOutside`): the log is
+  append-only, so growth is extended rather than re-scanned, and the caller proves the window only
+  grew (`indexed + older + newer === total`) instead of assuming it.
+- **Raw payloads are lazy** (`core/replay.ts` `raw: 'lazy'`, `navigation.ts` `logRawPayload`): a
+  scene replay makes no `put` calls at all. The bytes are the session's own events, so a reader who
+  opens a brick's raw view is handed the payload by seq at that moment — no hashing needed to show
+  bytes, and the panel says "read from the log" instead of drawing the payload as absent.
+
+Verification on this release:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **439 unit tests passing, 3 skipped**, 25 files (0.1.4.b's 430 plus 9: the world's
+  merge rules, the step cache's four facts, the growth check, and the lazy replay's two);
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `pnpm run test:scroll` — **79/79** in Chromium with React 18 (0.1.4.b's 73 plus 6), including a
+  drag over fresh scenes that must hash **no** raw payloads and the re-read that must replay no step;
+- `DSH_BENCH=1 pnpm exec vitest run tests/index-cost.spec.ts` — 120,000 events indexed, then a
+  6,000-event page: **13.1 ms full rescan against a 2.72 ms delta**, and the delta's index equals the
+  one a full scan builds, step for step.
+
+**What is *not* claimed.** The world's `columns` array is still copied per patch (one pointer copy of
+the Turn list, ~0.1 ms at ten thousand Turns), and the window's events array is copied when a page
+prepends (the residue in the delta's 2.72 ms). Both are bounded by the session's *length in Turns*,
+not by its payloads, and neither grows with what a page or a scene adds.
+
+## 0.1.4.b — motion moves to the compositor
+
+One change of *animation model* on top of 0.1.4.a. The brick contract, the scene model, the data
+model, the colour rule and every window decision are untouched: the data layer still knows whole
+cells, and each brick still carries its resting cell in `right`/`bottom`.
+
+**The defect.** 0.1.4.a fixed what a pan *costs* and left how it *moves* alone. A drag was rounded
+to whole cells, so the board stepped `0 → 1 → 2` rather than following the pointer; and every
+position was animated by transitioning `right`/`bottom` (plus `height`/`top` on the host), which are
+layout properties — so each frame of each animation re-ran style recalc and layout, on a hundred
+bricks at once. The fixture measured what that meant for the most ordinary animation the board has:
+
+| a new Turn arrives (one new column) | 0.1.4.a | 0.1.4.b |
+|---|---|---|
+| `LayoutCount` | **+102** | **+1** |
+| `RecalcStyleCount` | **+103** | **+1** |
+
+**The change.** Motion is one `translate3d` on a **motion plane** per face:
+
+- **a pan follows the pointer by the pixel.** The pointer's own fraction of a cell is what the plane
+  carries; the whole cells it crosses are the only thing the grid is ever rewritten for, and that
+  rewrite is invisible by construction (the slabs move one cell in layout, the plane gives exactly
+  that cell back in transform, in the same frame);
+- **a release settles.** 130 ms, `cubic-bezier(.2,.8,.2,1)`, from at most half a brick away — the
+  nearest whole cell is committed first, and only the remainder animates;
+- **a new Turn flips one plane**, and a **new brick animates its own transform** (260 ms, 1 px
+  settle). The host's `height`/`top` transition is gone: the box is a boundary, and the bricks are
+  anchored to the floor, so a taller band moves none of them;
+- **the rail thumb** is positioned by `translateX`/`translateY` from the same float pan, so the
+  handle, the board and the pointer are one number rather than three a frame apart;
+- **the ring.** One extra column and one extra row are painted outside the window on every side,
+  clipped by the face and never interactive or announced (`motionCell` in `tetris.ts`, unit-tested),
+  so a plane carrying up to a whole cell cannot expose an edge;
+- **the invariant**, pinned by a check: no element in the board transitions
+  `top`/`left`/`right`/`bottom`/`width`/`height`. `will-change: transform` is set for the length of
+  a gesture or a hand-off and cleared after it.
+
+Verification on this release:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **424 unit tests passing, 2 skipped**, 24 files (0.1.4.a's 420 plus 4: the motion
+  ring's three facts, and the pan clamp that keeps a fraction);
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `pnpm run test:scroll` — **73/73** in Chromium with React 18 (0.1.4.a's 65 plus 8), and **67/73**
+  against the 0.1.4.a sources, which is where the eight new checks come from: one plane per face
+  with every brick riding its own side's plane, the no-position-transition invariant, a drag that
+  carries ten distinct sub-cell offsets in one direction, a release that lands on a whole cell with
+  the plane back at rest, a pan that writes the plane and the chrome rather than a hundred bricks,
+  a new Turn that slides the plane instead of re-laying-out the grid, and a ring that is painted
+  outside the grid and never offered to the reader;
+- `node scripts/check-contract-drift.mjs` — no contract member dropped against the installed
+  0.1.7-rc.2 cores.
+
+**What is *not* claimed.** The drag's `LayoutCount` is not zero: a whole cell crossed is a whole
+cell painted, and the fixture's drag is deliberately brutal (each 16 px move crosses ~83 cells). The
+claim is the ratio — one layout per commit and two style writes per frame, against one layout and a
+hundred brick writes per commit — and the new-Turn number above, which is 102 : 1. Nor is the board
+compositor-only: the ring's cells are real DOM, and a commit is real layout. What is gone is
+*animating* layout.
+
+## 0.1.4.a — the drag stops materializing
+
+One change of *timing* on top of 0.1.4, with no change to the brick contract, the scene model, the
+data model or the colour rule. The defect it closes was found by reading the code path rather than
+by a test — every existing check passed while the board was un-draggable on a long session, because
+they all asserted the *shape* of the window (≤ 400 slabs, ten visible Turns, oldest Turn as cheap as
+the newest) and none of them asserted the *price of moving it*.
+
+**The defect.** A drag painted a window and panned by arithmetic, but each painted frame also cut a
+new scene, and answering that scene ran inside the frame that asked for it: `replaySession` over the
+slice, then a full React render of the board from the replay, synchronously, on the input thread.
+Two more session-scale costs sat in the same render: `durableEvents` copied and sorted the whole
+durable window only for `window()` to answer "it did not move", and `readingsOf` + `boardFromSources`
+rebuilt the entire board and handed `setColumns` a fresh array, which invalidated the board's
+tallest-column memo and bought one more paint.
+
+**The fix.** `syncScene` parks the demand while a hand-driven pan is in flight and sends it when the
+pan ends (`PAN_RELEASE_MS` = 80 ms after a release); `windowKeyOfSnapshot` reads the runtime's own
+window `revision` (plus the entry count and the durable ends as a fallback) so a render that changed
+nothing materializes nothing; `readingsOf` and `boardFromSources` are memos, and `setColumns` ignores
+an array it already holds. See `docs/history-scene.md`, "The pan does not materialize".
+
+**The new dimension in the browser fixture.** `scripts/test-scroll.mjs` gained nine checks (56 → 65)
+that count instead of timing, because a headless frame budget says more about the machine than about
+the board. The counters come from `window.__dshCacheBricksStats` — a read-only handle published by
+`client/index.tsx`, exposing the board's `{demands, deferred, flushed}` and the scene's
+`{windows, demands, cached, replays, sliceEvents, replayMs}`. A build that does not publish the handle
+fails the check rather than passing silently. The load-bearing one needs no counters at all: a render
+of the board calls `useChat`, so the fixture counts renders by counting those calls.
+
+**The same drag, both builds.** 2,000 Turns of durable history (22,000 events), a 2,000-Turn board,
+one drag of half the rail's travel in 120 pointer moves, counters read while the pointer is still
+down, then again 500 ms after release:
+
+| check | 0.1.4 | 0.1.4.a |
+|---|---|---|
+| `a drag re-renders the board zero times while the pointer is down` | **FAIL** — renders 4 → 125 | PASS — 0 |
+| `a drag asks the data layer for nothing while the pointer is down` | FAIL (no counters published) | PASS — 0 asks |
+| `the scenes the drag crossed were deferred, not dropped` | FAIL — deferred 0 | PASS — 22 deferred |
+| `the scene the drag landed on is materialized once, on release` | FAIL — flushed 0 | PASS — 1 flushed, ≤ 2 replays |
+| `the scene replay is handed a slice of the log, not the log` | FAIL | PASS — a slice ≤ ⅛ of the window |
+| totals | **59/65**, six failures | **65/65** |
+
+The 0.1.4 column is the same script run against the 0.1.4 sources in this worktree
+(`git stash push -- src/`, rebuild, run, restore): the fixture reports 121 board renders for 120
+pointer moves, i.e. one scene replay and one full board rebuild **per move**, which is the reader's
+"drag it and the whole history goes past again".
+
+Verification on this release:
+
+- `pnpm run typecheck` clean;
+- `pnpm test` — **420 unit tests passing, 2 skipped**, 24 files (0.1.4's 413 plus 7: the snapshot key
+  and its four ways of moving, the externally supplied window key, and the scene's counters);
+- `pnpm run verify:host` — all checks passed on the built artifact;
+- `pnpm run test:scroll` — **65/65** in Chromium with React 18 (0.1.4's 56 plus 9), and **59/65**
+  against the 0.1.4 sources, which is what makes the nine new checks evidence rather than decoration;
+- `node scripts/check-contract-drift.mjs` — no contract member dropped against the installed
+  0.1.7-rc.2 cores.
+
+**What is *not* claimed.** The counters are not a profiler: they say how often the board asked and
+how much it was handed, not how long a frame took. The frame check in the fixture is a guard rail
+(no stall over 250 ms), not a benchmark. And the deferred scene means a pan shows fold-typed bricks
+until one quiet window after the hand stops — a deliberate trade, recorded here rather than hidden.
+
+### Measured on the running instance
+
+The instance was moved from the 0.1.4 tarball to the 0.1.4.a tarball with the official command
+(`dsh plugin --profile web add file:…/dsh-cache-bricks-0.1.4-a.tgz`, `DSH_HOME=/path/to/dsh-home`),
+and **the host half did not change**: `lib/index.js` is byte-identical to 0.1.4
+(`2b86ca456d0f4c0ae61e…`) — the whole release is `lib/client.js` (`a3ebf968bddf2af0…`, 134,326 B
+against 132,491 B). The running server was not restarted (same PID), and the installed client bundle
+matches this worktree's build byte for byte.
+
+`scripts/live-scene-verify.mjs` was extended with the same property, measured on the real thing —
+counters instead of milliseconds, so a slow machine cannot pass or fail it:
+
+```
+session-c8330ba4… (41 bricks replayed from the log, pan limit 8)
+  ✓ a real drag asks the data layer for nothing while the pointer is down
+  ✓ the scene the drag landed on is materialized once, when the pointer comes up
+  · pan cost: 9 scenes deferred, 1 replays for the gesture
+  ✓ the drag really moved the window
+  ✓ opening a brick re-renders the board without copying the session window
+session-3ca0d08a… (9 live · 31 replayed, pan limit 7)
+  ✓ a real drag asks the data layer for nothing while the pointer is down
+  ✓ the scene the drag landed on is materialized once, when the pointer comes up
+  · pan cost: 8 scenes deferred, 1 replays for the gesture
+```
+
+That is the whole gesture on a real session: 8–9 scene cuts parked while the hand moved, **one**
+materialization and **one** log replay for the release, and a panel opening that re-rendered the
+board without walking the window. On a build without the counters the script says so and judges
+nothing — it does not report a pass it did not measure.
+
+**Not observable on this instance:** a drag whose scenes outnumber the session's own history. Every
+session here is narrower than one scene (the ten visible columns plus ten either side), so the
+fixture's 2,000-Turn board remains the place where the old per-frame cost is *shown* to be gone —
+the live run confirms the mechanism, not the scale.
 
 ## 0.1.3 — a landing you can see
 
@@ -476,7 +747,7 @@ instance http://127.0.0.1:18090 · session session-58aa2f08…
   ✓ a output brick lights up too, and settles back
   ✓ the card turns back to the readings
   · census: 86 settled bricks on the board — 35 with a row, 0 needing a group opened, 0 with no visible artifact at all
-  · 51 brick(s) are behind history the chat has not loaded yet: session-58aa2f08-bf51-47c9-a278-b874bb5e5fcf:21:1:0, session-58aa2f08-bf51-47c9-a278-b874bb5e5fcf:21:2:0, session-58aa2f08-bf51-47c9-a278-b874bb5e5fcf:21:3:0
+  · 51 brick(s) are behind history the chat has not loaded yet: session-example:21:1:0, session-example:21:2:0, session-example:21:3:0
   ✓ every settled brick that produced something can be reached: a row, or a log position to load through
   ✓ there are settled bricks on the board whose row is already visible
   · sampling 2 brick(s) that need history loaded first
@@ -491,7 +762,7 @@ instance http://127.0.0.1:18090 · session session-58aa2f08…
   ✓ the transcript tab waits to be asked, and says what it will read
   ✓ reading the conversation never scrolls the chat (ready)
   ✓ reading the conversation leaves the chat where it was
-  ✓ the transcript tab reads the log, not the DOM: labelled verbatim blocks (session-58aa2f08-bf51-47c9-a278-b874bb5e5fcf:21:1:0)
+  ✓ the transcript tab reads the log, not the DOM: labelled verbatim blocks (session-example:21:1:0)
   ✓ the assistant block holds the text the log committed for this step
 
 all checks passed

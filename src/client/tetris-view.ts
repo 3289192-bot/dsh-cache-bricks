@@ -57,6 +57,9 @@ import {
   newestTurnOf,
   railGeometry,
   tallestColumn,
+  clampPan,
+  countNewerThan,
+  motionCell,
   windowCell,
   type BoardColumn,
   type BoardFace,
@@ -109,11 +112,71 @@ const GRID_LEFT = RAIL
 /** How far the edge fade reaches into the grid, in CSS pixels. */
 const FADE = 9
 
-/** The brick transition: gravity on the way down, a shorter slide when the stack shifts left. */
-const SLAB_TRANSITION = 'bottom 420ms cubic-bezier(.45,.02,.95,.55), right 260ms ease-out'
+/**
+ * The one rule this board's animation layer follows: **nothing animates a position property.**
+ *
+ * A brick used to slide by transitioning `bottom` and `right`, and the board grew by transitioning
+ * `height` and `top`. All four are layout properties: every frame of every animation re-ran style
+ * recalc and layout on the main thread, and a pan made a hundred bricks do it at once. Motion now
+ * lives on **one plane per face** as a `translate3d`, so the compositor can carry it and the layout
+ * is written once per logical change (a whole cell crossed) instead of once per frame.
+ *
+ * `opacity`, `background` and the flip's `rotateY` are unaffected: none of them is a position.
+ */
+const SLAB_TRANSITION = 'none'
+
+/** Extra cells painted outside the window, so a fractional pan never exposes an edge. */
+const MOTION_RING = 1
+
+/** How long the board takes to settle onto the whole cell it was released nearest to. */
+const SNAP_MS = 130
+
+/**
+ * How long the whole board takes to slide one cell when a new Turn arrives while following.
+ *
+ * 260 ms and `ease-out` are the numbers the stack shifted with before there was a plane: a Turn
+ * arriving moved every brick one cell to the left with `right 260ms ease-out`. The plane moves the
+ * same distance with the same clock, so the arrival reads exactly as it always did.
+ */
+const TURN_SLIDE_MS = 260
+
+/** The easing a new Turn's slide uses: the `right 260ms ease-out` of the falling-stack board. */
+const TURN_SLIDE_EASE = 'ease-out'
+
+/**
+ * How long one new brick takes to fall into its cell, and the curve it falls on.
+ *
+ * These are 0.1.4's own numbers, kept deliberately: the brick used to *spawn* one brick-height
+ * above its cell (`bottom: bottom + metrics.height`) and transition down over 420 ms on
+ * `cubic-bezier(.45,.02,.95,.55)` — a slow start and an accelerating finish, which is what a small
+ * 36x15 brick dropping into a stack should feel like. The animation now runs on `transform` (one
+ * element, compositor) instead of `bottom` (every element, layout), which is the only thing that
+ * changed: same distance, same clock, same curve, same absence of a bounce.
+ */
+const FALL_MS = 420
+/** The fall's animation id, so a settled brick replaces its birth fall rather than stacking one. */
+const FALL_ID = 'cache-bricks-fall'
+
+/** The fall's curve: accelerate into the landing, stop dead. 0.1.4's `bottom` transition exactly. */
+const FALL_EASE = 'cubic-bezier(.45,.02,.95,.55)'
+
+/** One easing for every hand-off the board makes itself: fast out, soft landing, no spring. */
+const MOTION_EASE = 'cubic-bezier(.2,.8,.2,1)'
 
 /** How long a hand-driven pan keeps the bricks from animating their own moves, in milliseconds. */
 const PAN_QUIET_MS = 200
+
+/**
+ * How long after a release the pan is treated as over, in milliseconds.
+ *
+ * The quiet window above outlives the gesture: it exists so a drag does not make every brick
+ * animate its own slide. The *scene* waits for the same window, and a reader who let go of the
+ * rail should not wait 200 ms for the bricks on screen to get their exact type. A release is the
+ * one moment the window can honestly be cut short — nothing is moving any more — and the extra
+ * 20 ms {@link CacheTetrisBoard.endPanSoon} adds on top is enough for the last frame of the drag
+ * to paint and report the window the reader actually landed on.
+ */
+const PAN_RELEASE_MS = 80
 
 /**
  * Narrowest a colour slice may get, in CSS pixels.
@@ -176,8 +239,41 @@ function createLayer(face: BoardFace): HTMLDivElement {
     right: '0',
     bottom: '0',
     backfaceVisibility: 'hidden',
+    // The face **is** the grid box. The motion ring is painted just outside it, and clipping here
+    // is what keeps a fractional pan from showing a brick in the rail strip beside the grid.
+    overflow: 'hidden',
   } satisfies Partial<CSSStyleDeclaration>)
   return layer
+}
+
+/**
+ * The plane one face's bricks ride on.
+ *
+ * Every position a reader watches move — a pan, the slide when a new Turn arrives — is written
+ * here, once, as a `translate3d`. A hundred bricks move because their plane moved, not because a
+ * hundred elements each re-ran layout: `transform` is a compositor property, so the browser can
+ * carry the motion without asking the main thread for style, layout or paint on every frame.
+ * The bricks inside keep their own resting geometry in whole cells, which is what the data layer
+ * understands and what the DOM-based checks read.
+ *
+ * The lane does **not** ride this plane: it belongs to no Turn and to no place on the time axis,
+ * so a pan moves Turns past it rather than moving it.
+ *
+ * @param face - which side of the card this plane belongs to.
+ * @returns the plane element.
+ */
+function createPlane(face: BoardFace): HTMLDivElement {
+  const plane = document.createElement('div')
+  plane.dataset.cacheBricksPlane = face
+  Object.assign(plane.style, {
+    position: 'absolute',
+    top: '0',
+    left: '0',
+    right: '0',
+    bottom: '0',
+    transform: 'translate3d(0px, 0px, 0)',
+  } satisfies Partial<CSSStyleDeclaration>)
+  return plane
 }
 
 /**
@@ -443,6 +539,11 @@ interface SlabEntry {
   bottom: number
   /** True until the first resting position is applied, so it falls into place. */
   falling: boolean
+  /**
+   * True while this cell is motion ring: painted just outside the grid so a plane carrying a
+   * fraction of a cell never exposes an edge, and therefore never interactive or announced.
+   */
+  ring: boolean
   /** The pointer is on this brick. */
   hovered: boolean
   /** The activity face is currently painted at full strength. */
@@ -554,6 +655,9 @@ export class CacheTetrisBoard {
   private rotator: HTMLDivElement | undefined
   private cacheLayer: HTMLDivElement | undefined
   private typeLayer: HTMLDivElement | undefined
+  /** The plane each face's bricks ride on: the single element any smooth motion is written to. */
+  private cachePlane: HTMLDivElement | undefined
+  private typePlane: HTMLDivElement | undefined
   /** The flip control, outside the rotator so it never turns with the card. */
   private chip: HTMLButtonElement | undefined
   /** The auxiliary lane's dashed rule and its `SYS` label. */
@@ -605,10 +709,21 @@ export class CacheTetrisBoard {
    * new Turns arriving and pushed the reader further into the past on every page.
    */
   private lastNewestTurn: number | undefined
-  /** The last scene demand sent, so a paint inside the same scene sends nothing. */
+  /** The last scene the last paint *saw*, so a paint inside the same scene asks for nothing. */
   private sceneKey: string | undefined
+  /** The last scene actually handed to the data layer, so a deferred demand is sent once. */
+  private sentSceneKey: string | undefined
+  /**
+   * The scene a pan deferred, if the hand moved the window after the last one was sent.
+   *
+   * A drag cuts a new scene every few pixels; see {@link CacheTetrisBoard.syncScene} for why the
+   * demand is parked here instead of being sent.
+   */
+  private pendingScene: { key: string; demand: SceneDemand } | undefined
   /** Tallest column, remembered per content array: a repaint must not rescan the session. */
   private tallestCache: { columns: readonly BoardColumn[]; tallest: number } | undefined
+  /** The tallest column the data layer already measured for these columns, when it passed one. */
+  private tallestHint: { columns: readonly BoardColumn[]; tallest: number } | undefined
   /** The window of the last paint: what the rails describe and what a drag moves. */
   private view: BoardWindow | undefined
   /** The pointer drag in flight on a rail, if any. */
@@ -625,9 +740,38 @@ export class CacheTetrisBoard {
   } | undefined
   /** A brick to focus once the next paint has placed it, for arrows that pan the window. */
   private revealKey: string | undefined
+  /**
+   * What this board asked the data layer for, and what the pan did with the asking.
+   *
+   * A pan's cost is a *timing* property: nothing in the DOM says how many times the board asked
+   * for a scene, and no headless run can be trusted to measure milliseconds. These three numbers
+   * are what a browser check can hold the board to — a gesture in flight asks for nothing
+   * (`deferred`), a gesture that ended asks exactly once (`flushed`), and a gesture that never
+   * moved the window asks for neither. Read by `scripts/test-scroll.mjs` and
+   * `scripts/live-scene-verify.mjs` through the read-only handle in `index.tsx`; nothing in the
+   * plugin reads them.
+   */
+  readonly stats = { demands: 0, deferred: 0, flushed: 0 }
   /** Until this timestamp a hand-driven pan is in flight, so slabs must not animate. */
   private panUntil = 0
   private panTimer: number | undefined
+  /**
+   * The float pan the *view* is showing, in cells, and the whole-cell pan the DOM is painted at.
+   *
+   * The data layer only ever sees whole cells; the difference between the two is what the motion
+   * plane carries, in pixels. A drag moves `target` every frame and commits `painted` only when a
+   * whole cell has been crossed (see {@link CacheTetrisBoard.stepMotion}), so the grid is written
+   * once per cell instead of once per pointer event, and the reader sees every pixel in between.
+   */
+  private motionTarget: BoardScroll | undefined
+  private motionPainted: BoardScroll | undefined
+  private motionFrame: number | undefined
+  /** The hand-off animations: the snap after a release, the slide when a new Turn arrives. */
+  private snapAnim: Animation | undefined
+  private slideAnim: Animation | undefined
+  /** The last rail inputs, kept so a motion frame can move the thumb with the board. */
+  private railX: { track: number; viewport: number; content: number } | undefined
+  private railY: { track: number; viewport: number; content: number } | undefined
   private frame: number | undefined
   private settle: number | undefined
   private trailing: number | undefined
@@ -813,10 +957,22 @@ export class CacheTetrisBoard {
    * @param titles - hover text by brick key.
    * @param aux - auxiliary bricks, oldest first; shown in the lane above the columns.
    */
-  setColumns(columns: readonly BoardColumn[], titles: Map<string, string>, aux: readonly Brick[] = []): void {
+  setColumns(
+    columns: readonly BoardColumn[],
+    titles: Map<string, string>,
+    aux: readonly Brick[] = [],
+    tallest?: number,
+  ): void {
+    // Identity, not equality: the data layer hands back the very arrays it built for the last
+    // scene when nothing changed (see the memo in `index.tsx`), and a repaint of identical
+    // content costs a full measure pass over the transcript — the thing a drag must not pay.
+    if (columns === this.columns && titles === this.titles && aux === this.aux) return
     this.columns = columns
     this.titles = titles
     this.aux = aux
+    // The tallest column, when the caller measured it while building these columns: a patch that
+    // replaced fifty Turns must not make the board rescan ten thousand (see `tallestOf`).
+    this.tallestHint = tallest === undefined ? undefined : { columns, tallest }
     this.schedule(true)
   }
 
@@ -847,6 +1003,8 @@ export class CacheTetrisBoard {
     if (this.trailing !== undefined) window.clearTimeout(this.trailing)
     if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
     this.drag = undefined
+    this.pendingScene = undefined
+    this.cancelMotion()
     this.cancelPendingClick()
     ++this.navigationGeneration
     this.clearHighlight?.()
@@ -948,7 +1106,11 @@ export class CacheTetrisBoard {
       // The card needs a vanishing point of its own; 1000px turns a ~200px board
       // like a card rather than bending it like a fisheye.
       perspective: '1000px',
-      transition: 'height 200ms ease-out, top 200ms ease-out',
+      // The host's box is a *boundary*, not an animation: `top`/`height` are layout properties, so
+      // a transition on them re-runs layout on every frame of every fit change. The bricks are
+      // anchored to the floor, so a taller band moves none of them — there is nothing to ease, and
+      // the chrome that does move is written once, exactly.
+      transition: 'none',
     } satisfies Partial<CSSStyleDeclaration>)
     host.setAttribute('role', 'group')
     host.setAttribute('aria-label', 'Cache brick board: one brick per model request, newest task on the right')
@@ -969,6 +1131,10 @@ export class CacheTetrisBoard {
 
     const cacheLayer = createLayer('cache')
     const typeLayer = createLayer('type')
+    const cachePlane = createPlane('cache')
+    const typePlane = createPlane('type')
+    cacheLayer.append(cachePlane)
+    typeLayer.append(typePlane)
     // The type side starts facing away: the card rests on its cache side.
     typeLayer.style.transform = 'rotateY(180deg)'
     rotator.append(cacheLayer, typeLayer)
@@ -1036,6 +1202,8 @@ export class CacheTetrisBoard {
     this.rotator = rotator
     this.cacheLayer = cacheLayer
     this.typeLayer = typeLayer
+    this.cachePlane = cachePlane
+    this.typePlane = typePlane
     this.chip = chip
     this.hRail = horizontal.rail
     this.hThumb = horizontal.thumb
@@ -1116,6 +1284,9 @@ export class CacheTetrisBoard {
       if (rail.hasPointerCapture(event.pointerId)) rail.releasePointerCapture(event.pointerId)
       rail.style.cursor = 'grab'
       thumb.style.background = 'rgba(148, 163, 184, 0.5)'
+      // The hand is off: settle onto the nearest whole cell, then let the deferred scene go.
+      this.settleMotion()
+      this.endPanSoon()
     }
     rail.addEventListener('pointerup', finish)
     rail.addEventListener('pointercancel', finish)
@@ -1222,16 +1393,27 @@ export class CacheTetrisBoard {
     this.setFace(toggledFace(this.face))
   }
 
-  /** Mirror the cache layer into the type layer, so the card has a back. */
+  /**
+   * Mirror the cache side into the type side, so the card has a back.
+   *
+   * The two sides are copies of the same cells, so the copy has to reproduce the *structure* as
+   * well: a Turn's bricks ride the plane (they pan), the lane's bricks sit on the layer (they do
+   * not), and a ring cell stays ring on both sides. Mirrored by hand rather than by re-painting,
+   * because the paint that would do it reads `this.face`, which is still the old side at this point.
+   */
   private buildTypeLayer(): void {
+    const plane = this.typePlane
     const layer = this.typeLayer
     const metrics = this.metrics
-    if (layer === undefined || metrics === undefined) return
-    layer.replaceChildren()
+    if (plane === undefined || layer === undefined || metrics === undefined) return
+    plane.replaceChildren()
+    // The plane is the layer's only non-brick child, and it has to survive the reset.
+    layer.replaceChildren(plane)
     this.slabs.type.clear()
     for (const [key, source] of this.slabs.cache) {
-      const entry = this.createSlab(source.brick, metrics, 'type', source.right, source.bottom, false, !this.isPanning())
-      layer.append(entry.element)
+      const entry = this.createSlab(source.brick, metrics, 'type', source.right, source.bottom, false, source.ring)
+      if (source.element.parentElement === this.cachePlane) plane.append(entry.element)
+      else layer.append(entry.element)
       this.slabs.type.set(key, entry)
     }
     this.applyInteractivity()
@@ -1249,9 +1431,11 @@ export class CacheTetrisBoard {
     for (const face of FACES) {
       const active = face === this.face
       for (const entry of this.slabs[face].values()) {
-        entry.element.style.pointerEvents = active ? 'auto' : 'none'
-        entry.element.tabIndex = active ? 0 : -1
-        if (active) entry.element.removeAttribute('aria-hidden')
+        // The ring is painted, not offered: it is outside the grid, so it takes no pointer, no
+        // tab stop and no announcement even on the face the reader is looking at.
+        entry.element.style.pointerEvents = active && !entry.ring ? 'auto' : 'none'
+        entry.element.tabIndex = active && !entry.ring ? 0 : -1
+        if (active && !entry.ring) entry.element.removeAttribute('aria-hidden')
         else entry.element.setAttribute('aria-hidden', 'true')
       }
     }
@@ -1359,7 +1543,7 @@ export class CacheTetrisBoard {
     const want = this.neighbourOf(from, key)
     if (want === undefined) return false
     for (const [candidate, live] of this.slabs[this.face]) {
-      if (live.turn === want.turn && live.step === want.step && candidate !== from.key) {
+      if (!live.ring && live.turn === want.turn && live.step === want.step && candidate !== from.key) {
         live.element.focus()
         return true
       }
@@ -1421,51 +1605,60 @@ export class CacheTetrisBoard {
     // leave the pan alone. Adding the delta of `columns.length` used to push the reader further
     // into the past every time a page landed.
     this.scroll = heldScroll(this.scroll, this.columns, this.lastNewestTurn)
+    const previousNewest = this.lastNewestTurn
     this.lastNewestTurn = newestTurnOf(this.columns)
     const view = boardWindow(this.columns, metrics, this.scroll, this.aux.length > 0, this.tallestOf(this.columns))
     this.view = view
     // Landing back on the live corner resumes following, so the next brick arrives in view.
     if (this.scroll !== undefined && view.scroll.back === 0
       && view.scroll.up === liveScroll(this.columns, view.limit).up) this.scroll = undefined
-    // A pan is a hand-driven move of the whole window: the bricks must not animate their
-    // own slide while it happens, or the board would lag a drag by the drop animation.
-    const smooth = !this.isPanning()
     const lane = view.lane
     const seen = new Set<string>()
     const newestIndex = this.columns.length - 1
     // The cache side is canonical and always kept current; the type side is only
     // kept current while it is the one showing.
     const faces = this.face === 'type' && this.typeLayer !== undefined ? FACES : (['cache'] as const)
-    // Only the cells inside the window are visited. The window states its own index range
+    // Only the cells inside the window are visited, plus the motion ring: one extra column and row
+    // on every side, painted outside the grid box (the face clips them) so a plane carrying up to a
+    // whole cell never exposes an edge. The range states its own index range
     // (`BoardWindow.columnStart`/`rowStart`), so a paint costs the viewport — a thousand-column
     // session and a fifty-thousand-column one draw the same number of bricks per frame.
-    for (let index = view.columnStart; index < view.columnEnd; index += 1) {
-      const column = this.columns[index]!
-      const lastRow = Math.min(column.bricks.length, view.rowEnd)
-      for (let row = view.rowStart; row < lastRow; row += 1) {
-        // A brick outside the window is not drawn at all: the board is a window, and a
+    for (let index = view.columnStart - MOTION_RING; index < view.columnEnd + MOTION_RING; index += 1) {
+      const column = this.columns[index]
+      if (column === undefined) continue
+      const lastRow = Math.min(column.bricks.length, view.rowEnd + MOTION_RING)
+      for (let row = Math.max(0, view.rowStart - MOTION_RING); row < lastRow; row += 1) {
+        // A brick outside the window and its ring is not drawn at all: the board is a window, and a
         // brick the pan moved out is neither visible nor focusable nor announced. The range
         // already guarantees this; the check is kept because it is the single definition of
         // "inside", and the range is asserted against it in the unit tests.
-        const cell = windowCell(newestIndex - index, row, view.lead, view.scroll, metrics.columns, view.limit)
+        const cell = motionCell(newestIndex - index, row, view.lead, view.scroll, metrics.columns, view.limit, MOTION_RING)
         if (cell === undefined) continue
         const brick = column.bricks[row]!
         const key = brick.key
         seen.add(key)
         const { right, bottom } = cellPlacement(metrics, cell.column, cell.row)
+        const ring = cell.column < 0 || cell.column > metrics.columns - 1 || cell.row < 0 || cell.row > view.limit - 1
         for (const face of faces) {
           const layer = this.layerOf(face)
           const existing = layer.get(key)
           if (existing === undefined) {
-            // A brick only falls on the side the user is looking at; the hidden
-            // copy is built at rest, ready for the next turn of the card.
-            const entry = this.createSlab(brick, metrics, face, right, bottom, face === this.face && smooth, smooth)
+            // A brick only falls on the side the user is looking at, and never while the hand is
+            // moving the board: a pan that reveals new cells is not a drop.
+            const entry = this.createSlab(brick, metrics, face, right, bottom, face === this.face && !this.isPanning(), ring)
             layer.set(key, entry)
-            this.layerElement(face).append(entry.element)
+            this.planeElement(face).append(entry.element)
+            if (entry.falling && !ring) this.fallIn(entry, metrics)
             continue
           }
+          // The second drop of a brick's life: it was on screen as a draft (the dashed box above
+          // it promising the next cell), and the settlement has just landed. Repaint it, then let
+          // it fall the same way it was born — the reading arriving is the moment the reader is
+          // waiting for, and 0.1.4 marked it with motion. Only on the side being looked at, never
+          // while the hand is moving the board, and never for a cell the ring is holding off screen.
+          const settledNow = existing.brick.settled === false && brick.settled === true
           this.updateSlab(existing, brick, metrics)
-          this.syncTransition(existing, smooth)
+          this.markRing(existing, ring)
           if (existing.right !== right) {
             existing.right = right
             existing.element.style.right = `${String(right)}px`
@@ -1474,13 +1667,15 @@ export class CacheTetrisBoard {
             existing.bottom = bottom
             existing.element.style.bottom = `${String(bottom)}px`
           }
+          if (settledNow && !ring && face === this.face && !this.isPanning()) this.fallIn(existing, metrics)
         }
       }
     }
     // The lane: real requests that belong to no Turn, right-aligned like everything else and
     // capped by the board's width. Nothing is stacked — there is no step order to preserve —
     // and the lane is chrome at the window's top row, so panning moves Turns past it rather
-    // than moving it: it belongs to no Turn and therefore to no place on the time axis.
+    // than moving it: it belongs to no Turn and therefore to no place on the time axis. It is
+    // appended to the *layer*, not the plane, for exactly that reason.
     if (lane !== undefined) {
       const laneBricks = this.aux.slice(-metrics.columns)
       for (let index = 0; index < laneBricks.length; index += 1) {
@@ -1492,13 +1687,12 @@ export class CacheTetrisBoard {
           const layer = this.layerOf(face)
           const existing = layer.get(key)
           if (existing === undefined) {
-            const entry = this.createSlab(brick, metrics, face, right, bottom, false, smooth)
+            const entry = this.createSlab(brick, metrics, face, right, bottom, false, false)
             layer.set(key, entry)
             this.layerElement(face).append(entry.element)
             continue
           }
           this.updateSlab(existing, brick, metrics)
-          this.syncTransition(existing, smooth)
           if (existing.right === right && existing.bottom === bottom) continue
           existing.right = right
           existing.bottom = bottom
@@ -1514,6 +1708,13 @@ export class CacheTetrisBoard {
         entry.element.remove()
         layer.delete(key)
       }
+    }
+    // A new Turn while the board is following is one slide of the whole stack, not a hundred
+    // bricks each animating their own `right`: the bricks are already painted in their new cells,
+    // and the plane starts one cell to the right of that and animates home (see `slideIn`).
+    const newest = this.lastNewestTurn
+    if (this.scroll === undefined && previousNewest !== undefined && newest !== undefined && newest > previousNewest) {
+      this.slideIn(countNewerThan(this.columns, previousNewest), metrics)
     }
     this.syncLaneChrome(metrics, lane)
     this.syncGhost(host, metrics, view)
@@ -1542,6 +1743,19 @@ export class CacheTetrisBoard {
    * overscan on each axis, so panning inside a scene costs nothing and the next scene is already
    * warm by the time the reader gets there.
    *
+   * **A pan defers the wire.** A drag changes the scene every few pixels, and answering one
+   * demand is not free: the data layer replays the log for that slice and re-renders the board
+   * from it — synchronously, on the thread the pointer is being read on. Doing that per frame is
+   * what made a long session un-draggable, and it buys nothing a reader can use: nobody reads a
+   * brick's exact type while the board is flying past. So while a hand-driven pan is in flight
+   * the demand is *recorded* ({@link CacheTetrisBoard.pendingScene}) and sent once the pan ends,
+   * where "ends" is the same quiet window the bricks' own animation waits for
+   * ({@link CacheTetrisBoard.markPan}), shortened on release ({@link CacheTetrisBoard.endPanSoon}).
+   *
+   * The bricks do not wait for it: what is on screen is what the fold already gave the board, and
+   * the pan is pure geometry — every brick the reader pans past is drawn from data already in
+   * hand. Only the *exactness* of the bricks on screen arrives late, by one quiet window.
+   *
    * @param view - the window this paint is showing.
    * @param metrics - board geometry.
    */
@@ -1553,29 +1767,58 @@ export class CacheTetrisBoard {
       const plan = scenePlanOf(this.columns, view, metrics)
       if (plan.key !== this.sceneKey) {
         this.sceneKey = plan.key
-        onScene(plan.demand)
+        if (this.isPanning()) {
+          this.stats.deferred += 1
+          this.pendingScene = { key: plan.key, demand: plan.demand }
+        } else this.sendScene(plan.key, plan.demand)
       }
     }
+    // The pan is over (or was never on): whatever it deferred is materialized now, once.
+    if (!this.isPanning()) this.flushScene()
     if (onNeedOlder !== undefined && prefetchDue(view, metrics)) onNeedOlder()
+  }
+
+  /** Hand one scene to the data layer, and remember that it was this one. */
+  private sendScene(key: string, demand: SceneDemand): void {
+    this.stats.demands += 1
+    this.sentSceneKey = key
+    this.pendingScene = undefined
+    this.options.onScene?.(demand)
+  }
+
+  /**
+   * Materialize the scene the pan ended on, if the pan deferred one.
+   *
+   * Called from a paint, and only outside a pan. Sending the demand the pan already sent (a drag
+   * that came back to where it started) is a no-op: the data layer would answer with the scene it
+   * is already holding, and the round trip through React would be spent for nothing.
+   */
+  private flushScene(): void {
+    const pending = this.pendingScene
+    if (pending === undefined) return
+    this.pendingScene = undefined
+    if (pending.key === this.sentSceneKey) return
+    this.stats.flushed += 1
+    this.sendScene(pending.key, pending.demand)
   }
 
   /** The tallest column, measured once per content array rather than once per paint. */
   private tallestOf(columns: readonly BoardColumn[]): number {
-    if (this.tallestCache?.columns !== columns) {
-      this.tallestCache = { columns, tallest: tallestColumn(columns) }
-    }
-    return this.tallestCache.tallest
+    if (this.tallestCache?.columns === columns) return this.tallestCache.tallest
+    const hint = this.tallestHint
+    const tallest = hint !== undefined && hint.columns === columns ? hint.tallest : tallestColumn(columns)
+    this.tallestCache = { columns, tallest }
+    return tallest
   }
 
   /** Move the window, clamped to what the content allows right now. */
   private setScroll(back: number, up: number): void {
     const view = this.view
     if (view === undefined) return
-    const requested = clampScroll({ back, up }, view.limitScroll)
-    const live = liveScroll(this.columns, view.limit)
-    // Landing on the live corner resumes following, so the board keeps up with the session.
-    this.scroll = requested.back === 0 && requested.up === live.up ? undefined : requested
-    this.markPan()
+    // A pan that did not come from the rail (a wheel, a key, the live chip) lands on whole cells
+    // directly: there is no pointer to follow, so there is nothing for the plane to carry.
+    this.cancelMotion()
+    this.applyPan({ back, up })
     this.schedule(true)
   }
 
@@ -1600,10 +1843,44 @@ export class CacheTetrisBoard {
     return performance.now() < this.panUntil
   }
 
-  /** Keep a slab's animation in step with whether the window is being panned by hand. */
-  private syncTransition(entry: SlabEntry, smooth: boolean): void {
-    const wanted = smooth ? SLAB_TRANSITION : 'none'
-    if (entry.element.style.transition !== wanted) entry.element.style.transition = wanted
+  /**
+   * Bring the pan's quiet window to an early close, now that the pointer is up.
+   *
+   * The window exists for the *animation* (a pan must not make every brick animate its own
+   * slide) and the deferred scene waits on the same clock, so a reader who released the rail
+   * would otherwise stare at fold-typed bricks for another 200 ms. A release is the honest moment
+   * to end it early: one repaint after {@link PAN_RELEASE_MS}, by which time the last frame of
+   * the drag has painted the window the reader landed on, and the demand the drag deferred goes
+   * out from there.
+   *
+   * Does nothing when the drag deferred nothing, or when the ordinary quiet window ends sooner.
+   */
+  private endPanSoon(): void {
+    if (this.pendingScene === undefined) return
+    const until = performance.now() + PAN_RELEASE_MS
+    if (until >= this.panUntil) return
+    this.panUntil = until
+    if (this.panTimer !== undefined) window.clearTimeout(this.panTimer)
+    this.panTimer = window.setTimeout(() => {
+      this.panTimer = undefined
+      this.schedule(true)
+    }, PAN_RELEASE_MS + 20)
+  }
+
+  /**
+   * Mark a slab as ring or grid.
+   *
+   * The ring is real DOM — that is the point — but it is not part of the board the reader
+   * interacts with: it is clipped by the face, it takes no pointer, no focus and no announcement.
+   *
+   * @param entry - the slab.
+   * @param ring - whether its cell is outside the window.
+   */
+  private markRing(entry: SlabEntry, ring: boolean): void {
+    if (entry.ring === ring) return
+    entry.ring = ring
+    if (ring) entry.element.dataset.cacheBricksRing = ''
+    else delete entry.element.dataset.cacheBricksRing
   }
 
   /**
@@ -1653,6 +1930,13 @@ export class CacheTetrisBoard {
       furthest,
     }
     if (paged !== undefined) this.setScroll(base.back, base.up)
+    // The gesture starts from the pan on screen, and the planes stay on the compositor for as long
+    // as it lasts: `will-change` is set here and cleared on release, never left on globally.
+    this.motionPainted = { back: base.back, up: base.up }
+    this.motionTarget = { back: base.back, up: base.up }
+    if (this.cachePlane !== undefined) this.cachePlane.style.willChange = 'transform'
+    if (this.typePlane !== undefined) this.typePlane.style.willChange = 'transform'
+    this.applyDrag()
   }
 
   /** The pan an offset along the track stands for, with the thumb centred on the pointer. */
@@ -1663,21 +1947,171 @@ export class CacheTetrisBoard {
     return Math.round((1 - fraction) * furthest)
   }
 
-  /** Apply the drag in flight: whole cells, so the grid never lands between bricks. */
+  /** Apply the drag in flight: the pointer's own fraction of a cell, carried by the plane. */
   private applyDrag(): void {
     const drag = this.drag
-    if (drag === undefined) return
+    const metrics = this.metrics
+    const view = this.view
+    if (drag === undefined || metrics === undefined || view === undefined) return
     const horizontal = drag.axis === 'x'
     // The thumb follows the pointer **in track space**, not in brick pitches: dragging the
     // thumb to the end of its travel has to reach the end of the content, or the last Turns
-    // would be unreachable by drag. Whole cells, so the grid never lands between bricks.
+    // would be unreachable by drag.
     const moved = ((drag.to - drag.from) / drag.travel) * drag.furthest
-    const cells = Math.round(moved)
     // Dragging right/down moves towards the live corner, which is a smaller pan on both axes.
-    this.setScroll(
-      horizontal ? drag.base.back - cells : drag.base.back,
-      horizontal ? drag.base.up : drag.base.up - cells,
-    )
+    // No rounding: the fraction is what the reader sees move, and the whole cells it crosses are
+    // committed one at a time by `stepMotion`.
+    const wanted = clampPan({
+      back: horizontal ? drag.base.back - moved : drag.base.back,
+      up: horizontal ? drag.base.up : drag.base.up - moved,
+    }, view.limitScroll)
+    this.motionTarget = wanted
+    this.requestMotionFrame()
+  }
+
+  /**
+   * Settle the board onto the whole cell it was released nearest to.
+   *
+   * The plane is already mid-cell, so the hand-off is the *only* animation a release plays: at most
+   * half a brick of travel (39px across, 18px down — a whole cell is the worst case only when the
+   * reader stops exactly between two), 130ms, on the compositor. The logical pan moves to the
+   * nearest whole cell first, and the plane is set to the compensating offset in the same frame, so
+   * the commit is invisible and the animation only ever plays the remainder.
+   */
+  private settleMotion(): void {
+    const target = this.motionTarget
+    const metrics = this.metrics
+    if (target === undefined || metrics === undefined) {
+      this.motionTarget = undefined
+      this.motionPainted = undefined
+      return
+    }
+    const nearest = { back: Math.round(target.back), up: Math.round(target.up) }
+    const painted = this.motionPainted ?? nearest
+    if (nearest.back !== painted.back || nearest.up !== painted.up) {
+      this.motionPainted = nearest
+      this.commitPan(nearest)
+    }
+    const from = this.motionPixels(target, this.motionPainted ?? nearest, metrics)
+    const planes = [this.cachePlane, this.typePlane].filter((plane): plane is HTMLDivElement => plane !== undefined)
+    this.motionTarget = undefined
+    this.motionPainted = undefined
+    if (Math.abs(from.x) < 0.5 && Math.abs(from.y) < 0.5) {
+      this.endMotion('translate3d(0px, 0px, 0)')
+      return
+    }
+    if (prefersReducedMotion() || typeof Element.prototype.animate !== 'function') {
+      this.paintMotion(0, 0)
+      return
+    }
+    const fromTransform = `translate3d(${from.x.toFixed(2)}px, ${from.y.toFixed(2)}px, 0)`
+    const toTransform = 'translate3d(0px, 0px, 0)'
+    this.snapAnim = undefined
+    for (const plane of planes) {
+      plane.style.willChange = 'transform'
+      const animation = plane.animate(
+        [{ transform: fromTransform }, { transform: toTransform }],
+        { duration: SNAP_MS, easing: MOTION_EASE, fill: 'forwards' },
+      )
+      // One animation is enough to know when the hand-off is over; the last plane wins.
+      this.snapAnim = animation
+      animation.addEventListener('finish', () => {
+        if (this.snapAnim === animation) this.snapAnim = undefined
+        plane.style.willChange = 'auto'
+        plane.style.transform = toTransform
+        animation.cancel()
+        if (this.snapAnim === undefined) this.afterMotion()
+      }, { once: true })
+    }
+  }
+
+  /** Nothing is moving any more: hand the frames back to layout noise and the deferred scene. */
+  private afterMotion(): void {
+    this.schedule(true)
+  }
+
+  private endMotion(transform: string): void {
+    for (const plane of [this.cachePlane, this.typePlane]) {
+      if (plane === undefined) continue
+      plane.style.willChange = 'auto'
+      plane.style.transform = transform
+    }
+  }
+
+  /**
+   * Slide the whole board one cell to the left because a new Turn arrived while following.
+   *
+   * The bricks are already painted in their new cells; the plane starts a cell to the right of that
+   * and animates home, which is exactly the old position — one compositor animation instead of a
+   * hundred `right` transitions.
+   *
+   * @param cells - how many whole cells the stack shifted by.
+   * @param metrics - board geometry.
+   */
+  private slideIn(cells: number, metrics: BoardMetrics): void {
+    // Unconditional for the same reason as {@link fallIn}: this is the `right` transition 0.1.4
+    // ran on every brick of the stack, and it ran it whatever the reader's system asked for.
+    if (cells <= 0 || typeof Element.prototype.animate !== 'function') return
+    if (this.isMotionAnimating() || this.motionTarget !== undefined) return
+    const from = `translate3d(${String(cells * pitchX(metrics))}px, 0px, 0)`
+    for (const plane of [this.cachePlane, this.typePlane]) {
+      if (plane === undefined) continue
+      plane.style.willChange = 'transform'
+      plane.style.transform = from
+      const animation = plane.animate(
+        [{ transform: from }, { transform: 'translate3d(0px, 0px, 0)' }],
+        { duration: TURN_SLIDE_MS, easing: TURN_SLIDE_EASE, fill: 'forwards' },
+      )
+      this.slideAnim = animation
+      animation.addEventListener('finish', () => {
+        if (this.slideAnim === animation) this.slideAnim = undefined
+        plane.style.willChange = 'auto'
+        plane.style.transform = 'translate3d(0px, 0px, 0)'
+        animation.cancel()
+        if (this.slideAnim === undefined) this.afterMotion()
+      }, { once: true })
+    }
+  }
+
+  /** Drop every motion in flight and put the planes back at rest. */
+  private cancelMotion(): void {
+    if (this.motionFrame !== undefined) {
+      cancelAnimationFrame(this.motionFrame)
+      this.motionFrame = undefined
+    }
+    this.motionTarget = undefined
+    this.motionPainted = undefined
+    this.snapAnim?.cancel()
+    this.snapAnim = undefined
+    this.slideAnim?.cancel()
+    this.slideAnim = undefined
+    this.endMotion('translate3d(0px, 0px, 0)')
+  }
+
+  /** One new brick falls: animate **that brick**, on the compositor, and nothing else. */
+  private fallIn(entry: SlabEntry, metrics: BoardMetrics): void {
+    // No reduced-motion check here on purpose: 0.1.4 dropped every new brick with a `bottom`
+    // transition and never consulted the preference, so a reader whose system asks for reduce saw
+    // the drops — and a board that stops dropping reads as bricks appearing out of nowhere. The
+    // preference still silences the card flip, which is where 0.1.4 honoured it.
+    if (typeof Element.prototype.animate !== 'function') return
+    // One brick-height above the cell, which is where the brick used to spawn: `bottom` was written
+    // as `bottom + metrics.height` and the transition walked it home. Two keyframes and a curve,
+    // nothing else — no overshoot, because the old fall had none (see {@link FALL_MS}).
+    const drop = metrics.height
+    entry.element.style.willChange = 'transform'
+    // At most one fall per brick: a settled draft replaces its birth fall rather than composing
+    // two transforms onto the same element.
+    for (const running of entry.element.getAnimations()) {
+      if (running.id === FALL_ID) running.cancel()
+    }
+    const animation = entry.element.animate([
+      { transform: `translate3d(0px, ${String(-drop)}px, 0)` },
+      { transform: 'translate3d(0px, 0px, 0)' },
+    ], { duration: FALL_MS, easing: FALL_EASE, fill: 'none', id: FALL_ID })
+    animation.addEventListener('finish', () => {
+      entry.element.style.willChange = 'auto'
+    }, { once: true })
   }
 
   /**
@@ -1701,6 +2135,10 @@ export class CacheTetrisBoard {
     // free is part of the board and pans with it.
     const h = railGeometry(gridWidth, metrics.columns, this.columns.length + view.lead, view.scroll.back)
     const v = railGeometry(paneHeight, view.limit, view.tallest, view.scroll.up)
+    // Kept, not just measured: a motion frame moves the thumbs from these, so the rail, the board
+    // and the pointer are the same float number rather than three things a frame apart.
+    this.railX = { track: gridWidth, viewport: metrics.columns, content: this.columns.length + view.lead }
+    this.railY = { track: paneHeight, viewport: view.limit, content: view.tallest }
     this.applyRail('x', h, view.limitScroll.back, view.limitScroll.back - view.scroll.back, view.newer > 0 || view.older > 0
       ? `已回看 ${String(view.newer)} 轮，左侧还有 ${String(view.older)} 轮`
       : '已显示全部轮次')
@@ -1730,8 +2168,10 @@ export class CacheTetrisBoard {
     if (rail === undefined || thumb === undefined) return
     if (horizontal) thumb.style.width = `${String(geometry.thumb)}px`
     else thumb.style.height = `${String(geometry.thumb)}px`
-    if (horizontal) thumb.style.left = `${String(geometry.offset)}px`
-    else thumb.style.top = `${String(geometry.offset)}px`
+    // The thumb is positioned by `transform`, never by `left`/`top`: a rail that moved by layout
+    // while the board moved by compositor would visibly lag it by a frame (or a cell).
+    if (horizontal) thumb.style.transform = `translate3d(${String(geometry.offset)}px, 0, 0)`
+    else thumb.style.transform = `translate3d(0, ${String(geometry.offset)}px, 0)`
     rail.style.pointerEvents = geometry.scrollable ? 'auto' : 'none'
     rail.style.cursor = geometry.scrollable ? 'grab' : 'default'
     rail.style.opacity = geometry.scrollable ? '1' : '0.5'
@@ -1898,13 +2338,150 @@ export class CacheTetrisBoard {
     this.notice.style.display = this.estimated ? 'block' : 'none'
   }
 
-  /** The container element of one side. */
+  /** The plane one side's bricks live on: where every smooth motion is written. */
+  private planeElement(face: BoardFace): HTMLElement {
+    return face === 'cache' ? this.cachePlane! : this.typePlane!
+  }
+
+  /** The container element of one side (the plane's parent: the lane sits here, not on the plane). */
   private layerElement(face: BoardFace): HTMLElement {
     return face === 'cache' ? this.cacheLayer! : this.typeLayer!
   }
 
   /**
+   * Move the board to a fraction of a cell, in pixels, without touching the data layer.
+   *
+   * Both faces ride the same offset so the card turns over mid-motion without a jump. Called once
+   * per animation frame at most, and it writes exactly two style properties.
+   */
+  private paintMotion(x: number, y: number): void {
+    const transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`
+    if (this.cachePlane !== undefined) this.cachePlane.style.transform = transform
+    if (this.typePlane !== undefined) this.typePlane.style.transform = transform
+    this.paintThumbMotion()
+  }
+
+  /**
+   * What the view is showing against what the DOM is painted at, in cells.
+   *
+   * Read by the browser checks (`scripts/test-scroll.mjs`): the difference between the two is the
+   * fraction the motion plane is carrying, and it is the only way to tell "following the pointer"
+   * from "committed a whole cell and jumped" without timing anything.
+   */
+  get motionState(): { target: BoardScroll | undefined; painted: BoardScroll | undefined; plane: string } {
+    return {
+      target: this.motionTarget === undefined ? undefined : { ...this.motionTarget },
+      painted: this.motionPainted === undefined ? undefined : { ...this.motionPainted },
+      plane: this.cachePlane?.style.transform ?? '',
+    }
+  }
+
+  /** True while any hand-off animation (snap, slide) owns the planes. */
+  private isMotionAnimating(): boolean {
+    return this.snapAnim !== undefined || this.slideAnim !== undefined
+  }
+
+  /**
+   * Move both thumbs to the float pan, so the rail keeps up with the board between commits.
+   *
+   * The accessible value stays the whole cell (a scrollbar's value is a position, not a pixel), and
+   * it is written by the paint; what moves here is only where the handle is drawn.
+   */
+  private paintThumbMotion(): void {
+    const target = this.motionTarget
+    const painted = this.motionPainted
+    if (target === undefined || painted === undefined) return
+    const x = this.railX
+    if (x !== undefined && this.hThumb !== undefined) {
+      const geometry = railGeometry(x.track, x.viewport, x.content, target.back)
+      this.hThumb.style.transform = `translate3d(${String(geometry.offset)}px, 0, 0)`
+    }
+    const y = this.railY
+    if (y !== undefined && this.vThumb !== undefined) {
+      const geometry = railGeometry(y.track, y.viewport, y.content, target.up)
+      this.vThumb.style.transform = `translate3d(0, ${String(geometry.offset)}px, 0)`
+    }
+    void painted
+  }
+
+  /**
+   * The pixel offset a float pan stands for, given the pan the DOM is painted at.
+   *
+   * A larger pan moves the content left and down, so the offset is negative on both axes. This is
+   * the whole of the float/whole-cell translation, in one place.
+   */
+  private motionPixels(target: BoardScroll, painted: BoardScroll, metrics: BoardMetrics): { x: number; y: number } {
+    return {
+      x: -(target.back - painted.back) * pitchX(metrics),
+      y: -(target.up - painted.up) * pitchY(metrics),
+    }
+  }
+
+  /** Ask for one motion frame. Coalesced: a pointer that fires faster than the display costs one frame. */
+  private requestMotionFrame(): void {
+    if (this.disposed || this.motionFrame !== undefined) return
+    this.motionFrame = requestAnimationFrame(() => {
+      this.motionFrame = undefined
+      this.stepMotion()
+    })
+  }
+
+  /**
+   * One frame of a drag: commit whole cells, then carry the remainder on the plane.
+   *
+   * The commit is the only moment the grid is rewritten, and it is invisible by construction — the
+   * slabs move a whole cell in layout while the plane gives exactly that cell back in transform, so
+   * the pixels on screen do not move at all on the frame a cell is committed.
+   */
+  private stepMotion(): void {
+    const target = this.motionTarget
+    const metrics = this.metrics
+    if (target === undefined || metrics === undefined) return
+    const painted = this.motionPainted ?? target
+    // How many whole cells the view has moved past what the DOM shows.
+    const commit = {
+      back: Math.trunc(target.back - painted.back),
+      up: Math.trunc(target.up - painted.up),
+    }
+    if (commit.back !== 0 || commit.up !== 0) {
+      const next = { back: painted.back + commit.back, up: painted.up + commit.up }
+      this.motionPainted = next
+      this.commitPan(next)
+    }
+    const moved = this.motionPainted ?? target
+    const { x, y } = this.motionPixels(target, moved, metrics)
+    this.paintMotion(x, y)
+  }
+
+  /**
+   * Write a whole-cell pan and repaint on the spot.
+   *
+   * Unlike {@link setScroll} this does not schedule: a motion frame is already inside a frame, and
+   * scheduling would spend the *next* one on a paint the reader would see as a stutter.
+   */
+  private commitPan(pan: BoardScroll): void {
+    this.applyPan(pan)
+    if (!this.disposed && this.host !== undefined) this.paint()
+  }
+
+  /** Set the pan in force, keeping the "following the live end" rule in one place. */
+  private applyPan(pan: BoardScroll): void {
+    const view = this.view
+    if (view === undefined) return
+    const requested = clampScroll(pan, view.limitScroll)
+    const live = liveScroll(this.columns, view.limit)
+    // Landing on the live corner resumes following, so the board keeps up with the session.
+    this.scroll = requested.back === 0 && requested.up === live.up ? undefined : requested
+    this.markPan()
+  }
+
+  /**
    * Build one slab: a positioned brick on one side of the card.
+   *
+   * The element carries its **resting** cell in `right`/`bottom` and nothing else: no transition on
+   * either, ever (see {@link SLAB_TRANSITION}). Falling is an animation of the element's own
+   * `transform`, started by {@link CacheTetrisBoard.fallIn}, so the layout position is written once
+   * and the motion rides the compositor.
    *
    * @param brick - the brick to draw.
    * @param metrics - board geometry.
@@ -1912,8 +2489,7 @@ export class CacheTetrisBoard {
    * @param right - distance from the board's right edge.
    * @param bottom - distance from the board's floor.
    * @param falling - true when it should drop in from above the well.
-   * @param smooth - true when the slab should animate its own moves; false during a pan, when
-   *   every brick moves at once and the drop animation would read as lag.
+   * @param ring - true when this cell is motion ring: painted outside the grid, never interactive.
    * @returns the live entry, already wired to its gestures.
    */
   private createSlab(
@@ -1923,7 +2499,7 @@ export class CacheTetrisBoard {
     right: number,
     bottom: number,
     falling: boolean,
-    smooth: boolean,
+    ring: boolean,
   ): SlabEntry {
     const element = document.createElement('div')
     element.dataset.cacheBricksBrick = brick.key
@@ -1941,13 +2517,13 @@ export class CacheTetrisBoard {
       overflow: 'hidden',
       pointerEvents: 'auto',
       cursor: 'pointer',
-      // Gravity on the way down, a shorter slide when the stack shifts left.
-      transition: smooth ? SLAB_TRANSITION : 'none',
+      // Position properties are written, never animated: the plane and the brick's own transform
+      // are the only things that move (see the invariant at the top of the file).
+      transition: SLAB_TRANSITION,
     } satisfies Partial<CSSStyleDeclaration>)
     paintSlab(element, brick, face, metrics, false)
     element.style.right = `${String(right)}px`
-    // Spawn above the well so the first resting position is a fall.
-    element.style.bottom = `${String(falling ? bottom + metrics.height : bottom)}px`
+    element.style.bottom = `${String(bottom)}px`
 
     const entry: SlabEntry = {
       element,
@@ -1961,7 +2537,10 @@ export class CacheTetrisBoard {
       falling,
       hovered: false,
       lit: false,
+      ring: false,
     }
+    // One definition of "this cell is ring": the flag and the attribute are set together.
+    this.markRing(entry, ring)
     // A brick that was open before the pan moved it out and back keeps its mark: the slab is
     // new, the record it stands for is not.
     if (this.selectedKey === brick.key) {
@@ -2108,9 +2687,16 @@ export class CacheTetrisBoard {
         height: `${String(metrics.height)}px`,
         borderRadius: '4px',
         border: '1px dashed rgba(148, 163, 184, 0.35)',
-        transition: 'bottom 260ms ease-out, right 260ms ease-out',
+        // The ghost marks a cell. It is not animated *itself*: it is a child of the motion plane, so
+        // it pans with the board and slides with the stack for free, on the compositor, exactly like
+        // the bricks around it — and it keeps the cell it names instead of drifting by the plane's
+        // inset the way a host-level overlay did.
+        transition: 'none',
       } satisfies Partial<CSSStyleDeclaration>)
-      host.append(ghost)
+      // The plane is the grid box, so a cell placement is the ghost's own coordinate space; and it
+      // goes in first, so a brick landing in that cell paints over the dashed outline.
+      const plane = this.cachePlane ?? host
+      plane.prepend(ghost)
       this.ghost = ghost
     }
     const { right, bottom } = cellPlacement(metrics, cell.column, cell.row)

@@ -21,10 +21,13 @@ import {
   onWindowChange,
   readTranscript,
   resolveHistoricalStep,
+  logRawPayload,
   sessionFaceOf,
+  windowKeyOfSnapshot,
   type SessionFace,
   type WindowSnapshot,
 } from '../src/client/navigation'
+import type { BrickRecord } from '../src/shared/brick'
 
 /** An event window over a run of durable seqs, oldest first. */
 function window(entries: { type: string; seq: number; data?: Record<string, unknown> }[], hasMore = true): WindowSnapshot {
@@ -77,6 +80,39 @@ describe('sessionFaceOf: reaching the official face, or not', () => {
   it('survives a service that throws rather than letting it reach a click handler', () => {
     const service = { binding: () => { throw new Error('no binding') } }
     expect(sessionFaceOf(service, 'session-1')).toBeUndefined()
+  })
+})
+
+describe('reading a replayed brick\'s raw payload out of the log', () => {
+  const stream = [
+    { type: 'chunk', time: 41, chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+    { type: 'chunk', time: 42, chunk: { type: 'finish', reason: { kind: 'stop' }, replayState: { messages: 3 } } },
+  ]
+  const faceWith = (): SessionFace => face({
+    window: window([
+      { type: 'request/header', seq: 30, data: { header: { model: 'bench' }, reason: 'initial' } },
+      { type: 'step/start', seq: 39, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: 40, data: { turn: 1, step: 1, message: { role: 'assistant' }, stream, usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+      { type: 'step/end', seq: 44, data: { turn: 1, step: 1 } },
+    ]),
+  })
+
+  it('answers the stream, the derived replay script and the header in force', () => {
+    const record = { settlementSeq: 40 } as BrickRecord
+    expect(logRawPayload(faceWith(), record, 'stream')).toEqual(stream)
+    expect(logRawPayload(faceWith(), record, 'header')).toEqual({ header: { model: 'bench' }, reason: 'initial' })
+    // The replay script is derived from the same stream the brick was built from, on demand: the
+    // finish chunk's own state, which is what the eager path would have hashed into a blob.
+    expect(logRawPayload(faceWith(), record, 'replay')).toEqual({ messages: 3 })
+  })
+
+  it('says nothing rather than guessing when the log does not hold the brick', () => {
+    expect(logRawPayload(faceWith(), { settlementSeq: 41 } as BrickRecord, 'stream')).toBeUndefined()
+    expect(logRawPayload(faceWith(), {} as BrickRecord, 'stream')).toBeUndefined()
+    expect(logRawPayload(undefined, { settlementSeq: 40 } as BrickRecord, 'stream')).toBeUndefined()
+    // A header written after the settlement is not the one in force for it.
+    const later = face({ window: window([{ type: 'assistant/message', seq: 40, data: { turn: 1, step: 1, stream } }, { type: 'request/header', seq: 50, data: { header: { model: 'later' } } }]) })
+    expect(logRawPayload(later, { settlementSeq: 40 } as BrickRecord, 'header')).toBeUndefined()
   })
 })
 
@@ -177,6 +213,73 @@ describe('durableEventsOf: the log, without the client-only rows', () => {
     })
     expect(events.map((event) => event.seq)).toEqual([29, 30])
     expect(events[0]!.type).toBe('step/start')
+  })
+})
+
+/**
+ * The cheap question the render path asks on every pass.
+ *
+ * `durableEventsOf` copies and sorts the whole window, which is the right price for an answer that
+ * *is* the durable list and the wrong price for "is this the window I indexed a moment ago?" —
+ * asked on every render of the board, including the ones a drag causes. What is pinned here is
+ * that the cheap key moves whenever it must: a page landing at the older end, an append at the
+ * live end, the runtime's own revision counter, and a window that changed shape without moving its
+ * ends. It may over-report (one wasted index rebuild); it may never under-report.
+ */
+describe('windowKeyOfSnapshot: the window asked about itself', () => {
+  const snapshot = (
+    entries: { readonly type?: string; readonly seq?: number }[],
+    revision?: number,
+  ): WindowSnapshot => ({
+    hasMore: true,
+    ...(revision === undefined ? {} : { revision }),
+    entries: entries.map((entry) => ({
+      ...(entry.type === undefined ? {} : { type: entry.type }),
+      event: { type: 'step/start', ...(entry.seq === undefined ? {} : { seq: entry.seq }), data: {} },
+    })),
+  })
+
+  it('moves when the runtime says the window moved, without reading the entries', () => {
+    const before = snapshot([{ seq: 10 }, { seq: 20 }], 7)
+    expect(windowKeyOfSnapshot(before)).toBe(windowKeyOfSnapshot(snapshot([{ seq: 10 }, { seq: 20 }], 7)))
+    expect(windowKeyOfSnapshot(before)).not.toBe(windowKeyOfSnapshot(snapshot([{ seq: 10 }, { seq: 20 }], 8)))
+  })
+
+  it('moves on a prepend and on an append, revision or not', () => {
+    const plain = snapshot([{ seq: 10 }, { seq: 20 }])
+    const prepended = snapshot([{ seq: 4 }, { seq: 10 }, { seq: 20 }])
+    const appended = snapshot([{ seq: 10 }, { seq: 20 }, { seq: 44 }])
+    const keys = [plain, prepended, appended].map(windowKeyOfSnapshot)
+    expect(new Set(keys).size).toBe(3)
+  })
+
+  it('reads the window\'s real ends past the rows it does not index', () => {
+    // A transient row at either end is not part of the durable window; the key still names the
+    // durable ends, so a live chunk arriving does not look like history moving.
+    const durable = snapshot([{ type: 'event', seq: 10 }, { type: 'event', seq: 20 }])
+    const withTransient = snapshot([
+      { type: 'transient', seq: 9 },
+      { type: 'event', seq: 10 },
+      { type: 'event', seq: 20 },
+      { type: 'transient', seq: 21 },
+    ])
+    // The count differs (four entries, not two), so the key differs — over-reporting is allowed.
+    // What matters is the ends it *names*: the durable ones, not the transient rows'.
+    expect(windowKeyOfSnapshot(withTransient)).toContain('|10|20')
+    expect(windowKeyOfSnapshot(durable)).toContain('|10|20')
+  })
+
+  it('says "changed" for a window that changed shape without moving its ends', () => {
+    const three = snapshot([{ seq: 10 }, { seq: 15 }, { seq: 20 }], 3)
+    const four = snapshot([{ seq: 10 }, { seq: 15 }, { seq: 18 }, { seq: 20 }], 3)
+    // Same ends, same revision: the count is what catches it. A key that only looked at the ends
+    // would hand the scene a stale index.
+    expect(windowKeyOfSnapshot(three)).not.toBe(windowKeyOfSnapshot(four))
+  })
+
+  it('answers "empty" the same way for no window and for an empty one', () => {
+    expect(windowKeyOfSnapshot(undefined)).toBe(windowKeyOfSnapshot({ entries: [] }))
+    expect(windowKeyOfSnapshot({ entries: [] })).not.toBe(windowKeyOfSnapshot(snapshot([{ seq: 1 }])))
   })
 })
 

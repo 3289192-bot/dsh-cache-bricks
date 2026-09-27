@@ -118,6 +118,19 @@ describe('boardFromFeed', () => {
     expect(retried!.retried).toBeUndefined()
   })
 
+  it('says whether the request has settled, because that is what the second drop marks', () => {
+    // A draft the collector is still watching: no usage yet, and the board owes it a drop when the
+    // reading lands. Every other source can only speak after the fact, so it is born settled.
+    const data = boardFromFeed(feed([
+      record({ turn: 1, step: 1, settlement: 'running' }),
+      record({ turn: 2, step: 1 }),
+      record({ turn: 3, step: 1, settlement: 'attempt' }),
+    ]))
+    expect(data.columns[0]!.bricks[0]!.settled).toBe(false)
+    expect(data.columns[1]!.bricks[0]!.settled).toBe(true)
+    expect(data.columns[2]!.bricks[0]!.settled).toBe(true)
+  })
+
   it('marks a column finished only when the log says so', () => {
     const bricks = [record({ turn: 1, step: 1 }), record({ turn: 2, step: 1 })]
     // turn 1 finished, turn 2 still running: the ghost slot and the reserved lead
@@ -158,6 +171,11 @@ describe('boardFromFeed', () => {
 })
 
 describe('boardFromReadings (the no-host-half fallback)', () => {
+  it('draws every folded brick as settled: the fold can only speak after the usage lands', () => {
+    const data = boardFromReadings([reading(1, 1)])
+    expect(data.columns[0]!.bricks[0]!.settled).toBe(true)
+  })
+
   it('keys bricks by step and carries the ended flag onto the column', () => {
     const data = boardFromReadings([
       { turn: 1, step: 1, tone: 'good', label: '99%', ended: true },

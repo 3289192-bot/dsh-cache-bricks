@@ -228,6 +228,8 @@ export declare function usageFromStream(stream: readonly StreamRecordLike[] | un
  * the top level — it exists only as the stream's final `finish` chunk.
  */
 export declare function finishFromStream(stream: readonly StreamRecordLike[] | undefined): ReturnType<typeof finishOf>;
+/** Read the adapter's private replay state out of a durable stream. */
+export declare function replayFromStream(stream: readonly StreamRecordLike[] | undefined): unknown;
 /**
  * Turns outgoing requests into refs and hashes, remembering per-message hashes so
  * a long conversation is neither re-hashed nor re-stored on every call.

@@ -348,6 +348,15 @@ export interface Brick {
     /** What the step did in the conversation: the brick's back face. */
     readonly kind: ActivityKind;
     /**
+     * False while the request is still in flight, true once it has settled.
+     *
+     * The board draws a brick twice in its life: born (a draft the collector is watching, which
+     * reads `n/a` because no usage has landed yet) and settled (the same brick with its reading).
+     * The birth is a drop; this flag is what lets the settle be one too, instead of the brick
+     * changing its number in place while nothing moves.
+     */
+    readonly settled?: boolean;
+    /**
      * True for a brick the client folded itself, with no host collector running.
      *
      * Such a brick is one per **step**, has no attempt identity, and cannot navigate — so it
@@ -606,6 +615,19 @@ export declare function scrollLimit(columns: readonly BoardColumn[], capacity: n
  */
 export declare function clampScroll(scroll: BoardScroll, limit: BoardScroll): BoardScroll;
 /**
+ * Clamp a pan to what the content allows **without rounding it**.
+ *
+ * {@link clampScroll} rounds because a pan that reaches the window is always a whole cell. A
+ * *motion target* is not: it is the fraction of a cell the plane is carrying, and rounding it away
+ * is exactly the bug this exists to prevent — the board would look like it jumped a cell and then
+ * waited, which is the thing a fractional pan is for.
+ *
+ * @param scroll - the pan asked for, in cells (fractions allowed).
+ * @param limit - the largest pan the content allows.
+ * @returns the pan clamped to the content, its fraction intact.
+ */
+export declare function clampPan(scroll: BoardScroll, limit: BoardScroll): BoardScroll;
+/**
  * The live anchor: the newest Turn at the right, and the **running Turn's own top
  * brick** in frame.
  *
@@ -633,6 +655,32 @@ export declare function liveScroll(columns: readonly BoardColumn[], limit: numbe
  * @returns the window cell (`0,0` is the window's bottom-right cell), or undefined.
  */
 export declare function windowCell(columnDistance: number, row: number, lead: number, scroll: BoardScroll, capacity: number, limit: number): {
+    readonly column: number;
+    readonly row: number;
+} | undefined;
+/**
+ * Where one brick sits when the board is drawn with a ring of extra cells.
+ *
+ * The data layer knows whole cells — a pan is an integer, a window is a range — and that does
+ * not change when the *view* moves by fractions of a cell: the motion plane carries the
+ * fraction, and only a whole cell crossed advances the pan. The ring is what makes that
+ * possible without exposing an edge: a plane translated by up to one cell in either direction
+ * needs one extra column and one extra row on each side, painted but outside the grid box (the
+ * face clips them, so at rest they are invisible and untouchable).
+ *
+ * `windowCell` is this with `ring = 0`, which is the same function a paint used to have: one
+ * definition of "inside", extended rather than duplicated.
+ *
+ * @param columnDistance - cells between this column and the newest Turn (0 = newest).
+ * @param row - the brick's row in its own column (0 = resting on the floor).
+ * @param lead - the reserved lead cell.
+ * @param scroll - the pan applied to the board.
+ * @param capacity - columns the window can hold.
+ * @param limit - rows a column may fill inside the window.
+ * @param ring - extra cells painted outside the window on every side.
+ * @returns the window cell (`0,0` is the window's bottom-right cell), or undefined.
+ */
+export declare function motionCell(columnDistance: number, row: number, lead: number, scroll: BoardScroll, capacity: number, limit: number, ring: number): {
     readonly column: number;
     readonly row: number;
 } | undefined;

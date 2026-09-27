@@ -28,7 +28,7 @@
  * the grid the bricks fell into; the rails themselves are carved out of the band, so no
  * brick ever sits under one.
  */
-import { type BoardColumn, type Brick } from './tetris';
+import { type BoardColumn, type BoardScroll, type Brick } from './tetris';
 import { type SceneDemand } from './history-scene';
 import type { LoadReport, LoadRequest } from './navigation';
 import { type RevealOutcome } from './reveal';
@@ -88,6 +88,9 @@ export declare class CacheTetrisBoard {
     private rotator;
     private cacheLayer;
     private typeLayer;
+    /** The plane each face's bricks ride on: the single element any smooth motion is written to. */
+    private cachePlane;
+    private typePlane;
     /** The flip control, outside the rotator so it never turns with the card. */
     private chip;
     /** The auxiliary lane's dashed rule and its `SYS` label. */
@@ -139,19 +142,63 @@ export declare class CacheTetrisBoard {
      * new Turns arriving and pushed the reader further into the past on every page.
      */
     private lastNewestTurn;
-    /** The last scene demand sent, so a paint inside the same scene sends nothing. */
+    /** The last scene the last paint *saw*, so a paint inside the same scene asks for nothing. */
     private sceneKey;
+    /** The last scene actually handed to the data layer, so a deferred demand is sent once. */
+    private sentSceneKey;
+    /**
+     * The scene a pan deferred, if the hand moved the window after the last one was sent.
+     *
+     * A drag cuts a new scene every few pixels; see {@link CacheTetrisBoard.syncScene} for why the
+     * demand is parked here instead of being sent.
+     */
+    private pendingScene;
     /** Tallest column, remembered per content array: a repaint must not rescan the session. */
     private tallestCache;
+    /** The tallest column the data layer already measured for these columns, when it passed one. */
+    private tallestHint;
     /** The window of the last paint: what the rails describe and what a drag moves. */
     private view;
     /** The pointer drag in flight on a rail, if any. */
     private drag;
     /** A brick to focus once the next paint has placed it, for arrows that pan the window. */
     private revealKey;
+    /**
+     * What this board asked the data layer for, and what the pan did with the asking.
+     *
+     * A pan's cost is a *timing* property: nothing in the DOM says how many times the board asked
+     * for a scene, and no headless run can be trusted to measure milliseconds. These three numbers
+     * are what a browser check can hold the board to — a gesture in flight asks for nothing
+     * (`deferred`), a gesture that ended asks exactly once (`flushed`), and a gesture that never
+     * moved the window asks for neither. Read by `scripts/test-scroll.mjs` and
+     * `scripts/live-scene-verify.mjs` through the read-only handle in `index.tsx`; nothing in the
+     * plugin reads them.
+     */
+    readonly stats: {
+        demands: number;
+        deferred: number;
+        flushed: number;
+    };
     /** Until this timestamp a hand-driven pan is in flight, so slabs must not animate. */
     private panUntil;
     private panTimer;
+    /**
+     * The float pan the *view* is showing, in cells, and the whole-cell pan the DOM is painted at.
+     *
+     * The data layer only ever sees whole cells; the difference between the two is what the motion
+     * plane carries, in pixels. A drag moves `target` every frame and commits `painted` only when a
+     * whole cell has been crossed (see {@link CacheTetrisBoard.stepMotion}), so the grid is written
+     * once per cell instead of once per pointer event, and the reader sees every pixel in between.
+     */
+    private motionTarget;
+    private motionPainted;
+    private motionFrame;
+    /** The hand-off animations: the snap after a release, the slide when a new Turn arrives. */
+    private snapAnim;
+    private slideAnim;
+    /** The last rail inputs, kept so a motion frame can move the thumb with the board. */
+    private railX;
+    private railY;
     private frame;
     private settle;
     private trailing;
@@ -222,7 +269,7 @@ export declare class CacheTetrisBoard {
      * @param titles - hover text by brick key.
      * @param aux - auxiliary bricks, oldest first; shown in the lane above the columns.
      */
-    setColumns(columns: readonly BoardColumn[], titles: Map<string, string>, aux?: readonly Brick[]): void;
+    setColumns(columns: readonly BoardColumn[], titles: Map<string, string>, aux?: readonly Brick[], tallest?: number): void;
     /** Start watching layout changes. */
     start(): void;
     /** Detach everything this board owns. */
@@ -271,7 +318,14 @@ export declare class CacheTetrisBoard {
     private setFace;
     /** Flip to the other side. */
     toggleFace(): void;
-    /** Mirror the cache layer into the type layer, so the card has a back. */
+    /**
+     * Mirror the cache side into the type side, so the card has a back.
+     *
+     * The two sides are copies of the same cells, so the copy has to reproduce the *structure* as
+     * well: a Turn's bricks ride the plane (they pan), the lane's bricks sit on the layer (they do
+     * not), and a ring cell stays ring on both sides. Mirrored by hand rather than by re-painting,
+     * because the paint that would do it reads `this.face`, which is still the old side at this point.
+     */
     private buildTypeLayer;
     /**
      * Point the interaction at the side that is showing.
@@ -334,10 +388,33 @@ export declare class CacheTetrisBoard {
      * overscan on each axis, so panning inside a scene costs nothing and the next scene is already
      * warm by the time the reader gets there.
      *
+     * **A pan defers the wire.** A drag changes the scene every few pixels, and answering one
+     * demand is not free: the data layer replays the log for that slice and re-renders the board
+     * from it — synchronously, on the thread the pointer is being read on. Doing that per frame is
+     * what made a long session un-draggable, and it buys nothing a reader can use: nobody reads a
+     * brick's exact type while the board is flying past. So while a hand-driven pan is in flight
+     * the demand is *recorded* ({@link CacheTetrisBoard.pendingScene}) and sent once the pan ends,
+     * where "ends" is the same quiet window the bricks' own animation waits for
+     * ({@link CacheTetrisBoard.markPan}), shortened on release ({@link CacheTetrisBoard.endPanSoon}).
+     *
+     * The bricks do not wait for it: what is on screen is what the fold already gave the board, and
+     * the pan is pure geometry — every brick the reader pans past is drawn from data already in
+     * hand. Only the *exactness* of the bricks on screen arrives late, by one quiet window.
+     *
      * @param view - the window this paint is showing.
      * @param metrics - board geometry.
      */
     private syncScene;
+    /** Hand one scene to the data layer, and remember that it was this one. */
+    private sendScene;
+    /**
+     * Materialize the scene the pan ended on, if the pan deferred one.
+     *
+     * Called from a paint, and only outside a pan. Sending the demand the pan already sent (a drag
+     * that came back to where it started) is a no-op: the data layer would answer with the scene it
+     * is already holding, and the round trip through React would be spent for nothing.
+     */
+    private flushScene;
     /** The tallest column, measured once per content array rather than once per paint. */
     private tallestOf;
     /** Move the window, clamped to what the content allows right now. */
@@ -352,8 +429,29 @@ export declare class CacheTetrisBoard {
     private markPan;
     /** True while a hand-driven pan is still settling. */
     private isPanning;
-    /** Keep a slab's animation in step with whether the window is being panned by hand. */
-    private syncTransition;
+    /**
+     * Bring the pan's quiet window to an early close, now that the pointer is up.
+     *
+     * The window exists for the *animation* (a pan must not make every brick animate its own
+     * slide) and the deferred scene waits on the same clock, so a reader who released the rail
+     * would otherwise stare at fold-typed bricks for another 200 ms. A release is the honest moment
+     * to end it early: one repaint after {@link PAN_RELEASE_MS}, by which time the last frame of
+     * the drag has painted the window the reader landed on, and the demand the drag deferred goes
+     * out from there.
+     *
+     * Does nothing when the drag deferred nothing, or when the ordinary quiet window ends sooner.
+     */
+    private endPanSoon;
+    /**
+     * Mark a slab as ring or grid.
+     *
+     * The ring is real DOM — that is the point — but it is not part of the board the reader
+     * interacts with: it is clipped by the face, it takes no pointer, no focus and no announcement.
+     *
+     * @param entry - the slab.
+     * @param ring - whether its cell is outside the window.
+     */
+    private markRing;
     /**
      * Start a drag on a rail.
      *
@@ -368,8 +466,36 @@ export declare class CacheTetrisBoard {
     private beginRailDrag;
     /** The pan an offset along the track stands for, with the thumb centred on the pointer. */
     private railOffset;
-    /** Apply the drag in flight: whole cells, so the grid never lands between bricks. */
+    /** Apply the drag in flight: the pointer's own fraction of a cell, carried by the plane. */
     private applyDrag;
+    /**
+     * Settle the board onto the whole cell it was released nearest to.
+     *
+     * The plane is already mid-cell, so the hand-off is the *only* animation a release plays: at most
+     * half a brick of travel (39px across, 18px down — a whole cell is the worst case only when the
+     * reader stops exactly between two), 130ms, on the compositor. The logical pan moves to the
+     * nearest whole cell first, and the plane is set to the compensating offset in the same frame, so
+     * the commit is invisible and the animation only ever plays the remainder.
+     */
+    private settleMotion;
+    /** Nothing is moving any more: hand the frames back to layout noise and the deferred scene. */
+    private afterMotion;
+    private endMotion;
+    /**
+     * Slide the whole board one cell to the left because a new Turn arrived while following.
+     *
+     * The bricks are already painted in their new cells; the plane starts a cell to the right of that
+     * and animates home, which is exactly the old position — one compositor animation instead of a
+     * hundred `right` transitions.
+     *
+     * @param cells - how many whole cells the stack shifted by.
+     * @param metrics - board geometry.
+     */
+    private slideIn;
+    /** Drop every motion in flight and put the planes back at rest. */
+    private cancelMotion;
+    /** One new brick falls: animate **that brick**, on the compositor, and nothing else. */
+    private fallIn;
     /**
      * Keep both rails telling the truth about the window.
      *
@@ -411,10 +537,71 @@ export declare class CacheTetrisBoard {
     private syncLaneChrome;
     /** Keep the chrome strip's notice in step with what the board is showing. */
     private syncNotice;
-    /** The container element of one side. */
+    /** The plane one side's bricks live on: where every smooth motion is written. */
+    private planeElement;
+    /** The container element of one side (the plane's parent: the lane sits here, not on the plane). */
     private layerElement;
     /**
+     * Move the board to a fraction of a cell, in pixels, without touching the data layer.
+     *
+     * Both faces ride the same offset so the card turns over mid-motion without a jump. Called once
+     * per animation frame at most, and it writes exactly two style properties.
+     */
+    private paintMotion;
+    /**
+     * What the view is showing against what the DOM is painted at, in cells.
+     *
+     * Read by the browser checks (`scripts/test-scroll.mjs`): the difference between the two is the
+     * fraction the motion plane is carrying, and it is the only way to tell "following the pointer"
+     * from "committed a whole cell and jumped" without timing anything.
+     */
+    get motionState(): {
+        target: BoardScroll | undefined;
+        painted: BoardScroll | undefined;
+        plane: string;
+    };
+    /** True while any hand-off animation (snap, slide) owns the planes. */
+    private isMotionAnimating;
+    /**
+     * Move both thumbs to the float pan, so the rail keeps up with the board between commits.
+     *
+     * The accessible value stays the whole cell (a scrollbar's value is a position, not a pixel), and
+     * it is written by the paint; what moves here is only where the handle is drawn.
+     */
+    private paintThumbMotion;
+    /**
+     * The pixel offset a float pan stands for, given the pan the DOM is painted at.
+     *
+     * A larger pan moves the content left and down, so the offset is negative on both axes. This is
+     * the whole of the float/whole-cell translation, in one place.
+     */
+    private motionPixels;
+    /** Ask for one motion frame. Coalesced: a pointer that fires faster than the display costs one frame. */
+    private requestMotionFrame;
+    /**
+     * One frame of a drag: commit whole cells, then carry the remainder on the plane.
+     *
+     * The commit is the only moment the grid is rewritten, and it is invisible by construction — the
+     * slabs move a whole cell in layout while the plane gives exactly that cell back in transform, so
+     * the pixels on screen do not move at all on the frame a cell is committed.
+     */
+    private stepMotion;
+    /**
+     * Write a whole-cell pan and repaint on the spot.
+     *
+     * Unlike {@link setScroll} this does not schedule: a motion frame is already inside a frame, and
+     * scheduling would spend the *next* one on a paint the reader would see as a stutter.
+     */
+    private commitPan;
+    /** Set the pan in force, keeping the "following the live end" rule in one place. */
+    private applyPan;
+    /**
      * Build one slab: a positioned brick on one side of the card.
+     *
+     * The element carries its **resting** cell in `right`/`bottom` and nothing else: no transition on
+     * either, ever (see {@link SLAB_TRANSITION}). Falling is an animation of the element's own
+     * `transform`, started by {@link CacheTetrisBoard.fallIn}, so the layout position is written once
+     * and the motion rides the compositor.
      *
      * @param brick - the brick to draw.
      * @param metrics - board geometry.
@@ -422,8 +609,7 @@ export declare class CacheTetrisBoard {
      * @param right - distance from the board's right edge.
      * @param bottom - distance from the board's floor.
      * @param falling - true when it should drop in from above the well.
-     * @param smooth - true when the slab should animate its own moves; false during a pan, when
-     *   every brick moves at once and the drop animation would read as lag.
+     * @param ring - true when this cell is motion ring: painted outside the grid, never interactive.
      * @returns the live entry, already wired to its gestures.
      */
     private createSlab;

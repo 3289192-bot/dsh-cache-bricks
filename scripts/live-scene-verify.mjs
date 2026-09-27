@@ -9,7 +9,7 @@
  *
  * Usage:
  *   node scripts/live-scene-verify.mjs                    # port 18090, newest log's token
- *   node scripts/live-scene-verify.mjs --port 18091 --home <path-to-DSH-home>
+ *   node scripts/live-scene-verify.mjs --port 18091 --home C:\path\to\dsh-home
  *   node scripts/live-scene-verify.mjs --session session-…  # pick the session to open
  *
  * Playwright is resolved the same way as in `ui-verify.mjs` (it is not a dependency of this
@@ -182,7 +182,15 @@ try {
     console.log(`session ${richest.id} is not in the sidebar of this instance; skipping`)
     process.exit(0)
   }
-  await row.first().click()
+  // The sidebar's own resize handle can sit over a row and swallow a real click (it is a sibling
+  // overlay, not part of the row). The row's handler is a React listener on the root, so a
+  // dispatched event reaches it just the same — try the honest click first, fall back to that.
+  try {
+    await row.first().click({ timeout: 4_000 })
+  } catch {
+    console.log('  · the sidebar handle intercepted the click; dispatching it instead')
+    await row.first().dispatchEvent('click')
+  }
   await page.waitForTimeout(3_500)
   await page.mouse.move(1200, 700)
   await page.waitForSelector('[data-cache-bricks-board]', { timeout: 20_000 })
@@ -236,6 +244,73 @@ try {
     check('walking to the left edge lands on older Turns, not past them',
       atEdge.turns.length > 0 && atEdge.turns[atEdge.turns.length - 1] <= grown.turns[grown.turns.length - 1],
       `${grown.turns.join(',')} → ${atEdge.turns.join(',')}`)
+
+    // The price of a pan, on the real thing. 0.1.4 answered a scene per painted frame — replay and
+    // a full board render on the input thread — which is measured, not guessed: see
+    // `docs/verification.md`, "0.1.4.a". The counters are published by 0.1.4.a and later
+    // (`__dshCacheBricksStats` in `client/index.tsx`); a build that does not publish them is not
+    // judged here, it is named.
+    const statsOf = () => page.evaluate(() => {
+      const stats = window.__dshCacheBricksStats?.()
+      return stats === undefined ? undefined : { board: stats.board, scene: stats.scene, window: stats.window }
+    })
+    const countersBefore = await statsOf()
+    if (countersBefore === undefined) {
+      console.log('  · this build publishes no pan counters (__dshCacheBricksStats): pan cost not measured')
+    } else {
+      const track = await page.locator('[data-cache-bricks-rail="x"]').boundingBox()
+      const thumb = await page.locator('[data-cache-bricks-rail="x"] > div').first().boundingBox()
+      const panBefore = (await read()).pan
+      await page.mouse.move(thumb.x + thumb.width / 2, thumb.y + thumb.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(thumb.x + thumb.width / 2 + (track.width - thumb.width) / 2, thumb.y + thumb.height / 2, { steps: 60 })
+      const during = await statsOf()
+      await page.mouse.up()
+      await page.waitForTimeout(1_500)
+      const countersAfter = await statsOf()
+      const atRest = await read()
+      const deferred = during.board.deferred - countersBefore.board.deferred
+      check('a real drag asks the data layer for nothing while the pointer is down',
+        during.board.demands === countersBefore.board.demands
+        && during.scene.demands === countersBefore.scene.demands,
+        `board ${String(countersBefore.board.demands)}→${String(during.board.demands)}, scene ${String(countersBefore.scene.demands)}→${String(during.scene.demands)}, deferred ${String(deferred)}`)
+      if (deferred === 0) {
+        // Every session on this instance is narrower than one scene (a scene is the ten visible
+        // columns plus ten either side), so a pan cannot cut a new one and there is nothing to
+        // defer. Said out loud rather than dressed up as a pass: the deferral itself is proven by
+        // the 2,000-Turn browser fixture, not here.
+        console.log(`  · the pan stayed inside one scene (${String(atRest.turns.length)} Turns on the board, pan ${String(panBefore)} → ${String(atRest.pan)}): no deferral to observe`)
+      } else {
+        check('the scene the drag landed on is materialized once, when the pointer comes up',
+          countersAfter.board.flushed > countersBefore.board.flushed
+          && countersAfter.board.demands - during.board.demands <= 2,
+          `flushed ${String(countersBefore.board.flushed)}→${String(countersAfter.board.flushed)}, demands ${String(during.board.demands)}→${String(countersAfter.board.demands)}`)
+        console.log(`  · pan cost: ${String(deferred)} scenes deferred, `
+          + `${String(countersAfter.scene.replays - countersBefore.scene.replays)} replays for the gesture`)
+      }
+      check('the drag really moved the window', atRest.pan !== panBefore, `pan ${String(panBefore)} → ${String(atRest.pan)}`)
+
+      // A render that changed no window must not copy one. Opening a brick's panel is the cheapest
+      // real re-render this board has: before 0.1.4.a each of those renders walked and sorted the
+      // whole durable window. A page landing during the click would move the window and justify one
+      // copy, so the assertion is "not every render copied" rather than "none did".
+      const beforeClick = await statsOf()
+      // A brick in the gutter can sit under the sidebar's own overlay on some layouts; the brick's
+      // handler is a React listener on the root, so a dispatched click reaches it either way.
+      const brick = page.locator('[data-cache-bricks-brick]').first()
+      try {
+        await brick.click({ timeout: 4_000 })
+      } catch {
+        console.log('  · the sidebar overlay covered the brick; dispatching the click instead')
+        await brick.dispatchEvent('click')
+      }
+      await page.waitForTimeout(800)
+      const afterClick = await statsOf()
+      check('opening a brick re-renders the board without copying the session window',
+        afterClick.window.asked - beforeClick.window.asked >= 2
+        && afterClick.window.materialized - beforeClick.window.materialized < afterClick.window.asked - beforeClick.window.asked,
+        `renders +${String(afterClick.window.asked - beforeClick.window.asked)}, window copies +${String(afterClick.window.materialized - beforeClick.window.materialized)}`)
+    }
   } else {
     console.log('  · the horizontal rail has no travel on this session: no pan to make')
   }

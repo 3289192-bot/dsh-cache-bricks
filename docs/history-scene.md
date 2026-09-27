@@ -103,6 +103,144 @@ what the optional window subscription is for: `onWindowChange` listens to
 re-reads when the oldest seq moves. A core that publishes neither still works — a landed page
 re-renders the conversation it belongs to.
 
+## The pan does not materialize (0.1.4.a)
+
+The demand above is correct, and until 0.1.4.a it was sent from **inside the frame that produced it**.
+A drag cuts a new scene every few pixels, and answering one demand is not free: `HistoryScene`
+replays the log slice, React re-renders the board from it, and both happen synchronously on the
+thread the pointer is being read on. Historical length makes it worse in the expected way — the
+window is copied, indexed and merged at session scale — so a long session was un-draggable while
+0.1.4's *drawing* was already a window.
+
+Measured on the browser fixture with a 2,000-Turn board and one 120-move drag
+(`scripts/test-scroll.mjs`, counters published by `window.__dshCacheBricksStats`):
+
+| while the pointer is down | 0.1.4 | 0.1.4.a |
+|---|---|---|
+| board re-renders | **121** (one per move) | **0** |
+| scenes asked of the data layer | one per painted frame | **0** |
+| scenes materialized | per frame | **1**, on release (plus one re-cut that converges) |
+| events handed to `replaySession` | the frame's slice, per frame | one slice, ≤ ⅛ of the window |
+
+Three costs, one per layer, all in the same feedback loop:
+
+1. **the wire is deferred.** `syncScene` parks the demand (`pendingScene`) while a hand-driven pan is
+   in flight — the same `PAN_QUIET_MS` window the bricks' own animation already waits for — and
+   sends it once the pan ends, shortened to `PAN_RELEASE_MS` (80 ms) on pointer release. The bricks
+   do not wait for it: a pan is pure geometry, every brick the reader pans past is drawn from data
+   already in hand, and only the *exactness* of the bricks on screen arrives a quiet window late.
+   Nobody reads a brick's type while the board is flying past;
+2. **the window is asked about itself before it is copied.** `durableEvents` walks and sorts the
+   entire durable window, and the render path did that on every render — including the ones a drag
+   caused — only for `window()` to compare a key and answer "it did not move". The runtime already
+   publishes that answer: `SessionEventWindow.revision` (`contract/events.d.ts:59`).
+   `windowKeyOfSnapshot` reads the revision, plus the entry count and the durable ends for a core
+   that publishes none, and `noteWindow` materializes the events only when the key changed;
+3. **the board's data is memoised.** `readingsOf` and `boardFromSources` rebuilt the whole board on
+   every render and handed `setColumns` a new array, which invalidated the board's tallest-column
+   memo and bought another paint. Both are memos now, and `setColumns` ignores an array it already
+   has.
+
+The demand's own semantics are unchanged: the same `scenePlanOf` overscan, the same
+`SCENE_STEP_QUANTUM` snapping, the same memo. What changed is *when* the board is allowed to spend
+it — and a keyboard pan, a wheel notch and a rail drag all end the same way, with one ask.
+
+## The motion model (0.1.4.b)
+
+0.1.4.a made a pan cheap *in the data layer*. The view was still steppy, and the reason was the
+animation model rather than the pixel count: a pan landed on whole cells (`Math.round`), and every
+position was written as `right`/`bottom` and animated by **transitioning those same properties** —
+two layout properties per brick, a hundred bricks at a time, every frame of every animation.
+
+What changed is where motion lives, not what a brick is:
+
+| | 0.1.4.a | 0.1.4.b |
+|---|---|---|
+| A pan | rounded to a cell, then every brick re-written | the pointer's own fraction, carried by **one plane per face** as `translate3d` |
+| A cell crossing | — | the only moment the grid is rewritten (invisible: the slabs move a cell in layout while the plane gives exactly that cell back in transform) |
+| A release | the pan stayed where it was rounded to | 130 ms magnetic settle onto the nearest whole cell, on the compositor |
+| A new Turn | `right` transitioned on **every visible brick** | one plane FLIP: the cells are painted once, then one transform animates home |
+| A new brick | `bottom` transitioned on that brick | that brick's own `transform` animation (260 ms, 1 px settle) |
+| The board's box | `height`/`top` transitioned | written exactly once; the host is a boundary, not an animation |
+| The rail thumb | `left`/`top` | `translateX`/`translateY`, from the same float pan as the plane |
+| The invariant | — | **no `transition` or animation on `top`/`left`/`right`/`bottom`/`width`/`height`, anywhere in the board** |
+
+The data layer never sees a fraction. The window is still whole cells, the scene demand is still
+whole Turns and steps, and the DOM keeps each brick's resting cell in `right`/`bottom` — which is
+what the DOM-reading checks assert. The fraction exists only between the planner and the plane, and
+it is bounded by the **motion ring**: one extra column and one extra row painted on every side of
+the window (clipped by the face, never interactive, never announced), so a plane carrying up to a
+whole cell can never expose an edge.
+
+`will-change: transform` is set when a gesture or a hand-off starts and cleared when it ends: a
+plane, a flipping card and the one falling brick are promoted, and nothing else. The alternative —
+promoting a hundred bricks — buys a hundred compositor layers to solve what one plane solves.
+
+Measured on the browser fixture, same script, same drag, this machine:
+
+| | 0.1.4.a | 0.1.4.b |
+|---|---|---|
+| a new Turn arrives: `LayoutCount` | **+102** | **+1** |
+| … `RecalcStyleCount` | **+103** | **+1** |
+| a 12-move drag (996 cells crossed): `LayoutCount` | +17 | +13 |
+| … sub-cell offset carried by the plane | none (all zero) | −35.8 px … 0.0 px, one value per frame |
+| the fixture suite | 67/73 | **73/73** |
+
+The new-Turn number is the one that matters: sliding the stack used to re-lay-out the grid on every
+frame of a 190 ms animation, and now it costs one layout and one transform.
+
+## The data layer becomes a window too (0.1.4.c)
+
+0.1.4.a/b made the *drawing* a window and the *motion* compositor work. The data layer was still a
+backlog in three places, and each of them was O(something larger than the screen):
+
+| | before | 0.1.4.c |
+|---|---|---|
+| the board's merge | `boardFromSources` re-folded every reading on every scene change | a **world**: a base built from the fold when the fold changes, patched by the scene's steps and the collector's feed (`bricks.ts`, `BoardWorld`) |
+| the scene cache | 3 whole scenes, dropped whenever the window moved | a **step** cache: a finished step's events never change, keyed by its bracket and the header/context in force, so two screens share their overlap and a re-read is a lookup |
+| the window index | a full scan of every loaded event per page | a **delta**: the log is append-only, so a window that grew is indexed by its growth (`SceneIndexBuilder`, `durableEventsOutside`) |
+| raw payloads | every replayed stream, tool result and header canonicalized and SHA-256'd | **lazy**: nothing is hashed; the payloads are the session's own events, read by seq when a reader opens one (`logRawPayload`) |
+
+Measured on the browser fixture, 10,000 Turns / 30,000 steps (same script, same machine):
+
+| | 0.1.4.b | 0.1.4.c |
+|---|---|---|
+| ten screen reviews, script time | 678 ms | **202 ms** |
+| re-reading three already-read screens | 196 ms | **61 ms** (30 step hits, 0 misses) |
+| a page landing on a 120,000-event window | 13.1 ms (full rescan) | **2.72 ms** (delta) |
+| raw payloads hashed by a drag over fresh scenes | every scene | **0** (120 skipped) |
+
+`sceneSlice` also walks each merged range on its own now: the old loop started at the first range
+and ran to the last one, so a screen of six Turns near the end of a hundred-thousand-event window
+read the whole stretch between them to build a slice of a few hundred events.
+
+## The feel is a clock and a curve (0.1.4.d)
+
+Moving motion onto the plane changed *how* it is animated, not *what it looks like* — but the numbers
+went with the mechanism, and they should not have. The fall had been tuned with the transition it
+used to be (`bottom 420ms cubic-bezier(.45,.02,.95,.55)`, from one brick-height above the cell, no
+bounce); the plane's first version used a shorter, faster curve with a 1 px settle instead, and a
+36x15 brick that arrives in ~105 ms reads as a hop rather than a drop.
+
+`transform` and `bottom` interpolate the same way, so the old motion is restored by writing the old
+numbers on the new property:
+
+| | 0.1.4 | 0.1.4.c | 0.1.4.d |
+|---|---|---|---|
+| fall: duration · curve · from | 420 ms · `cubic-bezier(.45,.02,.95,.55)` · 15 px | 260 ms · `cubic-bezier(.35,.9,.4,1)` · 18 px, 1 px settle | **420 ms · `cubic-bezier(.45,.02,.95,.55)` · 15 px** |
+| new Turn: duration · curve | 260 ms · `ease-out` | 190 ms · `cubic-bezier(.2,.8,.2,1)` | **260 ms · `ease-out`** |
+
+Measured by seeking the animation itself (`Animation.currentTime`, so the page's frame production
+cannot distort it) and reading the brick's visual top, on both builds: the curves agree to **0.1 px**
+at every sampled instant — 0:15 · 100:14.3 · 200:12.3 · 300:8.9 · 400:3.8 · 415:2.4 px above the
+cell — while the work is unchanged: one element, one compositor property, and a new Turn still costs
+`LayoutCount +1` against 0.1.4's +100.
+
+The check lives in `scripts/test-scroll.mjs` now, which also closes a blind spot: the whole suite
+runs with `prefers-reduced-motion: reduce`, so neither the fall nor the slide had ever been
+exercised. The motion section asks for motion explicitly (`page.emulateMedia`), drives one brick and
+one Turn, and asserts the clock, the curve and the trajectory.
+
 ## What the two caps mean now
 
 `DEFAULT_MAX_BRICKS = 400` is unchanged, and it is still right — but for one job instead of two.

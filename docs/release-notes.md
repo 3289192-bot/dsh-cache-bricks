@@ -1,31 +1,32 @@
-**完整版 · 推荐安装** · 仅支持 DeepSeek Harness `0.1.7-rc.2` 的 Web profile。
+**完整版 · 推荐下载**
 
-- 修复长会话回看时，历史砖的请求类型丢失、被显示成普通输出的问题。
-- 回看更早记录时按需加载历史，减少重复处理整段会话。
-- 修复补载历史后棋盘位置跳动，保持当前阅读位置。
-- 优化长会话的棋盘渲染，减少屏幕外砖块带来的开销。
-- 更正安装说明：主页、版本标签和下载包内的 README 统一指向 `v0.1.4`。
+- 优化棋盘拖动和历史回看，减少重复计算、历史扫描与数据处理。
+- 优化落砖及整列平移动画，减少页面布局开销。
+- 恢复请求出现、读数结算时的两次落砖反馈，修复虚线位置不同步。
+- 修复系统开启“减少动态效果”时落砖动画消失的问题。
+- 增加中文使用说明图。
 
-**[下载完整版 v0.1.4](https://github.com/3289192-bot/dsh-cache-bricks/releases/download/v0.1.4/dsh-cache-bricks-0.1.4.tgz)** · [功能与使用说明](https://github.com/3289192-bot/dsh-cache-bricks#readme)
+**[下载完整版 v0.1.5](https://github.com/3289192-bot/dsh-cache-bricks/releases/download/v0.1.5/dsh-cache-bricks-0.1.5.tgz)** · [使用说明](https://github.com/3289192-bot/dsh-cache-bricks#readme)
 
 ```sh
-dsh plugin --profile web add github:3289192-bot/dsh-cache-bricks#v0.1.4
+dsh plugin --profile web add github:3289192-bot/dsh-cache-bricks#v0.1.5
 ```
+
+**兼容性：** 当前公开测试使用基线为 DSH `0.1.7-rc.2` Web profile；其他版本未经本次兼容性测试，不保证兼容，不限定只能安装在 rc.2。
 
 <details>
 <summary>Lite 精简版（可选）</summary>
 
-适合只需要缓存命中率棋盘的用户。保留缓存读数、颜色提示和棋盘滚动，省去请求详情面板、对话定位、对比和类型翻面。
+只需要缓存棋盘时选择。保留缓存读数、滚动和旧会话补载，省去详情、定位、对比与翻面。
 
-- 修复打开旧会话时棋盘为空的问题。
-- 恢复黄色提示：低于 90% 为黄，低于 70% 为红；小于 1000 token 的请求显示为灰色。
+本次同步优化落砖和平移动画，修复减少动态效果设置导致的落砖消失，以及虚线位置跟随问题。
 
-[下载 Lite v0.1.4](https://github.com/3289192-bot/dsh-cache-bricks/releases/download/v0.1.4/lite-dsh-cache-bricks-0.1.4.tgz)
+[下载 Lite v0.1.5](https://github.com/3289192-bot/dsh-cache-bricks/releases/download/v0.1.5/lite-dsh-cache-bricks-0.1.5.tgz)
 
 ```sh
-dsh plugin --profile web add github:3289192-bot/dsh-cache-bricks#v0.1.4-lite
+dsh plugin --profile web add github:3289192-bot/dsh-cache-bricks#v0.1.5-lite
 ```
 
-Lite 同样仅支持 DSH `0.1.7-rc.2` Web profile。两个版本共用包名 `dsh-cache-bricks`，同一 profile 选择一个安装。
+同一 profile 选择完整版或 Lite 之一。Lite 的其他 DSH 版本同样不保证兼容。
 
 </details>

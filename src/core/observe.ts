@@ -354,7 +354,7 @@ export function finishFromStream(stream: readonly StreamRecordLike[] | undefined
 }
 
 /** Read the adapter's private replay state out of a durable stream. */
-function replayFromStream(stream: readonly StreamRecordLike[] | undefined): unknown {
+export function replayFromStream(stream: readonly StreamRecordLike[] | undefined): unknown {
   for (const record of stream ?? []) {
     if (record.type !== 'chunk') continue
     const chunk = (record as { chunk?: { type?: string; replayState?: unknown } }).chunk
